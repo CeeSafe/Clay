@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: MIT
+// The Ui layer: Tailwind option mapping (renderer.h ParseComponentOptions), state variants, clicks, cursor,
+// scrolling, breakpoints/theme/@container, and transitions (claywind_transition.h, incl. the C test's numbers).
+
+import claywind;
+
+/// A scripted platform: tests set the pointer, keys, typed characters and clock between frames.
+struct FakePlatform {
+    size: Dims;
+    pointerState: Pointer;
+    dt: f32;
+    clock: f64;
+    cursor: Cursor;
+    /// Bit `keyIndex(k)` per key.
+    down: u64;
+    pressed: u64;
+    /// Typed characters for this frame, read front to back.
+    typed: [u32; 16];
+    typedCount: usize;
+    typedRead: usize;
+}
+
+impl Platform for FakePlatform {
+    fn screenSize(borrow this) -> Dims => this.size;
+    fn frameTime(borrow this) -> f32 => this.dt;
+    fn time(borrow this) -> f64 => this.clock;
+    fn pointer(borrow this) -> Pointer => this.pointerState;
+    fn keyDown(borrow this, key: Key) -> bool => (this.down >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyPressed(borrow this, key: Key) -> bool => (this.pressed >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyRepeated(borrow this, key: Key) -> bool => false;
+    fn nextChar(borrow mut this) -> u32 {
+        if (this.typedRead >= this.typedCount) {
+            return 0;
+        }
+        let c = this.typed[this.typedRead];
+        this.typedRead += 1;
+        return c;
+    }
+    fn setCursor(borrow mut this, cursor: Cursor) {
+        this.cursor = cursor;
+    }
+}
+
+fn platformAt(w: f32, h: f32, x: f32, y: f32) -> FakePlatform => FakePlatform {
+    size: Dims { w: w, h: h },
+    pointerState: Pointer.at(Vec2 { x: x, y: y }),
+    dt: 0.016,
+    clock: 0.0,
+    cursor: Cursor.Default,
+    down: 0,
+    pressed: 0,
+    typed: [0u32; 16],
+    typedCount: 0,
+    typedRead: 0,
+};
+
+fn finish(ui: borrow mut Ui, platform: borrow mut FakePlatform) -> Result<void, TestFailure> {
+    let measure = ClayMeasure { unused: 0 };
+    let ok = match (endFrame(mut ui, mut platform, measure)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    return Check.isTrue(ok, "frame fits");
+}
+
+/// The background color of the first Fill whose box starts at (x, y).
+fn fillAt(ui: borrow Ui, x: f32, y: f32) -> Color? {
+    let tree = ui.layout();
+    for (i in 0..tree.commandCount()) {
+        match (tree.command(i)) {
+            Command.Fill(area, color, _) => {
+                if ((area.x - x).abs() < 0.5 && (area.y - y).abs() < 0.5) {
+                    return color;
+                }
+            }
+            _ => {}
+        }
+    }
+    return null;
+}
+
+fn button(ui: borrow mut Ui) {
+    ui.open(Style.row().id("btn").size(Size.fixed(100.0)).bg(SLATE_800)
+        .hover(Style.of().bg(BLUE_500))
+        .active(Style.of().bg(BLUE_700))
+        .cursor(Cursor.Pointer));
+    ui.close();
+}
+
+@test
+fn tailwindOptionsMapToTheEngine() -> Result<void, TestFailure> {
+    // Shadow preset, rounded, ring, position + inset, gap-x/gap-y by direction, items/justify by direction.
+    let d = Style.row().shadow(ShadowSize.Lg).rounded(Radius.Md).ring(2.0, BLUE_400, 3.0).baseDecl();
+    expect("shadow-lg offsetY", d.shadow.offsetY, 10.0)?;
+    expect("shadow-lg blur", d.shadow.blur, 16.0)?;
+    Check.equalU64(70, d.shadow.color.a as u64)?;
+    expect("rounded-md", d.cornerRadius.bottomLeft, 6.0)?;
+    expect("ring width", d.ring.width, 2.0)?;
+
+    let abs = Style.box().absolute().right(8.0).bottom(4.0).z(10).baseDecl();
+    let anchored = match (abs.floating.element) {
+        AttachPoint.RightBottom => true,
+        _ => false,
+    };
+    Check.isTrue(anchored, "right/bottom anchor the bottom-right corner")?;
+    expect("offset x inward", abs.floating.offset.x, -8.0)?;
+    expect("offset y inward", abs.floating.offset.y, -4.0)?;
+    let fixedTopRight = Style.box().fixed().inset(true, false).baseDecl();
+    let toRoot = match (fixedTopRight.floating.attachTo) {
+        AttachTo.Root => true,
+        _ => false,
+    };
+    Check.isTrue(toRoot, "fixed attaches to the root")?;
+
+    let r = Style.row().gapX(5.0).gapY(9.0).baseDecl();
+    expect("row gap-x is the in-line gap", r.layout.childGap, 5.0)?;
+    expect("row gap-y is the line gap", r.layout.childGapCross, 9.0)?;
+    let c = Style.column().gapX(5.0).gapY(9.0).baseDecl();
+    expect("column gap-y is the in-line gap", c.layout.childGap, 9.0)?;
+    expect("column gap-x is the line gap", c.layout.childGapCross, 5.0)?;
+
+    let j = Style.column().justify(Justify.Between).items(Items.Center).baseDecl();
+    let mainOk = match (j.layout.alignY) {
+        AxisAlign.Between => true,
+        _ => false,
+    };
+    let crossOk = match (j.layout.alignX) {
+        AxisAlign.Center => true,
+        _ => false,
+    };
+    Check.isTrue(mainOk && crossOk, "a column justifies along y and aligns items along x")?;
+
+    // Gradient direction -> CSS angle, via -> three stops at the midpoint.
+    let g = Style.row().gradient(GradientDir.ToBottomRight, INDIGO_600, VIOLET_500).via(PINK_500).baseDecl().gradient;
+    Check.isTrue(g.useAngle && g.angle == 135.0, "to-br is 135 degrees")?;
+    Check.equalU64(3, g.stopCount as u64)?;
+    expect("via at the midpoint", g.stops[1].position, 0.5)?;
+
+    // Text: bold uses the bold face at the 18px base size; the default ink is light gray.
+    let t = Text.of().font(TEXT_XL).bold().config();
+    Check.equalU64(FONT_BOLD as u64, t.fontId as u64)?;
+    expect("bold size", t.fontSize, 18.0)?;
+    let plain = Text.of().font(TEXT_XL).config();
+    expect("text-xl size", plain.fontSize, 22.0)?;
+    Check.equalU64(229, plain.color.r as u64)?;
+    return Ok();
+}
+
+@test
+fn hoverActiveAndCursor() -> Result<void, TestFailure> {
+    var storage = [0u8; 524288];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(64))!;
+    var platform = platformAt(400.0, 300.0, 50.0, 50.0);
+    // Frame 1: nothing laid out yet, so nothing is hovered.
+    ui.begin(mut platform);
+    button(mut ui);
+    finish(mut ui, mut platform)?;
+    Check.isTrue(fillAt(ui, 0.0, 0.0)!.same(Color.hex(SLATE_800)), "first frame: base color")?;
+    // Frame 2: the pointer is over the last frame's box -> hover.
+    ui.begin(mut platform);
+    button(mut ui);
+    finish(mut ui, mut platform)?;
+    Check.isTrue(fillAt(ui, 0.0, 0.0)!.same(Color.hex(BLUE_500)), "hover color")?;
+    let pointerCursor = match (platform.cursor) {
+        Cursor.Pointer => true,
+        _ => false,
+    };
+    Check.isTrue(pointerCursor, "hovering asks for the pointer cursor")?;
+    // Frame 3: pressed -> active wins over hover.
+    platform.pointerState.down = true;
+    platform.pointerState.pressed = true;
+    ui.begin(mut platform);
+    button(mut ui);
+    finish(mut ui, mut platform)?;
+    Check.isTrue(fillAt(ui, 0.0, 0.0)!.same(Color.hex(BLUE_700)), "active color")?;
+    // Frame 4: released over it -> clicked, back to hover.
+    platform.pointerState.down = false;
+    platform.pointerState.pressed = false;
+    platform.pointerState.released = true;
+    ui.begin(mut platform);
+    button(mut ui);
+    let clicked = ui.clicked("btn");
+    finish(mut ui, mut platform)?;
+    Check.isTrue(clicked, "press + release over the button is a click")?;
+    // Frame 5: pointer away -> base color, default cursor, no click.
+    platform.pointerState.released = false;
+    platform.pointerState.position = Vec2 { x: 300.0, y: 250.0 };
+    ui.begin(mut platform);
+    button(mut ui);
+    let again = ui.clicked("btn");
+    finish(mut ui, mut platform)?;
+    Check.isFalse(again, "no click without a release")?;
+    Check.isTrue(fillAt(ui, 0.0, 0.0)!.same(Color.hex(SLATE_800)), "base color again")?;
+    let defaultCursor = match (platform.cursor) {
+        Cursor.Default => true,
+        _ => false,
+    };
+    return Check.isTrue(defaultCursor, "cursor resets when nothing asks");
+}
+
+@test
+fn disabledAndGroupVariants() -> Result<void, TestFailure> {
+    var storage = [0u8; 524288];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(64))!;
+    var platform = platformAt(400.0, 300.0, 20.0, 20.0);
+    for (frame in 0..2) {
+        ui.begin(mut platform);
+        ui.open(Style.row().id("card").size(Size.fixed(200.0)).p(10.0).bg(SLATE_900));
+        // Disabled: hover is suppressed and the disabled variant applies.
+        ui.open(Style.row().id("off").size(Size.fixed(50.0)).bg(EMERALD_600).hover(Style.of().bg(EMERALD_500))
+            .isDisabled(true).disabled(Style.of().bg(SLATE_700)));
+        ui.close();
+        // group-hover: changes while "card" (the parent) is hovered, though the pointer is not over it.
+        ui.open(Style.row().id("badge").size(Size.fixed(20.0)).bg(SLATE_400).groupHover("card", Style.of().bg(PINK_500)));
+        ui.close();
+        ui.close();
+        finish(mut ui, mut platform)?;
+    }
+    Check.isTrue(fillAt(ui, 10.0, 10.0)!.same(Color.hex(SLATE_700)), "disabled overrides hover")?;
+    return Check.isTrue(fillAt(ui, 60.0, 10.0)!.same(Color.hex(PINK_500)), "group-hover applies");
+}
+
+fn scrollList(ui: borrow mut Ui) {
+    ui.open(Style.column().id("list").w(Size.fixed(100.0)).h(Size.fixed(50.0)).scroll(ScrollAxis.Vertical));
+    for (i in 0..10) {
+        ui.open(Style.row().size(Size.fixed(20.0)).bg(SLATE_800));
+        ui.close();
+    }
+    ui.close();
+}
+
+@test
+fn wheelAndDragScrolling() -> Result<void, TestFailure> {
+    var storage = [0u8; 524288];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(64))!;
+    var platform = platformAt(400.0, 300.0, 10.0, 10.0);
+    // Frames 1-2 learn the container's size (50) and content (200).
+    for (f in 0..2) {
+        ui.begin(mut platform);
+        scrollList(mut ui);
+        finish(mut ui, mut platform)?;
+    }
+    // One wheel notch down scrolls 10 per unit (Clay): -1 * 10 * ... Clay adds wheel.y * 10.
+    platform.pointerState.wheel = Vec2 { x: 0.0, y: -3.0 };
+    ui.begin(mut platform);
+    scrollList(mut ui);
+    finish(mut ui, mut platform)?;
+    expect("wheel scrolls by 10 per unit", ui.scrollOffset("list").y, -30.0)?;
+    platform.pointerState.wheel = Vec2.zero();
+    // Far past the end clamps to -(content - size) = -150.
+    platform.pointerState.wheel = Vec2 { x: 0.0, y: -100.0 };
+    ui.begin(mut platform);
+    scrollList(mut ui);
+    finish(mut ui, mut platform)?;
+    expect("clamped to the content", ui.scrollOffset("list").y, -150.0)?;
+    platform.pointerState.wheel = Vec2.zero();
+    // The children move with the offset: the first child is at y = -150.
+    let tree = ui.layout();
+    var firstChildY: f32 = 0.0;
+    var fills: usize = 0;
+    for (i in 0..tree.commandCount()) {
+        match (tree.command(i)) {
+            Command.Fill(area, _, _) => {
+                if (fills == 0) {
+                    firstChildY = area.y;
+                }
+                fills += 1;
+            }
+            _ => {}
+        }
+    }
+    Check.isTrue(fills < 10, "off-screen children are culled")?;
+    ui.scrollToTop("list");
+    expect("scrollToTop", ui.scrollOffset("list").y, 0.0)?;
+    // Drag: press at y=40, move to y=10 -> content follows the pointer by -30.
+    platform.pointerState.position = Vec2 { x: 10.0, y: 40.0 };
+    platform.pointerState.down = true;
+    platform.pointerState.pressed = true;
+    ui.begin(mut platform);
+    scrollList(mut ui);
+    finish(mut ui, mut platform)?;
+    platform.pointerState.pressed = false;
+    platform.pointerState.position = Vec2 { x: 10.0, y: 10.0 };
+    ui.begin(mut platform);
+    scrollList(mut ui);
+    finish(mut ui, mut platform)?;
+    expect("drag scrolls with the pointer", ui.scrollOffset("list").y, -30.0)?;
+    let unused = firstChildY;
+    return Ok();
+}
+
+@test
+fn breakpointsThemeAndContainers() -> Result<void, TestFailure> {
+    var storage = [0u8; 524288];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(64))!;
+    var platform = platformAt(1100.0, 600.0, -1.0, -1.0);
+    ui.begin(mut platform);
+    let lg = match (ui.breakpoint()) {
+        Breakpoint.Lg => true,
+        _ => false,
+    };
+    Check.isTrue(lg, "1100px is lg")?;
+    expect("no container before its first layout", ui.containerWidth("panel"), 0.0)?;
+    ui.open(Style.column().id("panel").w(Size.percent(0.5)).h(Size.fixed(40.0)));
+    ui.close();
+    finish(mut ui, mut platform)?;
+    ui.begin(mut platform);
+    expect("@container reads last frame's width", ui.containerWidth("panel"), 550.0)?;
+    finish(mut ui, mut platform)?;
+    ui.setDarkMode(true);
+    Check.equalU64(SLATE_900 as u64, ui.theme(SLATE_900, WHITE) as u64)?;
+    return Ok();
+}
+
+// ---- transitions: claywind_transition.h's test_transition, case for case ----------------------------------------
+
+fn bgDecl(color: u32) -> Decl {
+    var d = Decl.of();
+    d.background = Color.hex(color);
+    return d;
+}
+
+fn red(d: Decl) -> f32 => round<f32>(d.background.r as u32);
+fn blue(d: Decl) -> f32 => round<f32>(d.background.b as u32);
+
+@test
+fn transitionsEaseAndSettle() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = Transitions.create(memory, 64)!;
+    let RED: u32 = 0xFF0000FF;
+    let BLUE: u32 = 0x0000FFFF;
+    let colLin = TransitionSpec.colorsOnly().durationMs(1000.0).easing(Ease.Linear);
+    var d = bgDecl(RED);
+    t.apply(101, colLin, 0.0, mut d);
+    expect("snap bg.r", red(d), 255.0)?;
+    expect("snap bg.b", blue(d), 0.0)?;
+    d = bgDecl(BLUE);
+    t.apply(101, colLin, 0.5, mut d);
+    expect("mid bg.r", red(d), 127.5)?;
+    expect("mid bg.b", blue(d), 127.5)?;
+    d = bgDecl(BLUE);
+    t.apply(101, colLin, 0.5, mut d);
+    expect("end bg.b", blue(d), 255.0)?;
+    d = bgDecl(BLUE);
+    t.apply(101, colLin, 0.5, mut d);
+    expect("hold bg.b", blue(d), 255.0)?;
+
+    let colOut = TransitionSpec.colorsOnly().durationMs(1000.0).easing(Ease.Out);
+    d = bgDecl(RED);
+    t.apply(102, colOut, 0.0, mut d);
+    d = bgDecl(BLUE);
+    t.apply(102, colOut, 0.5, mut d);
+    expect("ease-out bg.b", blue(d), 191.25)?;
+    expect("ease-out bg.r", red(d), 63.75)?;
+
+    let xf = TransitionSpec.transformOnly().durationMs(1000.0).easing(Ease.Linear);
+    d = Decl.of();
+    t.apply(103, xf, 0.0, mut d);
+    expect("snap scale", d.layout.scale, 1.0)?;
+    d = Decl.of();
+    d.layout.scale = 2.0;
+    t.apply(103, xf, 0.5, mut d);
+    expect("mid scale", d.layout.scale, 1.5)?;
+    d = Decl.of();
+    d.layout.scale = 2.0;
+    t.apply(103, xf, 0.5, mut d);
+    expect("end scale", d.layout.scale, 2.0)?;
+
+    let op = TransitionSpec.opacityOnly().durationMs(1000.0).easing(Ease.Linear);
+    d = Decl.of();
+    t.apply(104, op, 0.0, mut d);
+    expect("snap opacity", d.layout.opacity, 1.0)?;
+    d = Decl.of();
+    d.layout.opacity = 0.5;
+    t.apply(104, op, 0.5, mut d);
+    expect("mid opacity", d.layout.opacity, 0.75)?;
+    d = bgDecl(RED);
+    d.layout.opacity = 0.5;
+    t.apply(104, op, 0.5, mut d);
+    expect("bg untouched by opacity spec", red(d), 255.0)?;
+
+    let del = TransitionSpec.colorsOnly().durationMs(1000.0).delayMs(500.0).easing(Ease.Linear);
+    d = bgDecl(RED);
+    t.apply(106, del, 0.0, mut d);
+    d = bgDecl(BLUE);
+    t.apply(106, del, 0.5, mut d);
+    expect("delay holds start (b)", blue(d), 0.0)?;
+    expect("delay holds start (r)", red(d), 255.0)?;
+    d = bgDecl(BLUE);
+    t.apply(106, del, 0.5, mut d);
+    expect("post-delay midpoint", blue(d), 127.5)?;
+    return Ok();
+}
+
+@test
+fn hoverTransitionsThroughTheUi() -> Result<void, TestFailure> {
+    var storage = [0u8; 524288];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(64))!;
+    var platform = platformAt(400.0, 300.0, 10.0, 10.0);
+    platform.dt = 0.05;
+    let RED: u32 = 0xFF0000FF;
+    let BLUE: u32 = 0x0000FFFF;
+    var blues = [0.0f32; 6];
+    for (frame in 0..6usize) {
+        ui.begin(mut platform);
+        ui.open(Style.row().id("t").size(Size.fixed(40.0)).bg(RED).hover(Style.of().bg(BLUE))
+            .transition(TransitionSpec.colorsOnly().durationMs(200.0).easing(Ease.Linear)));
+        ui.close();
+        finish(mut ui, mut platform)?;
+        blues[frame] = round<f32>(fillAt(ui, 0.0, 0.0)!.b as u32);
+    }
+    // Frame 0 snaps to red (nothing hovered yet); hover starts on frame 1 and eases over 4 frames of 50ms.
+    expect("frame 0 red", blues[0], 0.0)?;
+    expect("frame 1 a quarter", blues[1], 63.75)?;
+    expect("frame 2 half", blues[2], 127.5)?;
+    expect("frame 4 settled", blues[4], 255.0)?;
+    return Ok();
+}
+
+@test
+fn runningOutOfRoomIsReported() -> Result<void, TestFailure> {
+    var storage = [0u8; 524288];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(4))!;
+    var platform = platformAt(100.0, 100.0, -1.0, -1.0);
+    ui.begin(mut platform);
+    for (i in 0..10) {
+        ui.open(Style.row());
+        ui.close();
+    }
+    let measure = ClayMeasure { unused: 0 };
+    let failed = match (endFrame(mut ui, mut platform, measure)) {
+        Ok() => false,
+        Err(_) => true,
+    };
+    return Check.isTrue(failed, "too many elements for the capacity");
+}

@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: MIT
+// The backend seam. claywind_backend.h's vtable of function pointers (a field holding a function cannot be called
+// in CeeSafe) becomes one interface method over the `Command` enum: a backend matches the commands it supports and
+// ignores the rest, as a NULL hook was skipped in C. Dispatch is through `dyn`.
+
+public interface Backend {
+    /// Draws one command. For `Command.Text`, `text` holds the run's UTF-8 bytes; otherwise it is empty.
+    fn draw(borrow mut this, command: Command, text: Slice<u8>);
+}

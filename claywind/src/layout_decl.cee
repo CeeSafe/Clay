@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: MIT
+// Element declarations for the layout engine: the CeeSafe form of Clay's Clay_ElementDeclaration, including every
+// ClayWind fork field (margins, wrap, basis/shrink, transforms, effects). Plain Copy data with a `Decl.of()` default,
+// since CeeSafe has no struct defaults. The Tailwind-style builder (style.cee, Phase 3) produces these.
+
+public const MAX_FLOAT: f32 = 3.4028234663852886e+38;
+public const GRADIENT_MAX_STOPS: usize = 4;
+
+/// Main-axis direction of a container (Clay_LayoutDirection).
+public enum Direction {
+    Row,
+    Column,
+}
+
+public enum SizingKind {
+    Fit,
+    Grow,
+    Fixed,
+    Percent,
+}
+
+/// Sizing along one axis. `min`/`max` bound FIT and GROW (max 0 means unbounded); `percent` is 0..1.
+public struct SizingAxis {
+    public kind: SizingKind;
+    public min: f32;
+    public max: f32;
+    public percent: f32;
+
+    public fn fit() -> SizingAxis => SizingAxis { kind: SizingKind.Fit, min: 0.0, max: 0.0, percent: 0.0 };
+    public fn fitBetween(min: f32, max: f32) -> SizingAxis =>
+        SizingAxis { kind: SizingKind.Fit, min: min, max: max, percent: 0.0 };
+    public fn grow() -> SizingAxis => SizingAxis { kind: SizingKind.Grow, min: 0.0, max: 0.0, percent: 0.0 };
+    public fn growBetween(min: f32, max: f32) -> SizingAxis =>
+        SizingAxis { kind: SizingKind.Grow, min: min, max: max, percent: 0.0 };
+    public fn fixed(v: f32) -> SizingAxis => SizingAxis { kind: SizingKind.Fixed, min: v, max: v, percent: 0.0 };
+    public fn percentOf(p: f32) -> SizingAxis =>
+        SizingAxis { kind: SizingKind.Percent, min: 0.0, max: 0.0, percent: p };
+
+    public fn isFit(this) -> bool => match (this.kind) {
+        SizingKind.Fit => true,
+        _ => false,
+    };
+    public fn isGrow(this) -> bool => match (this.kind) {
+        SizingKind.Grow => true,
+        _ => false,
+    };
+    public fn isFixed(this) -> bool => match (this.kind) {
+        SizingKind.Fixed => true,
+        _ => false,
+    };
+    public fn isPercent(this) -> bool => match (this.kind) {
+        SizingKind.Percent => true,
+        _ => false,
+    };
+}
+
+/// Alignment along one axis. Clay's X and Y alignment enums share values; this is both. `Between`/`Around`/`Evenly`
+/// apply on the main axis only, `Baseline` on the cross axis only.
+public enum AxisAlign {
+    Start,
+    Center,
+    End,
+    Between,
+    Around,
+    Evenly,
+    Baseline,
+}
+
+/// How wrapped lines share the cross axis (Tailwind content-*).
+public enum AlignContent {
+    Start,
+    Center,
+    End,
+    Between,
+    Around,
+    Evenly,
+    Stretch,
+}
+
+/// Blend modes for an element and its subtree (Tailwind mix-blend-*). `None` emits no bracket.
+public enum BlendMode {
+    None,
+    Multiply,
+    Add,
+    Subtract,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+/// Post-filters for an element and its subtree.
+public enum FilterMode {
+    None,
+    Blur,
+    Grayscale,
+    Brightness,
+}
+
+public enum GradientKind {
+    Linear,
+    Radial,
+}
+
+public enum GradientSpread {
+    Pad,
+    Reflect,
+    Repeat,
+}
+
+public enum AttachPoint {
+    LeftTop,
+    LeftCenter,
+    LeftBottom,
+    CenterTop,
+    CenterCenter,
+    CenterBottom,
+    RightTop,
+    RightCenter,
+    RightBottom,
+}
+
+public enum AttachTo {
+    None,
+    Parent,
+    ElementWithId,
+    Root,
+}
+
+public enum TextWrap {
+    Words,
+    Newlines,
+    None,
+}
+
+public enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Layout properties (Clay_LayoutConfig, with the ClayWind fork fields).
+public struct LayoutConfig {
+    public width: SizingAxis;
+    public height: SizingAxis;
+    public padding: Sides;
+    public childGap: f32;
+    public alignX: AxisAlign;
+    public alignY: AxisAlign;
+    public direction: Direction;
+    public reverse: bool;
+    public stretch: bool;
+    public margin: Sides;
+    public translate: Vec2;
+    public wrap: bool;
+    public childGapCross: f32;
+    public basis: f32;
+    public noShrink: bool;
+    public alignContent: AlignContent;
+    public scale: f32;
+    public rotation: f32;
+    public skewX: f32;
+    public skewY: f32;
+    public blend: BlendMode;
+    public opacity: f32;
+    public filter: FilterMode;
+    public filterAmount: f32;
+
+    public fn of() -> LayoutConfig => LayoutConfig {
+        width: SizingAxis.fit(),
+        height: SizingAxis.fit(),
+        padding: Sides.all(0.0),
+        childGap: 0.0,
+        alignX: AxisAlign.Start,
+        alignY: AxisAlign.Start,
+        direction: Direction.Row,
+        reverse: false,
+        stretch: false,
+        margin: Sides.all(0.0),
+        translate: Vec2.zero(),
+        wrap: false,
+        childGapCross: 0.0,
+        basis: 0.0,
+        noShrink: false,
+        alignContent: AlignContent.Start,
+        scale: 0.0,
+        rotation: 0.0,
+        skewX: 0.0,
+        skewY: 0.0,
+        blend: BlendMode.None,
+        opacity: 0.0,
+        filter: FilterMode.None,
+        filterAmount: 0.0,
+    };
+
+    public fn isRow(this) -> bool => match (this.direction) {
+        Direction.Row => true,
+        Direction.Column => false,
+    };
+
+    /// Whether a scale/rotate/skew bracket is emitted (scale 0 and 1 both mean none).
+    public fn hasTransform(this) -> bool => (this.scale != 0.0 && this.scale != 1.0) || this.rotation != 0.0 ||
+        this.skewX != 0.0 || this.skewY != 0.0;
+    public fn hasOpacity(this) -> bool => this.opacity > 0.0 && this.opacity < 1.0;
+    public fn hasFilter(this) -> bool => match (this.filter) {
+        FilterMode.None => false,
+        _ => true,
+    };
+    public fn hasBlend(this) -> bool => match (this.blend) {
+        BlendMode.None => false,
+        _ => true,
+    };
+}
+
+public struct Floating {
+    public offset: Vec2;
+    public expand: Dims;
+    public parentId: u32;
+    public zIndex: i32;
+    public element: AttachPoint;
+    public parent: AttachPoint;
+    public attachTo: AttachTo;
+    /// Clip to the attached parent's clip region (Clay CLAY_CLIP_TO_ATTACHED_PARENT); false = escape clipping.
+    public clipToParent: bool;
+    /// Pointer events pass through to what is underneath (Clay passthrough capture mode).
+    public passthrough: bool;
+
+    public fn none() -> Floating => Floating {
+        offset: Vec2.zero(),
+        expand: Dims { w: 0.0, h: 0.0 },
+        parentId: 0,
+        zIndex: 0,
+        element: AttachPoint.LeftTop,
+        parent: AttachPoint.LeftTop,
+        attachTo: AttachTo.None,
+        clipToParent: false,
+        passthrough: false,
+    };
+
+    public fn isFloating(this) -> bool => match (this.attachTo) {
+        AttachTo.None => false,
+        _ => true,
+    };
+}
+
+public struct Clip {
+    public horizontal: bool;
+    public vertical: bool;
+    public childOffset: Vec2;
+
+    public fn none() -> Clip => Clip { horizontal: false, vertical: false, childOffset: Vec2.zero() };
+    public fn any(this) -> bool => this.horizontal || this.vertical;
+}
+
+public struct BorderWidth {
+    public left: f32;
+    public right: f32;
+    public top: f32;
+    public bottom: f32;
+    public betweenChildren: f32;
+
+    public fn none() -> BorderWidth =>
+        BorderWidth { left: 0.0, right: 0.0, top: 0.0, bottom: 0.0, betweenChildren: 0.0 };
+    public fn all(w: f32) -> BorderWidth => BorderWidth { left: w, right: w, top: w, bottom: w, betweenChildren: 0.0 };
+    public fn any(this) -> bool => this.left > 0.0 || this.right > 0.0 || this.top > 0.0 || this.bottom > 0.0 ||
+        this.betweenChildren > 0.0;
+}
+
+public struct Border {
+    public color: Color;
+    public width: BorderWidth;
+}
+
+public struct Shadow {
+    public color: Color;
+    public offsetX: f32;
+    public offsetY: f32;
+    public blur: f32;
+    public spread: f32;
+}
+
+public struct Ring {
+    public color: Color;
+    public width: f32;
+    public offset: f32;
+}
+
+public struct GradientStop {
+    public color: Color;
+    /// 0..1 along the gradient line.
+    public position: f32;
+}
+
+public struct Gradient {
+    public from: Color;
+    public to: Color;
+    public vertical: bool;
+    public kind: GradientKind;
+    public useAngle: bool;
+    /// CSS degrees: 0 = to top, 90 = to right, 180 = to bottom.
+    public angle: f32;
+    public stopCount: usize;
+    public stops: [GradientStop; 4];
+    public spread: GradientSpread;
+
+    public fn none() -> Gradient {
+        let clear = Color.hex(TRANSPARENT);
+        let stop = GradientStop { color: clear, position: 0.0 };
+        return Gradient {
+            from: clear,
+            to: clear,
+            vertical: false,
+            kind: GradientKind.Linear,
+            useAngle: false,
+            angle: 0.0,
+            stopCount: 0,
+            stops: [stop, stop, stop, stop],
+            spread: GradientSpread.Pad,
+        };
+    }
+
+    public fn present(this) -> bool => this.from.a > 0 || this.to.a > 0 || this.stopCount > 0;
+}
+
+/// A vector icon drawn by the renderer (ids are controls.cee's ICON_* constants; 0 = none).
+public struct Icon {
+    public id: u32;
+    public color: Color;
+    public stroke: f32;
+}
+
+/// Everything about one element (Clay_ElementDeclaration).
+public struct Decl {
+    public layout: LayoutConfig;
+    public background: Color;
+    public cornerRadius: Corners;
+    /// width / height; 0 = none.
+    public aspectRatio: f32;
+    /// An image handle the backend understands; 0 = none.
+    public image: u32;
+    public floating: Floating;
+    /// A custom-draw handle passed to the backend; 0 = none.
+    public custom: u32;
+    public clip: Clip;
+    public border: Border;
+    public shadow: Shadow;
+    public ring: Ring;
+    public gradient: Gradient;
+    public icon: Icon;
+
+    public fn of() -> Decl {
+        let clear = Color.hex(TRANSPARENT);
+        return Decl {
+            layout: LayoutConfig.of(),
+            background: clear,
+            cornerRadius: Corners.all(0.0),
+            aspectRatio: 0.0,
+            image: 0,
+            floating: Floating.none(),
+            custom: 0,
+            clip: Clip.none(),
+            border: Border { color: clear, width: BorderWidth.none() },
+            shadow: Shadow { color: clear, offsetX: 0.0, offsetY: 0.0, blur: 0.0, spread: 0.0 },
+            ring: Ring { color: clear, width: 0.0, offset: 0.0 },
+            gradient: Gradient.none(),
+            icon: Icon { id: 0, color: clear, stroke: 0.0 },
+        };
+    }
+
+    /// A fixed-size box (handy in tests and for spacers).
+    public fn sized(w: f32, h: f32) -> Decl {
+        var d = Decl.of();
+        d.layout.width = SizingAxis.fixed(w);
+        d.layout.height = SizingAxis.fixed(h);
+        return d;
+    }
+}
+
+/// Text properties (Clay_TextElementConfig).
+public struct TextConfig {
+    public color: Color;
+    public fontId: u32;
+    public fontSize: f32;
+    public letterSpacing: f32;
+    /// 0 = the measured line height.
+    public lineHeight: f32;
+    public wrap: TextWrap;
+    public align: TextAlign;
+    /// Keep at most this many lines, ellipsizing the last (0 = no clamp).
+    public lineClamp: usize;
+
+    public fn of(fontSize: f32) -> TextConfig => TextConfig {
+        color: Color.hex(WHITE),
+        fontId: 0,
+        fontSize: fontSize,
+        letterSpacing: 0.0,
+        lineHeight: 0.0,
+        wrap: TextWrap.Words,
+        align: TextAlign.Left,
+        lineClamp: 0,
+    };
+
+    public fn wrapsWords(this) -> bool => match (this.wrap) {
+        TextWrap.Words => true,
+        _ => false,
+    };
+}

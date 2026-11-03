@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: MIT
+// The controls driven by a scripted platform, ported from tests/platform_test.c: a button, a text field with a
+// caret, a slider and a spin input, frame by frame, asserting the caller-owned state.
+
+import claywind;
+
+/// The C test's fixed-advance "font": 0.6 em per glyph, as tall as the font size, baseline at 0.8 em.
+struct FixedAdvance {
+    unused: u8;
+}
+
+impl TextMetrics for FixedAdvance {
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims => Dims {
+        w: 0.6 * config.fontSize * round<f32>(utf8.length),
+        h: config.fontSize,
+    };
+    fn baseline(borrow this, config: TextConfig) -> f32 => 0.8 * config.fontSize;
+}
+
+/// The caller-owned state the controls edit.
+struct App {
+    saveHit: bool;
+    name: [u8; 32];
+    nameLen: usize;
+    nameCaret: usize;
+    volume: f32;
+    qty: i32;
+}
+
+fn showcase(ui: borrow mut Ui, app: borrow mut App) {
+    let metrics = FixedAdvance { unused: 0 };
+    ui.open(Style.column().id("root").w(Size.grow()).h(Size.grow()).p(space(4.0)).gap(space(3.0)));
+    app.saveHit = Controls.button(mut ui, "save", "Save");
+    textInputEx(mut ui, metrics, "name", mut app.name[..], mut app.nameLen, mut app.nameCaret);
+    Controls.slider(mut ui, "vol", mut app.volume, 0.0, 1.0, 200.0);
+    Controls.spinInput(mut ui, "qty", mut app.qty, 0, 10, 1);
+    ui.close();
+}
+
+/// One frame, then the one-frame input edges are consumed (as the C test's frame()).
+/// The platform sits in a struct so each frame lends it as a field (a `borrow mut` parameter handed to a `dyn`
+/// parameter is moved, not reborrowed).
+struct Rig {
+    p: FakePlatform;
+}
+
+fn step(ui: borrow mut Ui, rig: borrow mut Rig, app: borrow mut App) -> Result<void, TestFailure> {
+    ui.begin(mut rig.p);
+    showcase(mut ui, mut app);
+    let metrics = FixedAdvance { unused: 0 };
+    let ok = match (endFrame(mut ui, mut rig.p, metrics)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    rig.p.pointerState.pressed = false;
+    rig.p.pointerState.released = false;
+    rig.p.pressed = 0;
+    rig.p.typedCount = 0;
+    rig.p.typedRead = 0;
+    rig.p.clock += 1.0 / 60.0;
+    return Check.isTrue(ok, "frame fits");
+}
+
+fn press(rig: borrow mut Rig, k: Key) {
+    rig.p.pressed = 1u64 << (keyIndex(k) as u64);
+}
+
+fn typeChars(rig: borrow mut Rig, text: StringView) {
+    let b = text.bytes();
+    for (i in 0..b.length) {
+        rig.p.typed[i] = b[i] as u32;
+    }
+    rig.p.typedCount = b.length;
+}
+
+fn centerOf(ui: borrow Ui, name: StringView) -> Vec2 {
+    let b = ui.boxOf(name)!;
+    return Vec2 { x: b.x + b.w / 2.0, y: b.y + b.h / 2.0 };
+}
+
+fn heightOf(ui: borrow Ui, name: StringView) -> f32 => ui.boxOf(name)!.h;
+
+fn nameIs(app: borrow App, want: StringView) -> bool {
+    let w = want.bytes();
+    if (app.nameLen != w.length) {
+        return false;
+    }
+    for (i in 0..w.length) {
+        if (app.name[i] != w[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn isCursor(c: Cursor, pointer: bool) -> bool => match (c) {
+    Cursor.Pointer => pointer,
+    Cursor.Default => !pointer,
+    Cursor.Text => false,
+};
+
+fn click(ui: borrow mut Ui, rig: borrow mut Rig, app: borrow mut App) -> Result<void, TestFailure> {
+    rig.p.pointerState.pressed = true;
+    rig.p.pointerState.down = true;
+    step(mut ui, mut rig, mut app)?;
+    rig.p.pointerState.down = false;
+    rig.p.pointerState.released = true;
+    return step(mut ui, mut rig, mut app);
+}
+
+@test
+fn controlsDrivenByAScriptedPlatform() -> Result<void, TestFailure> {
+    var storage = [0u8; 1048576];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(128))!;
+    var rig = Rig { p: platformAt(800.0, 600.0, -1.0, -1.0) };
+    var app = App { saveHit: false, name: [0u8; 32], nameLen: 0, nameCaret: 0, volume: 0.25, qty: 3 };
+
+    // Frame 1 lays out so element boxes exist.
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(ui.boxOf("save")!.w > 0.0 && ui.boxOf("name")!.w > 0.0, "controls laid out")?;
+    let emptyHeight = heightOf(ui, "name");
+    Check.isTrue(isCursor(rig.p.cursor, false), "cursor reset to default each frame")?;
+
+    // Hover the button: the pointer cursor is requested; nothing is clicked yet.
+    rig.p.pointerState.position = centerOf(ui, "save");
+    step(mut ui, mut rig, mut app)?;
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(isCursor(rig.p.cursor, true), "hovering a cursor-pointer element sets the pointer cursor")?;
+    Check.isTrue(!app.saveHit, "button not hit without a click")?;
+
+    // Click the button.
+    rig.p.pointerState.pressed = true;
+    rig.p.pointerState.down = true;
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(app.saveHit, "the button reports the click")?;
+    rig.p.pointerState.down = false;
+    rig.p.pointerState.released = true;
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(!app.saveHit, "a button hit is a one-frame event")?;
+
+    // Click into the text field, type, edit at the caret.
+    rig.p.pointerState.position = centerOf(ui, "name");
+    step(mut ui, mut rig, mut app)?;
+    click(mut ui, mut rig, mut app)?;
+    Check.isTrue(ui.hasFocusNamed("name"), "clicking the text field focuses it")?;
+    typeChars(mut rig, "Hi");
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(nameIs(app, "Hi") && app.nameCaret == 2, "typed text lands in the caller's buffer")?;
+    step(mut ui, mut rig, mut app)?;
+    expect("an empty field keeps its one-line height", heightOf(ui, "name"), emptyHeight)?;
+    press(mut rig, Key.Left);
+    step(mut ui, mut rig, mut app)?;
+    typeChars(mut rig, "-");
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(nameIs(app, "H-i") && app.nameCaret == 2, "insert at the caret after Left")?;
+    press(mut rig, Key.Backspace);
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(nameIs(app, "Hi") && app.nameCaret == 1, "backspace at the caret")?;
+    press(mut rig, Key.Enter);
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(!ui.hasFocusNamed("name"), "Enter clears focus")?;
+
+    // Tab cycling: the first Tab focuses the first registered focusable (the text field).
+    press(mut rig, Key.Tab);
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(ui.hasFocusNamed("name"), "Tab focuses the first focusable control")?;
+    press(mut rig, Key.Tab);
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(ui.hasFocusNamed("qty"), "Tab moves to the next control (the spin input)")?;
+    press(mut rig, Key.Up);
+    step(mut ui, mut rig, mut app)?;
+    Check.equalU64(4, truncate<u64>(app.qty))?;
+    rig.p.down = 1u64 << (keyIndex(Key.LeftShift) as u64);
+    press(mut rig, Key.Tab);
+    step(mut ui, mut rig, mut app)?;
+    rig.p.down = 0;
+    Check.isTrue(ui.hasFocusNamed("name"), "Shift-Tab moves focus back")?;
+
+    // Slider drag: press on the track at 75% and the value follows the pointer while held.
+    let vb = ui.boxOf("vol")!;
+    rig.p.pointerState.position = Vec2 { x: vb.x + vb.w * 0.75, y: vb.y + vb.h / 2.0 };
+    step(mut ui, mut rig, mut app)?;
+    rig.p.pointerState.pressed = true;
+    rig.p.pointerState.down = true;
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(app.volume > 0.7 && app.volume < 0.8, "the slider follows the pointer")?;
+    rig.p.pointerState.position.x = vb.x + vb.w * 0.5;
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(app.volume > 0.45 && app.volume < 0.55, "the slider keeps capturing while held")?;
+    rig.p.pointerState.down = false;
+    rig.p.pointerState.released = true;
+    step(mut ui, mut rig, mut app)?;
+    rig.p.pointerState.position.x = vb.x;
+    step(mut ui, mut rig, mut app)?;
+    Check.isTrue(app.volume > 0.45 && app.volume < 0.55, "the slider releases capture on release")?;
+
+    // The spin input's + button.
+    rig.p.pointerState.position = centerOf(ui, "qty~inc");
+    step(mut ui, mut rig, mut app)?;
+    click(mut ui, mut rig, mut app)?;
+    Check.equalU64(5, truncate<u64>(app.qty))?;
+
+    // Caret measurement goes through the metrics the frame uses.
+    let m = FixedAdvance { unused: 0 };
+    let hello = "Hello";
+    expect("fixed-advance width", m.measure(hello.bytes(), TextConfig.of(20.0)).w, 60.0)?;
+    return Ok();
+}
+
+@test
+fn choiceControlsSelectAndClose() -> Result<void, TestFailure> {
+    var storage = [0u8; 1048576];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = Ui.create(memory, UiCapacity.of(128))!;
+    var p = platformAt(800.0, 600.0, -1.0, -1.0);
+    let metrics = FixedAdvance { unused: 0 };
+    let sizes = "Small|Medium|Large";
+    Check.equalU64(3, itemCount(sizes) as u64)?;
+    Check.isTrue(itemAt(sizes, 1).bytes().length == 6 && itemCount("") == 0, "item lists split on '|'")?;
+    var picked: usize = 0;
+    var open = false;
+    var tab: usize = 0;
+    var radioPick: usize = 0;
+    var checked = false;
+    for (frame in 0..12) {
+        ui.begin(mut p);
+        ui.open(Style.column().id("root").w(Size.grow()).h(Size.grow()).p(16.0).gap(12.0));
+        Controls.tabs(mut ui, "tabs", "One|Two|Three", mut tab);
+        Controls.checkbox(mut ui, "chk", "Check me", mut checked);
+        Controls.radio(mut ui, "rad", sizes, mut radioPick);
+        ui.open(Style.box().id("dd-wrap").w(Size.fixed(200.0)));
+        Controls.dropdown(mut ui, "dd", sizes, mut picked, mut open);
+        ui.close();
+        ui.close();
+        let ok = match (endFrame(mut ui, mut p, metrics)) {
+            Ok() => true,
+            Err(_) => false,
+        };
+        Check.isTrue(ok, "frame fits")?;
+        p.pointerState.pressed = false;
+        // Script: click the second tab, the checkbox, the third radio, open the dropdown, pick "Large".
+        let target: StringView = match (frame) {
+            1 => "tabs~1",
+            3 => "chk",
+            5 => "rad~2",
+            7 => "dd",
+            9 => "dd~2",
+            _ => "",
+        };
+        if (target.length > 0) {
+            p.pointerState.position = centerOf(ui, target);
+            p.pointerState.pressed = true;
+        }
+    }
+    Check.equalU64(1, tab as u64)?;
+    Check.isTrue(checked, "the checkbox toggled")?;
+    Check.equalU64(2, radioPick as u64)?;
+    Check.equalU64(2, picked as u64)?;
+    return Check.isTrue(!open, "choosing an item closes the dropdown");
+}

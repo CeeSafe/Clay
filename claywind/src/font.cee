@@ -1,0 +1,648 @@
+// SPDX-License-Identifier: MIT
+// TrueType fonts: a port of ThorVG 1.1.2's sfnt/TTF reader (tvgSfntReader.cpp, tvgTtfReader.cpp), which is what
+// renders ClayWind's text today, so glyph shapes, advances, kerning and the ascent match it.
+//   - tables by binary search of the table directory; head (unitsPerEm, loca format), hhea (ascent, descent,
+//     line gap, long metrics count), maxp, cmap (3/10 or 0/4 format 12, else 3/1 or 0/3 format 4 or 6), hmtx;
+//   - outlines from glyf/loca: quadratic contours become cubics (the 2/3 rule), y flipped; composite glyphs place
+//     their components by offset (ThorVG ignores component scales too);
+//   - kerning from a format-0 `kern` table (no GPOS, as ThorVG).
+// Fonts read only the bytes they are given: the caller owns them (the Raster keeps them in its pool).
+
+const INVALID_GLYPH: u32 = 0xFFFFFFFF;
+
+/// A parsed font: table offsets and metrics (in font units).
+public struct FontInfo {
+    public unitsPerEm: f32;
+    public ascent: f32;
+    public descent: f32;
+    public lineGap: f32;
+    locaFormat: u32;
+    numHmtx: u32;
+    cmap: usize;
+    hmtx: usize;
+    loca: usize;
+    glyf: usize;
+    kern: usize;
+    maxp: usize;
+}
+
+/// One glyph's outline in font units (y already flipped, as ThorVG builds it): ops 0 = move, 1 = line,
+/// 2 = cubic (three points), 3 = close.
+struct GlyphOutline {
+    ops: [u8; 1024];
+    xs: [f32; 3072];
+    ys: [f32; 3072];
+    opCount: usize;
+    ptCount: usize;
+    overflowed: bool;
+}
+
+fn emptyOutline() -> GlyphOutline => GlyphOutline {
+    ops: [0u8; 1024],
+    xs: [0.0f32; 3072],
+    ys: [0.0f32; 3072],
+    opCount: 0,
+    ptCount: 0,
+    overflowed: false,
+};
+
+fn outlineOp(o: borrow mut GlyphOutline, op: u8, x: f32, y: f32) {
+    if (o.opCount >= 1024 || o.ptCount >= 3072) {
+        o.overflowed = true;
+        return;
+    }
+    o.ops[o.opCount] = op;
+    o.opCount += 1;
+    if (op != 3) {
+        o.xs[o.ptCount] = x;
+        o.ys[o.ptCount] = y;
+        o.ptCount += 1;
+    }
+}
+
+fn outlineCubic(o: borrow mut GlyphOutline, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) {
+    if (o.opCount >= 1024 || o.ptCount + 3 > 3072) {
+        o.overflowed = true;
+        return;
+    }
+    o.ops[o.opCount] = 2;
+    o.opCount += 1;
+    o.xs[o.ptCount] = ax;
+    o.ys[o.ptCount] = ay;
+    o.xs[o.ptCount + 1] = bx;
+    o.ys[o.ptCount + 1] = by;
+    o.xs[o.ptCount + 2] = cx;
+    o.ys[o.ptCount + 2] = cy;
+    o.ptCount += 3;
+}
+
+// ---- byte access (big-endian, bounds-checked by the slice) ---------------------------------------------------
+
+fn valid(d: Slice<u8>, offset: usize, margin: usize) -> bool => offset <= d.length && d.length - offset >= margin;
+
+fn u8at(d: Slice<u8>, o: usize) -> u32 => d[o] as u32;
+fn u16at(d: Slice<u8>, o: usize) -> u32 => ((d[o] as u32) << 8) | (d[o + 1] as u32);
+fn i16at(d: Slice<u8>, o: usize) -> i32 {
+    let v = u16at(d, o);
+    return if (v >= 0x8000) truncate<i32>(v) - 65536 else truncate<i32>(v);
+}
+fn i8at(d: Slice<u8>, o: usize) -> i32 {
+    let v = d[o] as u32;
+    return if (v >= 0x80) truncate<i32>(v) - 256 else truncate<i32>(v);
+}
+fn u32at(d: Slice<u8>, o: usize) -> u32 => (u16at(d, o) << 16) | u16at(d, o + 2);
+
+fn tagValue(t: [u8; 4]) -> u32 => ((t[0] as u32) << 24) | ((t[1] as u32) << 16) | ((t[2] as u32) << 8) | (t[3] as u32);
+
+/// SfntReader::table: the offset of table `tag`, or 0 (bsearch over the sorted 16-byte directory records).
+fn tableOffset(d: Slice<u8>, tag: [u8; 4]) -> usize {
+    if (!valid(d, 0, 12)) {
+        return 0;
+    }
+    let count = u16at(d, 4) as usize;
+    if (!valid(d, 12, count * 16)) {
+        return 0;
+    }
+    let key = tagValue(tag);
+    var lo: usize = 0;
+    var hi = count;
+    while (lo < hi) {
+        let mid = lo + (hi - lo) / 2;
+        let v = u32at(d, 12 + mid * 16);
+        if (v == key) {
+            return u32at(d, 12 + mid * 16 + 8) as usize;
+        }
+        if (v < key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0;
+}
+
+/// SfntReader::header + TtfReader::header: null if this is not a usable TrueType font.
+public fn parseFont(d: Slice<u8>) -> FontInfo? {
+    if (!valid(d, 0, 12)) {
+        return null;
+    }
+    let kind = u32at(d, 0);
+    if (kind != 0x00010000 && kind != 0x74727565) {
+        return null;
+    }
+    let head = tableOffset(d, ['h', 'e', 'a', 'd']);
+    if (head == 0 || !valid(d, head, 54)) {
+        return null;
+    }
+    let hhea = tableOffset(d, ['h', 'h', 'e', 'a']);
+    if (hhea == 0 || !valid(d, hhea, 36)) {
+        return null;
+    }
+    let maxp = tableOffset(d, ['m', 'a', 'x', 'p']);
+    if (maxp == 0 || !valid(d, maxp, 6)) {
+        return null;
+    }
+    let glyphs = u16at(d, maxp + 4);
+    let hmtxs = u16at(d, hhea + 34);
+    if (glyphs == 0 || hmtxs == 0 || hmtxs > glyphs) {
+        return null;
+    }
+    let cmap = tableOffset(d, ['c', 'm', 'a', 'p']);
+    if (cmap == 0 || !valid(d, cmap, 4)) {
+        return null;
+    }
+    let hmtx = tableOffset(d, ['h', 'm', 't', 'x']);
+    if (!valid(d, hmtx, (hmtxs as usize) * 4)) {
+        return null;
+    }
+    let kern = tableOffset(d, ['k', 'e', 'r', 'n']);
+    if (kern != 0 && (!valid(d, kern, 4) || u16at(d, kern) != 0)) {
+        return null;
+    }
+    let loca = tableOffset(d, ['l', 'o', 'c', 'a']);
+    let glyf = tableOffset(d, ['g', 'l', 'y', 'f']);
+    if (loca == 0 || glyf == 0) {
+        return null;
+    }
+    return FontInfo {
+        unitsPerEm: round<f32>(u16at(d, head + 18)),
+        ascent: round<f32>(i16at(d, hhea + 4)),
+        descent: round<f32>(i16at(d, hhea + 6)),
+        lineGap: round<f32>(i16at(d, hhea + 8)),
+        locaFormat: u16at(d, head + 50),
+        numHmtx: hmtxs,
+        cmap: cmap,
+        hmtx: hmtx,
+        loca: loca,
+        glyf: glyf,
+        kern: kern,
+        maxp: maxp,
+    };
+}
+
+// ---- character map ---------------------------------------------------------------------------------------------
+
+fn cmap12(d: Slice<u8>, table: usize, codepoint: u32) -> u32 {
+    let len = u32at(d, table + 4) as usize;
+    if (len < 16 || !valid(d, table, len)) {
+        return INVALID_GLYPH;
+    }
+    let count = u32at(d, table + 12) as usize;
+    for (i in 0..count) {
+        let first = u32at(d, table + i * 12 + 16);
+        let last = u32at(d, table + i * 12 + 20);
+        if (codepoint < first || codepoint > last) {
+            continue;
+        }
+        return (codepoint - first) + u32at(d, table + i * 12 + 24);
+    }
+    return INVALID_GLYPH;
+}
+
+/// SfntReader::cmap_4 (the binary search over end codes that settles on the next highest).
+fn cmap4(d: Slice<u8>, table: usize, codepoint: u32) -> u32 {
+    if (codepoint > 0xFFFF || !valid(d, table, 8)) {
+        return INVALID_GLYPH;
+    }
+    let segX2 = u16at(d, table) as usize;
+    if (segX2 == 0 || (segX2 & 1) != 0) {
+        return INVALID_GLYPH;
+    }
+    let endCodes = table + 8;
+    let startCodes = endCodes + segX2 + 2;
+    let idDeltas = startCodes + segX2;
+    let idRangeOffsets = idDeltas + segX2;
+    if (!valid(d, idRangeOffsets, segX2)) {
+        return INVALID_GLYPH;
+    }
+    let n = segX2 / 2;
+    var low: usize = 0;
+    var high = n - 1;
+    while (low != high) {
+        let mid = low + (high - low) / 2;
+        if (codepoint > u16at(d, endCodes + mid * 2)) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let segment = low * 2;
+    let startCode = u16at(d, startCodes + segment);
+    if (startCode > codepoint) {
+        return 0;
+    }
+    let delta = u16at(d, idDeltas + segment);
+    let rangeOffset = u16at(d, idRangeOffsets + segment);
+    if (rangeOffset == 0) {
+        return (codepoint + delta) & 0xFFFF;
+    }
+    let offset = idRangeOffsets + segment + (rangeOffset as usize) + 2 * ((codepoint - startCode) as usize);
+    if (!valid(d, offset, 2)) {
+        return INVALID_GLYPH;
+    }
+    let id = u16at(d, offset);
+    return if (id > 0) (id + delta) & 0xFFFF else 0;
+}
+
+fn cmap6(d: Slice<u8>, table: usize, codepoint: u32) -> u32 {
+    if (codepoint > 0xFFFF) {
+        return 0;
+    }
+    let first = u16at(d, table);
+    let count = u16at(d, table + 2);
+    if (!valid(d, table, 4 + 2 * (count as usize)) || codepoint < first || codepoint - first >= count) {
+        return INVALID_GLYPH;
+    }
+    return u16at(d, table + 4 + 2 * ((codepoint - first) as usize));
+}
+
+/// SfntReader::glyph: full-repertoire maps first, then BMP maps.
+public fn glyphIndex(d: Slice<u8>, f: FontInfo, codepoint: u32) -> u32 {
+    let count = u16at(d, f.cmap + 2) as usize;
+    if (!valid(d, f.cmap, 4 + count * 8)) {
+        return INVALID_GLYPH;
+    }
+    for (i in 0..count) {
+        let entry = f.cmap + 4 + i * 8;
+        let kind = u16at(d, entry) * 64 + u16at(d, entry + 2);
+        if (kind == 4 || kind == 202) {
+            let table = f.cmap + (u32at(d, entry + 4) as usize);
+            if (!valid(d, table, 8)) {
+                return INVALID_GLYPH;
+            }
+            return if (u16at(d, table) == 12) cmap12(d, table, codepoint) else INVALID_GLYPH;
+        }
+    }
+    for (i in 0..count) {
+        let entry = f.cmap + 4 + i * 8;
+        let kind = u16at(d, entry) * 64 + u16at(d, entry + 2);
+        if (kind == 3 || kind == 193) {
+            let table = f.cmap + (u32at(d, entry + 4) as usize);
+            if (!valid(d, table, 6)) {
+                return INVALID_GLYPH;
+            }
+            let format = u16at(d, table);
+            if (format == 4) {
+                return cmap4(d, table + 6, codepoint);
+            }
+            if (format == 6) {
+                return cmap6(d, table + 6, codepoint);
+            }
+            return INVALID_GLYPH;
+        }
+    }
+    return INVALID_GLYPH;
+}
+
+// ---- metrics ---------------------------------------------------------------------------------------------------
+
+/// SfntReader::glyphMetrics: the advance width in font units.
+public fn glyphAdvance(d: Slice<u8>, f: FontInfo, glyph: u32) -> f32 {
+    if (glyph < f.numHmtx) {
+        let o = f.hmtx + 4 * (glyph as usize);
+        return if (valid(d, o, 4)) round<f32>(u16at(d, o)) else 0.0;
+    }
+    let boundary = f.hmtx + 4 * (f.numHmtx as usize);
+    return if (boundary >= 4 && valid(d, boundary - 4, 4)) round<f32>(u16at(d, boundary - 4)) else 0.0;
+}
+
+/// TtfReader::positioning: the horizontal kerning between two glyphs, in font units (0 without a kern table).
+public fn kerning(d: Slice<u8>, f: FontInfo, left: u32, right: u32) -> f32 {
+    if (f.kern == 0) {
+        return 0.0;
+    }
+    var k = f.kern;
+    var tables = u16at(d, k + 2);
+    k += 4;
+    var x: f32 = 0.0;
+    while (tables > 0) {
+        if (!valid(d, k, 6)) {
+            return x;
+        }
+        let length = u16at(d, k + 2) as usize;
+        let format = u8at(d, k + 4);
+        let flags = u8at(d, k + 5);
+        k += 6;
+        if (format == 0 && (flags & 1) != 0 && (flags & 2) == 0) {
+            if (!valid(d, k, 8)) {
+                return x;
+            }
+            let pairs = u16at(d, k) as usize;
+            k += 8;
+            let key = (left << 16) | right;
+            var lo: usize = 0;
+            var hi = pairs;
+            while (lo < hi) {
+                let mid = lo + (hi - lo) / 2;
+                let rec = k + mid * 6;
+                if (!valid(d, rec, 6)) {
+                    break;
+                }
+                let v = u32at(d, rec);
+                if (v == key) {
+                    if ((flags & 4) == 0) {
+                        x += round<f32>(i16at(d, rec + 4));
+                    }
+                    break;
+                }
+                if (v < key) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+        }
+        // As ThorVG: advance by the subtable length from where the reading stopped.
+        k += length;
+        tables -= 1;
+    }
+    return x;
+}
+
+// ---- outlines --------------------------------------------------------------------------------------------------
+
+/// TtfReader::outlineOffset: the glyph's outline, or 0 for an empty glyph.
+fn outlineOffset(d: Slice<u8>, f: FontInfo, glyph: u32) -> usize {
+    var cur: usize = 0;
+    var next: usize = 0;
+    if (f.locaFormat == 0) {
+        let base = f.loca + 2 * (glyph as usize);
+        if (!valid(d, base, 4)) {
+            return 0;
+        }
+        cur = 2 * (u16at(d, base) as usize);
+        next = 2 * (u16at(d, base + 2) as usize);
+    } else {
+        let base = f.loca + 4 * (glyph as usize);
+        if (!valid(d, base, 8)) {
+            return 0;
+        }
+        cur = u32at(d, base) as usize;
+        next = u32at(d, base + 4) as usize;
+    }
+    return if (cur == next) 0 else f.glyf + cur;
+}
+
+/// TtfReader::convert: appends the glyph's outline, offset by (ox, oy) font units, to `out`.
+fn decodeGlyph(
+    d: Slice<u8>,
+    f: FontInfo,
+    glyph: u32,
+    ox: f32,
+    oy: f32,
+    depth: u32,
+    out: borrow mut GlyphOutline,
+) -> bool {
+    let at = outlineOffset(d, f, glyph);
+    if (at == 0) {
+        return true;
+    }
+    if (!valid(d, at, 10)) {
+        return false;
+    }
+    let contours = i16at(d, at);
+    if (contours == 0) {
+        return false;
+    }
+    if (contours < 0) {
+        var maxDepth: u32 = 16;
+        if (valid(d, f.maxp, 32) && u32at(d, f.maxp) >= 0x00010000) {
+            maxDepth = u16at(d, f.maxp + 30);
+        }
+        if (depth > maxDepth) {
+            return false;
+        }
+        return decodeComposite(d, f, at, ox, oy, depth + 1, out);
+    }
+    let cn = truncate<usize>(contours);
+    var p = at + 10;
+    if (!valid(d, p, cn * 2 + 2)) {
+        return false;
+    }
+    let pointCount = (u16at(d, p + (cn - 1) * 2) as usize) + 1;
+    if (pointCount > 1024) {
+        out.overflowed = true;
+        return false;
+    }
+    var ends = [0usize; 256];
+    if (cn > 256) {
+        out.overflowed = true;
+        return false;
+    }
+    for (i in 0..cn) {
+        ends[i] = u16at(d, p) as usize;
+        p += 2;
+    }
+    p += 2 + (u16at(d, p) as usize);
+    // Flags.
+    var flags = [0u8; 1024];
+    var value: u8 = 0;
+    var repeat: u32 = 0;
+    for (i in 0..pointCount) {
+        if (repeat > 0) {
+            repeat -= 1;
+        } else {
+            if (!valid(d, p, 1)) {
+                return false;
+            }
+            value = d[p];
+            p += 1;
+            if ((value & 0x08) != 0) {
+                if (!valid(d, p, 1)) {
+                    return false;
+                }
+                repeat = d[p] as u32;
+                p += 1;
+            }
+        }
+        flags[i] = value;
+    }
+    // Coordinates: x deltas, then y deltas (y negated, as ThorVG builds it).
+    var px = [0.0f32; 1024];
+    var py = [0.0f32; 1024];
+    var acc: i32 = 0;
+    for (i in 0..pointCount) {
+        let fl = flags[i];
+        if ((fl & 0x02) != 0) {
+            if (!valid(d, p, 1)) {
+                return false;
+            }
+            let v = truncate<i32>(d[p] as u32);
+            p += 1;
+            acc += if ((fl & 0x10) != 0) v else -v;
+        } else if ((fl & 0x10) == 0) {
+            if (!valid(d, p, 2)) {
+                return false;
+            }
+            acc += i16at(d, p);
+            p += 2;
+        }
+        px[i] = ox + round<f32>(acc);
+    }
+    acc = 0;
+    for (i in 0..pointCount) {
+        let fl = flags[i];
+        if ((fl & 0x04) != 0) {
+            if (!valid(d, p, 1)) {
+                return false;
+            }
+            let v = truncate<i32>(d[p] as u32);
+            p += 1;
+            acc += if ((fl & 0x20) != 0) v else -v;
+        } else if ((fl & 0x20) == 0) {
+            if (!valid(d, p, 2)) {
+                return false;
+            }
+            acc += i16at(d, p);
+            p += 2;
+        }
+        py[i] = oy - round<f32>(acc);
+    }
+    // Quadratic contours as cubics (2/3 rule), each starting with a move and ending with a close.
+    let k: f32 = 2.0 / 3.0;
+    var begin: usize = 0;
+    for (c in 0..cn) {
+        let end = ends[c];
+        if (end < begin || end >= pointCount) {
+            return false;
+        }
+        var offCurve = (flags[begin] & 1) == 0;
+        let sx = if (offCurve) (px[begin] + px[end]) * 0.5 else px[begin];
+        let sy = if (offCurve) (py[begin] + py[end]) * 0.5 else py[begin];
+        outlineOp(mut out, 0, sx, sy);
+        var lx = sx;
+        var ly = sy;
+        let count = end - begin + 1;
+        for (x in 1..count) {
+            let i = begin + x;
+            let qx = px[i - 1];
+            let qy = py[i - 1];
+            if ((flags[i] & 1) != 0) {
+                if (offCurve) {
+                    outlineCubic(
+                        mut out,
+                        lx + k * (qx - lx),
+                        ly + k * (qy - ly),
+                        px[i] + k * (qx - px[i]),
+                        py[i] + k * (qy - py[i]),
+                        px[i],
+                        py[i],
+                    );
+                    offCurve = false;
+                } else {
+                    outlineOp(mut out, 1, px[i], py[i]);
+                }
+                lx = px[i];
+                ly = py[i];
+            } else {
+                if (offCurve) {
+                    let ex = (px[i] + qx) * 0.5;
+                    let ey = (py[i] + qy) * 0.5;
+                    outlineCubic(
+                        mut out,
+                        lx + k * (qx - lx),
+                        ly + k * (qy - ly),
+                        ex + k * (qx - ex),
+                        ey + k * (qy - ey),
+                        ex,
+                        ey,
+                    );
+                    lx = ex;
+                    ly = ey;
+                } else {
+                    offCurve = true;
+                }
+            }
+        }
+        if (offCurve) {
+            let qx = px[begin + count - 1];
+            let qy = py[begin + count - 1];
+            outlineCubic(
+                mut out,
+                lx + k * (qx - lx),
+                ly + k * (qy - ly),
+                sx + k * (qx - sx),
+                sy + k * (qy - sy),
+                sx,
+                sy,
+            );
+        }
+        outlineOp(mut out, 3, 0.0, 0.0);
+        begin = end + 1;
+    }
+    return true;
+}
+
+/// TtfReader::composite: components placed by their x/y offsets (scales are read past, as ThorVG does).
+fn decodeComposite(
+    d: Slice<u8>,
+    f: FontInfo,
+    at: usize,
+    ox: f32,
+    oy: f32,
+    depth: u32,
+    out: borrow mut GlyphOutline,
+) -> bool {
+    var p = at + 10;
+    loop {
+        if (!valid(d, p, 4)) {
+            return false;
+        }
+        let flags = u16at(d, p);
+        let component = u16at(d, p + 2);
+        p += 4;
+        var cx: f32 = 0.0;
+        var cy: f32 = 0.0;
+        if ((flags & 0x0001) != 0) {
+            if (!valid(d, p, 4)) {
+                return false;
+            }
+            if ((flags & 0x0002) != 0) {
+                cx = round<f32>(i16at(d, p));
+                cy = -round<f32>(i16at(d, p + 2));
+            }
+            p += 4;
+        } else {
+            if (!valid(d, p, 2)) {
+                return false;
+            }
+            if ((flags & 0x0002) != 0) {
+                cx = round<f32>(i8at(d, p));
+                cy = -round<f32>(i8at(d, p + 1));
+            }
+            p += 2;
+        }
+        if ((flags & 0x0008) != 0) {
+            p += 2;
+        } else if ((flags & 0x0040) != 0) {
+            p += 4;
+        } else if ((flags & 0x0080) != 0) {
+            p += 8;
+        }
+        if (!decodeGlyph(d, f, component, ox + cx, oy + cy, depth, mut out)) {
+            return false;
+        }
+        if ((flags & 0x0020) == 0) {
+            return true;
+        }
+    }
+}
+
+/// Decodes one UTF-8 code point at `i`; returns it and the bytes it used (invalid bytes are one byte each).
+public fn decodeUtf8(s: Slice<u8>, i: usize) -> [u32; 2] {
+    let b0 = s[i] as u32;
+    if (b0 < 0x80) {
+        return [b0, 1];
+    }
+    if (b0 >= 0xC0 && b0 < 0xE0 && i + 1 < s.length) {
+        return [((b0 & 0x1F) << 6) | ((s[i + 1] as u32) & 0x3F), 2];
+    }
+    if (b0 >= 0xE0 && b0 < 0xF0 && i + 2 < s.length) {
+        return [((b0 & 0x0F) << 12) | (((s[i + 1] as u32) & 0x3F) << 6) | ((s[i + 2] as u32) & 0x3F), 3];
+    }
+    if (b0 >= 0xF0 && i + 3 < s.length) {
+        return [((b0 & 0x07) << 18) | (((s[i + 1] as u32) & 0x3F) << 12) | (((s[i + 2] as u32) & 0x3F) << 6) |
+            ((s[i + 3] as u32) & 0x3F), 4];
+    }
+    return [b0, 1];
+}

@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: MIT
+// Formatting helpers over lib/core's `TextWriter` (the replacement for C's `F(&arena, "fmt", ...)`, since CeeSafe has
+// no variadic calls). Write into a stack buffer, then hand `writer.written()` to `Ui.labelBytes`:
+//
+//     var buffer = [0u8; 32];
+//     var w = TextWriter.create(mut buffer[..]);
+//     w.text("fps ");
+//     Format.fixed(mut w, fps, 1);
+//     ui.labelBytes(w.written(), EMERALD_400);
+
+public struct Format {
+    /// `value` with exactly `decimals` digits after the point (0..=6), rounded half away from zero.
+    /// NaN is written "nan", infinities "inf"/"-inf".
+    public fn fixed(w: borrow mut TextWriter, value: f32, decimals: u32) {
+        if (value != value) {
+            w.text("nan");
+            return;
+        }
+        let places = if (decimals > 6) 6u32 else decimals;
+        var scale: f64 = 1.0;
+        for (i in 0..places) {
+            scale *= 10.0;
+        }
+        var v = value as f64;
+        let negative = v < 0.0;
+        if (negative) {
+            v = -v;
+        }
+        if (v > 1e15) {
+            w.text(if (negative) "-inf" else "inf");
+            return;
+        }
+        let scaled = (v * scale + 0.5).floor();
+        // A value that rounds to zero prints without a sign ("0.00", not "-0.00").
+        if (negative && scaled != 0.0) {
+            w.byte('-');
+        }
+        let whole = truncate<u64>(scaled / scale);
+        let fraction = truncate<u64>(scaled - round<f64>(whole) * scale);
+        w.decimal(whole);
+        if (places > 0) {
+            w.byte('.');
+            var digits = [0u8; 6];
+            var f = fraction;
+            var k = places;
+            while (k > 0) {
+                k -= 1;
+                digits[k as usize] = truncate<u8>(f % 10) + '0';
+                f /= 10;
+            }
+            for (i in 0..places) {
+                w.byte(digits[i as usize]);
+            }
+        }
+    }
+
+    /// An integer padded on the left with `fill` to at least `width` characters.
+    public fn padded(w: borrow mut TextWriter, value: i64, width: u32, fill: u8) {
+        var digits = [0u8; 20];
+        var n: u64 = if (value < 0) truncate<u64>(-(value + 1)) + 1 else truncate<u64>(value);
+        var count: u32 = 0;
+        loop {
+            digits[count as usize] = truncate<u8>(n % 10) + '0';
+            count += 1;
+            n /= 10;
+            if (n == 0) {
+                break;
+            }
+        }
+        let shown = if (value < 0) count + 1 else count;
+        var pad = shown;
+        while (pad < width) {
+            w.byte(fill);
+            pad += 1;
+        }
+        if (value < 0) {
+            w.byte('-');
+        }
+        while (count > 0) {
+            count -= 1;
+            w.byte(digits[count as usize]);
+        }
+    }
+}

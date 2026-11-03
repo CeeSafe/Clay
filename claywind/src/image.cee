@@ -1,0 +1,867 @@
+// SPDX-License-Identifier: MIT
+// Image decoding with no dependencies: BMP (1/4/8-bit palette, 16/24/32-bit, bit fields, top-down or bottom-up) and
+// PNG (every color type and bit depth, palettes with tRNS, Adam7 interlacing, a full zlib inflate). The C build
+// loaded images through ThorVG's loaders; this replaces them.
+//
+// Nothing allocates: `imageInfo` reports the size and the scratch a PNG needs for its inflated rows, and
+// `decodeImage` writes 0xAABBGGRR pixels (straight alpha, the Raster's image format) into the caller's slice.
+// `loadImage` does both into a Raster image slot.
+
+/// Which format a file holds.
+public enum ImageKind {
+    Bmp,
+    Png,
+}
+
+/// Why an image did not decode.
+public enum ImageError {
+    /// Neither a BMP nor a PNG.
+    NotAnImage,
+    /// The file ends early, or a chunk or row runs past its end.
+    Truncated,
+    /// A valid file using something not supported (BMP RLE, a PNG compression method other than deflate).
+    Unsupported,
+    /// Malformed data: bad Huffman codes, distances before the start, a bad filter type, a bad palette index.
+    Corrupt,
+    /// The pixel or scratch slice is too small, or the Raster has no room.
+    TooSmall,
+}
+
+/// An image's size, and how many scratch bytes `decodeImage` needs for it (0 for a BMP).
+public struct ImageInfo {
+    public kind: ImageKind;
+    public w: usize;
+    public h: usize;
+    public scratchBytes: usize;
+}
+
+fn be32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) |
+        (b[at + 3] as u32);
+
+fn le16(b: Slice<u8>, at: usize) -> u32 => (b[at] as u32) | ((b[at + 1] as u32) << 8);
+
+fn le32(b: Slice<u8>, at: usize) -> u32 => le16(b, at) | (le16(b, at + 2) << 16);
+
+/// 0xAABBGGRR.
+fn packRgba(r: u32, g: u32, b: u32, a: u32) -> u32 => r | (g << 8) | (b << 16) | (a << 24);
+
+/// What `bytes` holds and how big it is.
+public fn imageInfo(bytes: Slice<u8>) -> Result<ImageInfo, ImageError> {
+    if (bytes.length >= 2 && bytes[0] == 'B' && bytes[1] == 'M') {
+        return bmpInfo(bytes);
+    }
+    if (bytes.length >= 8 && bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G') {
+        return pngInfo(bytes);
+    }
+    return Err(ImageError.NotAnImage);
+}
+
+/// Decodes `bytes` into `pixels` (row-major, `info.w * info.h` of them) using `scratch` (`info.scratchBytes`).
+public fn decodeImage(bytes: Slice<u8>, pixels: SliceMut<u32>, scratch: SliceMut<u8>) -> Result<ImageInfo, ImageError> {
+    let info = imageInfo(bytes)?;
+    if (pixels.length < info.w * info.h || scratch.length < info.scratchBytes) {
+        return Err(ImageError.TooSmall);
+    }
+    match (info.kind) {
+        ImageKind.Bmp => { decodeBmp(bytes, info, mut pixels)?; }
+        ImageKind.Png => { decodePng(bytes, info, mut pixels, mut scratch)?; }
+    }
+    return Ok(info);
+}
+
+/// Decodes `bytes` into a new Raster image under `handle` (then `Style.image(handle, ...)` draws it).
+public fn loadImage(
+    raster: borrow mut Raster,
+    handle: u32,
+    bytes: Slice<u8>,
+    scratch: SliceMut<u8>,
+) -> Result<ImageInfo, ImageError> {
+    let info = imageInfo(bytes)?;
+    if (scratch.length < info.scratchBytes || !raster.addImage(handle, info.w, info.h)) {
+        return Err(ImageError.TooSmall);
+    }
+    match (raster.imagePixelsMut(handle)) {
+        Some(pixels) => {
+            match (info.kind) {
+                ImageKind.Bmp => { decodeBmp(bytes, info, mut pixels)?; }
+                ImageKind.Png => { decodePng(bytes, info, mut pixels, mut scratch)?; }
+            }
+        }
+        null => { return Err(ImageError.TooSmall); }
+    }
+    return Ok(info);
+}
+
+// ---- BMP ---------------------------------------------------------------------------------------------------------------
+
+/// The BMP header fields the decoder uses.
+struct BmpHeader {
+    dataAt: usize;
+    headerSize: usize;
+    w: usize;
+    h: usize;
+    topDown: bool;
+    bpp: u32;
+    compression: u32;
+    paletteAt: usize;
+    paletteCount: usize;
+    paletteStride: usize;
+    masks: [u32; 4];
+}
+
+fn bmpHeader(b: Slice<u8>) -> Result<BmpHeader, ImageError> {
+    if (b.length < 26) {
+        return Err(ImageError.Truncated);
+    }
+    let dataAt = le32(b, 10) as usize;
+    let headerSize = le32(b, 14) as usize;
+    if (headerSize == 12) {
+        // BITMAPCOREHEADER: 16-bit sizes, 3-byte palette entries.
+        let bpp = le16(b, 24);
+        let count = if (bpp <= 8) 1usize << (bpp as usize) else 0;
+        return Ok(BmpHeader {
+            dataAt: dataAt,
+            headerSize: 12,
+            w: le16(b, 18) as usize,
+            h: le16(b, 20) as usize,
+            topDown: false,
+            bpp: bpp,
+            compression: 0,
+            paletteAt: 26,
+            paletteCount: count,
+            paletteStride: 3,
+            masks: [0u32; 4],
+        });
+    }
+    if (headerSize < 40 || b.length < 14 + headerSize) {
+        return Err(if (headerSize < 40) ImageError.Unsupported else ImageError.Truncated);
+    }
+    let rawH = le32(b, 22);
+    let topDown = (rawH & 0x80000000) != 0;
+    let h = if (topDown) (rawH ^ 0xFFFFFFFF) + 1 else rawH;
+    let bpp = le16(b, 28);
+    let compression = le32(b, 30);
+    let used = le32(b, 46) as usize;
+    let count = if (bpp <= 8) (if (used == 0) 1usize << (bpp as usize) else used) else 0;
+    var masks = [0u32; 4];
+    if (compression == 3 || compression == 6) {
+        // Bit fields: in the header from V2 on, else straight after the 40-byte header.
+        if (b.length < 14 + 40 + 16) {
+            return Err(ImageError.Truncated);
+        }
+        masks[0] = le32(b, 54);
+        masks[1] = le32(b, 58);
+        masks[2] = le32(b, 62);
+        masks[3] = if (headerSize >= 56 || compression == 6) le32(b, 66) else 0;
+    } else if (bpp == 16) {
+        masks = [0x7C00u32, 0x03E0, 0x001F, 0];
+    } else if (bpp == 32) {
+        masks = [0x00FF0000u32, 0x0000FF00, 0x000000FF, 0];
+    }
+    let extra =
+        if (compression == 3 && headerSize == 40) 12usize else if (compression == 6 && headerSize == 40) 16 else 0;
+    return Ok(BmpHeader {
+        dataAt: dataAt,
+        headerSize: headerSize,
+        w: le32(b, 18) as usize,
+        h: h as usize,
+        topDown: topDown,
+        bpp: bpp,
+        compression: compression,
+        paletteAt: 14 + headerSize + extra,
+        paletteCount: count,
+        paletteStride: 4,
+        masks: masks,
+    });
+}
+
+fn bmpInfo(b: Slice<u8>) -> Result<ImageInfo, ImageError> {
+    let hd = bmpHeader(b)?;
+    if (hd.w == 0 || hd.h == 0 || hd.w > 32768 || hd.h > 32768) {
+        return Err(ImageError.Corrupt);
+    }
+    return Ok(ImageInfo { kind: ImageKind.Bmp, w: hd.w, h: hd.h, scratchBytes: 0 });
+}
+
+/// A channel through a bit-field mask, scaled to 0..255 (a zero mask reads as `missing`).
+fn maskChannel(v: u32, mask: u32, missing: u32) -> u32 {
+    if (mask == 0) {
+        return missing;
+    }
+    var shift: u32 = 0;
+    var m = mask;
+    while ((m & 1) == 0) {
+        m = m >> 1;
+        shift += 1;
+    }
+    let raw = (v & mask) >> shift;
+    if (m == 0) {
+        return 0;
+    }
+    return truncate<u32>((raw as u64) * 255 / (m as u64)); // floor, as Pillow scales 5- and 6-bit channels
+}
+
+fn decodeBmp(b: Slice<u8>, info: ImageInfo, pixels: SliceMut<u32>) -> Result<void, ImageError> {
+    let hd = bmpHeader(b)?;
+    if (hd.compression != 0 && hd.compression != 3 && hd.compression != 6) {
+        return Err(ImageError.Unsupported); // RLE4/RLE8, embedded JPEG/PNG
+    }
+    let bpp = hd.bpp as usize;
+    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) {
+        return Err(ImageError.Unsupported);
+    }
+    if (hd.paletteCount > 0 && hd.paletteAt + hd.paletteCount * hd.paletteStride > b.length) {
+        return Err(ImageError.Truncated);
+    }
+    let stride = (info.w * bpp + 31) / 32 * 4;
+    if (hd.dataAt + stride * info.h > b.length) {
+        return Err(ImageError.Truncated);
+    }
+    // 32-bit images with no alpha mask are opaque; with an alpha mask that is all zero, also opaque (common writers).
+    var alphaSeen = false;
+    for (row in 0..info.h) {
+        let y = if (hd.topDown) row else info.h - 1 - row;
+        let at = hd.dataAt + row * stride;
+        for (x in 0..info.w) {
+            var px: u32 = 0;
+            if (bpp <= 8) {
+                let bit = x * bpp;
+                let byte = b[at + bit / 8] as u32;
+                let shift = truncate<u32>(8 - bpp - bit % 8);
+                let index = ((byte >> shift) & ((1u32 << (truncate<u32>(bpp))) - 1)) as usize;
+                if (index >= hd.paletteCount) {
+                    return Err(ImageError.Corrupt);
+                }
+                let e = hd.paletteAt + index * hd.paletteStride;
+                px = packRgba(b[e + 2] as u32, b[e + 1] as u32, b[e] as u32, 255);
+            } else if (bpp == 24) {
+                let e = at + x * 3;
+                px = packRgba(b[e + 2] as u32, b[e + 1] as u32, b[e] as u32, 255);
+            } else {
+                let v = if (bpp == 16) le16(b, at + x * 2) else le32(b, at + x * 4);
+                let a = maskChannel(v, hd.masks[3], 255);
+                if (hd.masks[3] != 0 && a != 0) {
+                    alphaSeen = true;
+                }
+                px = packRgba(
+                    maskChannel(v, hd.masks[0], 0),
+                    maskChannel(v, hd.masks[1], 0),
+                    maskChannel(v, hd.masks[2], 0),
+                    a,
+                );
+            }
+            pixels[y * info.w + x] = px;
+        }
+    }
+    if (hd.masks[3] != 0 && !alphaSeen) {
+        for (i in 0..info.w * info.h) {
+            pixels[i] = pixels[i] | 0xFF000000;
+        }
+    }
+    return Ok();
+}
+
+// ---- inflate (RFC 1951) ----------------------------------------------------------------------------------------------
+
+/// Reads the zlib stream that runs through a PNG's IDAT chunks, a bit at a time (least significant bit first).
+struct BitIn {
+    /// The next byte, and the end, of the current IDAT chunk's data.
+    pos: usize;
+    end: usize;
+    /// Where the next chunk header starts.
+    next: usize;
+    bits: u32;
+    count: u32;
+    failed: bool;
+}
+
+const IDAT: u32 = 0x49444154;
+const IEND: u32 = 0x49454E44;
+
+fn nextByte(png: Slice<u8>, s: borrow mut BitIn) -> u32 {
+    while (s.pos >= s.end) {
+        if (s.failed || s.next + 12 > png.length) {
+            s.failed = true;
+            return 0;
+        }
+        let length = be32(png, s.next) as usize;
+        let kind = be32(png, s.next + 4);
+        let start = s.next + 8;
+        if (start + length + 4 > png.length || kind == IEND) {
+            s.failed = true;
+            return 0;
+        }
+        s.next = start + length + 4;
+        if (kind == IDAT) {
+            s.pos = start;
+            s.end = start + length;
+        }
+    }
+    let v = png[s.pos] as u32;
+    s.pos += 1;
+    return v;
+}
+
+fn takeBits(png: Slice<u8>, s: borrow mut BitIn, n: u32) -> u32 {
+    if (n == 0) {
+        return 0;
+    }
+    while (s.count < n) {
+        s.bits = s.bits | (nextByte(png, mut s) << s.count);
+        s.count += 8;
+    }
+    let v = s.bits & ((1u32 << n) - 1);
+    s.bits = s.bits >> n;
+    s.count -= n;
+    return v;
+}
+
+/// A canonical Huffman code as counts per length and symbols in code order (zlib's puff).
+struct Huffman {
+    counts: [u16; 16];
+    symbols: [u16; 320];
+}
+
+fn emptyHuffman() -> Huffman => Huffman { counts: [0u16; 16], symbols: [0u16; 320] };
+
+/// Builds the code from code lengths; false when the lengths over-subscribe the code (incomplete codes are allowed).
+fn buildHuffman(h: borrow mut Huffman, lengths: Slice<u8>) -> bool {
+    for (i in 0usize..16) {
+        h.counts[i] = 0;
+    }
+    for (i in 0..lengths.length) {
+        h.counts[lengths[i] as usize] += 1;
+    }
+    var left: i32 = 1;
+    for (len in 1usize..16) {
+        left = left * 2 - (h.counts[len] as i32);
+        if (left < 0) {
+            return false;
+        }
+    }
+    var offsets = [0u16; 16];
+    for (len in 1usize..15) {
+        offsets[len + 1] = offsets[len] + h.counts[len];
+    }
+    for (sym in 0..lengths.length) {
+        let len = lengths[sym] as usize;
+        if (len != 0) {
+            h.symbols[offsets[len] as usize] = truncate<u16>(sym);
+            offsets[len] += 1;
+        }
+    }
+    return true;
+}
+
+/// The next symbol, or -1 for a code that is not in the table.
+fn decodeSymbol(png: Slice<u8>, s: borrow mut BitIn, h: borrow Huffman) -> i32 {
+    var code: i32 = 0;
+    var first: i32 = 0;
+    var index: i32 = 0;
+    for (len in 1usize..16) {
+        code = code + truncate<i32>(takeBits(png, mut s, 1));
+        let count = h.counts[len] as i32;
+        if (code - count < first) {
+            return h.symbols[truncate<usize>(index + code - first)] as i32;
+        }
+        index += count;
+        first = (first + count) * 2;
+        code = code * 2;
+        if (s.failed) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163,
+    195, 227, 258,
+];
+const LENGTH_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073,
+    4097, 6145, 8193, 12289, 16385, 24577,
+];
+const DIST_EXTRA: [u8; 30] = [
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13,
+];
+const CODE_ORDER: [u8; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+/// Decodes one Huffman-coded block's symbols into `out` from `at`; returns the new end, or an error.
+fn inflateCodes(
+    png: Slice<u8>,
+    s: borrow mut BitIn,
+    lit: borrow Huffman,
+    dist: borrow Huffman,
+    out: SliceMut<u8>,
+    at: usize,
+) -> Result<usize, ImageError> {
+    var n = at;
+    loop {
+        let sym = decodeSymbol(png, mut s, lit);
+        if (sym < 0) {
+            return Err(if (s.failed) ImageError.Truncated else ImageError.Corrupt);
+        }
+        if (sym < 256) {
+            if (n >= out.length) {
+                return Err(ImageError.Corrupt);
+            }
+            out[n] = truncate<u8>(sym);
+            n += 1;
+        } else if (sym == 256) {
+            return Ok(n);
+        } else {
+            let li = truncate<usize>(sym - 257);
+            if (li >= 29) {
+                return Err(ImageError.Corrupt);
+            }
+            let length = (LENGTH_BASE[li] as usize) + (takeBits(png, mut s, LENGTH_EXTRA[li] as u32) as usize);
+            let ds = decodeSymbol(png, mut s, dist);
+            if (ds < 0 || ds >= 30) {
+                return Err(if (s.failed) ImageError.Truncated else ImageError.Corrupt);
+            }
+            let di = truncate<usize>(ds);
+            let distance = (DIST_BASE[di] as usize) + (takeBits(png, mut s, DIST_EXTRA[di] as u32) as usize);
+            if (distance > n || n + length > out.length) {
+                return Err(ImageError.Corrupt);
+            }
+            for (k in 0..length) {
+                out[n + k] = out[n + k - distance];
+            }
+            n += length;
+        }
+        if (s.failed) {
+            return Err(ImageError.Truncated);
+        }
+    }
+}
+
+/// Inflates the zlib stream starting at the PNG's first IDAT into `out`; returns how many bytes it produced.
+fn inflate(png: Slice<u8>, s: borrow mut BitIn, out: SliceMut<u8>) -> Result<usize, ImageError> {
+    let cmf = takeBits(png, mut s, 8);
+    let flg = takeBits(png, mut s, 8);
+    if ((cmf & 15) != 8 || ((cmf << 8) | flg) % 31 != 0) {
+        return Err(if (s.failed) ImageError.Truncated else ImageError.Corrupt);
+    }
+    if ((flg & 32) != 0) {
+        return Err(ImageError.Unsupported); // a preset dictionary
+    }
+    var lit = emptyHuffman();
+    var dist = emptyHuffman();
+    var n: usize = 0;
+    loop {
+        let last = takeBits(png, mut s, 1);
+        let kind = takeBits(png, mut s, 2);
+        if (kind == 0) {
+            // Stored: skip to a byte boundary, LEN and its complement, then LEN raw bytes.
+            s.bits = 0;
+            s.count = 0;
+            let len = takeBits(png, mut s, 16) as usize;
+            let nlen = takeBits(png, mut s, 16) as usize;
+            if (len != (nlen ^ 0xFFFF)) {
+                return Err(if (s.failed) ImageError.Truncated else ImageError.Corrupt);
+            }
+            if (n + len > out.length) {
+                return Err(ImageError.Corrupt);
+            }
+            for (k in 0..len) {
+                out[n + k] = truncate<u8>(nextByte(png, mut s));
+            }
+            n += len;
+        } else if (kind == 1) {
+            // Fixed codes.
+            var lengths = [0u8; 320];
+            for (i in 0usize..144) {
+                lengths[i] = 8;
+            }
+            for (i in 144usize..256) {
+                lengths[i] = 9;
+            }
+            for (i in 256usize..280) {
+                lengths[i] = 7;
+            }
+            for (i in 280usize..288) {
+                lengths[i] = 8;
+            }
+            buildHuffman(mut lit, lengths[0..288]);
+            for (i in 0usize..30) {
+                lengths[i] = 5;
+            }
+            buildHuffman(mut dist, lengths[0..30]);
+            n = inflateCodes(png, mut s, lit, dist, mut out, n)?;
+        } else if (kind == 2) {
+            // Dynamic codes: the code-length code, then the literal/length and distance code lengths.
+            let nlen = (takeBits(png, mut s, 5) as usize) + 257;
+            let ndist = (takeBits(png, mut s, 5) as usize) + 1;
+            let ncode = (takeBits(png, mut s, 4) as usize) + 4;
+            if (nlen > 286 || ndist > 30) {
+                return Err(ImageError.Corrupt);
+            }
+            var lengths = [0u8; 320];
+            for (i in 0..ncode) {
+                lengths[CODE_ORDER[i] as usize] = truncate<u8>(takeBits(png, mut s, 3));
+            }
+            var codeLengths = emptyHuffman();
+            if (!buildHuffman(mut codeLengths, lengths[0..19])) {
+                return Err(ImageError.Corrupt);
+            }
+            for (i in 0usize..19) {
+                lengths[i] = 0;
+            }
+            var index: usize = 0;
+            while (index < nlen + ndist) {
+                let sym = decodeSymbol(png, mut s, codeLengths);
+                if (sym < 0) {
+                    return Err(if (s.failed) ImageError.Truncated else ImageError.Corrupt);
+                }
+                if (sym < 16) {
+                    lengths[index] = truncate<u8>(sym);
+                    index += 1;
+                } else {
+                    var value: u8 = 0;
+                    var repeat: usize = 0;
+                    if (sym == 16) {
+                        if (index == 0) {
+                            return Err(ImageError.Corrupt);
+                        }
+                        value = lengths[index - 1];
+                        repeat = 3 + (takeBits(png, mut s, 2) as usize);
+                    } else if (sym == 17) {
+                        repeat = 3 + (takeBits(png, mut s, 3) as usize);
+                    } else {
+                        repeat = 11 + (takeBits(png, mut s, 7) as usize);
+                    }
+                    if (index + repeat > nlen + ndist) {
+                        return Err(ImageError.Corrupt);
+                    }
+                    for (k in 0..repeat) {
+                        lengths[index + k] = value;
+                    }
+                    index += repeat;
+                }
+            }
+            if (lengths[256] == 0) {
+                return Err(ImageError.Corrupt); // no end-of-block code
+            }
+            if (!buildHuffman(mut lit, lengths[0..nlen])) {
+                return Err(ImageError.Corrupt);
+            }
+            var distLengths = [0u8; 30];
+            for (i in 0..ndist) {
+                distLengths[i] = lengths[nlen + i];
+            }
+            if (!buildHuffman(mut dist, distLengths[0..ndist])) {
+                return Err(ImageError.Corrupt);
+            }
+            n = inflateCodes(png, mut s, lit, dist, mut out, n)?;
+        } else {
+            return Err(ImageError.Corrupt);
+        }
+        if (s.failed) {
+            return Err(ImageError.Truncated);
+        }
+        if (last == 1) {
+            return Ok(n);
+        }
+    }
+}
+
+// ---- PNG ---------------------------------------------------------------------------------------------------------------
+
+/// IHDR, plus where PLTE and tRNS are.
+struct PngHeader {
+    w: usize;
+    h: usize;
+    depth: usize;
+    colorType: u32;
+    channels: usize;
+    interlaced: bool;
+    paletteAt: usize;
+    paletteCount: usize;
+    transAt: usize;
+    transLength: usize;
+    firstChunk: usize;
+}
+
+fn pngHeader(b: Slice<u8>) -> Result<PngHeader, ImageError> {
+    if (b.length < 33) {
+        return Err(ImageError.Truncated);
+    }
+    if (b[4] != 0x0D || b[5] != 0x0A || b[6] != 0x1A || b[7] != 0x0A || be32(b, 12) != 0x49484452) {
+        return Err(ImageError.NotAnImage);
+    }
+    let colorType = b[25] as u32;
+    let depth = b[24] as usize;
+    let channels: usize = match (colorType) {
+        0 => 1,
+        2 => 3,
+        3 => 1,
+        4 => 2,
+        6 => 4,
+        _ => 0,
+    };
+    let depthOk = match (colorType) {
+        0 => depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16,
+        3 => depth == 1 || depth == 2 || depth == 4 || depth == 8,
+        _ => depth == 8 || depth == 16,
+    };
+    if (channels == 0 || !depthOk) {
+        return Err(ImageError.Corrupt);
+    }
+    if (b[26] != 0 || b[27] != 0 || b[28] > 1) {
+        return Err(ImageError.Unsupported);
+    }
+    var hd = PngHeader {
+        w: be32(b, 16) as usize,
+        h: be32(b, 20) as usize,
+        depth: depth,
+        colorType: colorType,
+        channels: channels,
+        interlaced: b[28] == 1,
+        paletteAt: 0,
+        paletteCount: 0,
+        transAt: 0,
+        transLength: 0,
+        firstChunk: 33,
+    };
+    // Find PLTE and tRNS (both come before the first IDAT).
+    var at: usize = 33;
+    while (at + 12 <= b.length) {
+        let length = be32(b, at) as usize;
+        let kind = be32(b, at + 4);
+        if (at + 12 + length > b.length) {
+            return Err(ImageError.Truncated);
+        }
+        if (kind == 0x504C5445) {
+            hd.paletteAt = at + 8;
+            hd.paletteCount = length / 3;
+        } else if (kind == 0x74524E53) {
+            hd.transAt = at + 8;
+            hd.transLength = length;
+        } else if (kind == IDAT || kind == IEND) {
+            break;
+        }
+        at += 12 + length;
+    }
+    if (colorType == 3 && hd.paletteCount == 0) {
+        return Err(ImageError.Corrupt);
+    }
+    return Ok(hd);
+}
+
+fn rowBytes(hd: borrow PngHeader, w: usize) -> usize => (w * hd.channels * hd.depth + 7) / 8;
+
+/// Adam7: the start and step of each pass in x and y.
+const PASS_X0: [u8; 7] = [0, 4, 0, 2, 0, 1, 0];
+const PASS_Y0: [u8; 7] = [0, 0, 4, 0, 2, 0, 1];
+const PASS_DX: [u8; 7] = [8, 8, 4, 4, 2, 2, 1];
+const PASS_DY: [u8; 7] = [8, 8, 8, 4, 4, 2, 2];
+
+fn passSize(full: usize, start: u8, step: u8) -> usize {
+    let s = start as usize;
+    let d = step as usize;
+    return if (full > s) (full - s + d - 1) / d else 0;
+}
+
+/// The inflated size: one filter byte plus the packed row, per row of every pass.
+fn inflatedSize(hd: borrow PngHeader) -> usize {
+    if (!hd.interlaced) {
+        return hd.h * (1 + rowBytes(hd, hd.w));
+    }
+    var total: usize = 0;
+    for (p in 0usize..7) {
+        let pw = passSize(hd.w, PASS_X0[p], PASS_DX[p]);
+        let ph = passSize(hd.h, PASS_Y0[p], PASS_DY[p]);
+        if (pw > 0 && ph > 0) {
+            total += ph * (1 + rowBytes(hd, pw));
+        }
+    }
+    return total;
+}
+
+fn pngInfo(b: Slice<u8>) -> Result<ImageInfo, ImageError> {
+    let hd = pngHeader(b)?;
+    if (hd.w == 0 || hd.h == 0 || hd.w > 32768 || hd.h > 32768) {
+        return Err(ImageError.Corrupt);
+    }
+    return Ok(ImageInfo { kind: ImageKind.Png, w: hd.w, h: hd.h, scratchBytes: inflatedSize(hd) });
+}
+
+fn iabs(v: i32) -> i32 => if (v < 0) -v else v;
+
+fn paeth(a: i32, b: i32, c: i32) -> i32 {
+    let p = a + b - c;
+    let pa = iabs(p - a);
+    let pb = iabs(p - b);
+    let pc = iabs(p - c);
+    return if (pa <= pb && pa <= pc) a else if (pb <= pc) b else c;
+}
+
+/// Undoes the row filters of one pass (`rows` rows of `stride` bytes plus a filter byte each, from `at`) in place.
+fn unfilter(data: SliceMut<u8>, at: usize, rows: usize, stride: usize, bpp: usize) -> Result<void, ImageError> {
+    for (y in 0..rows) {
+        let row = at + y * (stride + 1);
+        let filter = data[row];
+        let cur = row + 1;
+        let prev = if (y > 0) cur - stride - 1 else 0; // the row above (read only when y > 0)
+        for (x in 0..stride) {
+            let a = if (x >= bpp) data[cur + x - bpp] as i32 else 0;
+            let b = if (y > 0) data[prev + x] as i32 else 0;
+            let c = if (x >= bpp && y > 0) data[prev + x - bpp] as i32 else 0;
+            let raw = data[cur + x] as i32;
+            let v = match (filter) {
+                0 => raw,
+                1 => raw + a,
+                2 => raw + b,
+                3 => raw + (a + b) / 2,
+                4 => raw + paeth(a, b, c),
+                _ => -1,
+            };
+            if (v < 0) {
+                return Err(ImageError.Corrupt);
+            }
+            data[cur + x] = truncate<u8>(v);
+        }
+    }
+    return Ok();
+}
+
+/// Sample `i` (0-based, in channels) of a row starting at `row`, at the image's bit depth, as 0..255 (16-bit keeps
+/// the high byte) or, with `raw`, unscaled (palette indexes and tRNS comparisons).
+fn sample(data: Slice<u8>, row: usize, i: usize, depth: usize, raw: bool) -> u32 {
+    if (depth == 8) {
+        return data[row + i] as u32;
+    }
+    if (depth == 16) {
+        let v = ((data[row + 2 * i] as u32) << 8) | (data[row + 2 * i + 1] as u32);
+        return if (raw) v else v >> 8;
+    }
+    let bit = i * depth;
+    let shift = truncate<u32>(8 - depth - bit % 8);
+    let mask = (1u32 << (truncate<u32>(depth))) - 1;
+    let v = ((data[row + bit / 8] as u32) >> shift) & mask;
+    return if (raw) v else v * 255 / mask;
+}
+
+fn pngPixel(b: Slice<u8>, hd: borrow PngHeader, data: Slice<u8>, row: usize, x: usize) -> Result<u32, ImageError> {
+    let c = hd.channels;
+    let d = hd.depth;
+    match (hd.colorType) {
+        0 => {
+            let g = sample(data, row, x, d, false);
+            var a: u32 = 255;
+            if (hd.transLength >= 2 && sample(
+                data,
+                row,
+                x,
+                d,
+                true,
+            ) == ((b[hd.transAt] as u32) << 8 | (b[hd.transAt + 1] as u32))) {
+                a = 0;
+            }
+            return Ok(packRgba(g, g, g, a));
+        }
+        2 => {
+            let r = sample(data, row, x * c, d, false);
+            let g = sample(data, row, x * c + 1, d, false);
+            let bl = sample(data, row, x * c + 2, d, false);
+            var a: u32 = 255;
+            if (hd.transLength >= 6) {
+                let t = hd.transAt;
+                let tr = (b[t] as u32) << 8 | (b[t + 1] as u32);
+                let tg = (b[t + 2] as u32) << 8 | (b[t + 3] as u32);
+                let tb = (b[t + 4] as u32) << 8 | (b[t + 5] as u32);
+                if (sample(data, row, x * c, d, true) == tr && sample(data, row, x * c + 1, d, true) == tg &&
+                    sample(data, row, x * c + 2, d, true) == tb) {
+                    a = 0;
+                }
+            }
+            return Ok(packRgba(r, g, bl, a));
+        }
+        3 => {
+            let index = sample(data, row, x, d, true) as usize;
+            if (index >= hd.paletteCount) {
+                return Err(ImageError.Corrupt);
+            }
+            let e = hd.paletteAt + index * 3;
+            let a = if (index < hd.transLength) b[hd.transAt + index] as u32 else 255;
+            return Ok(packRgba(b[e] as u32, b[e + 1] as u32, b[e + 2] as u32, a));
+        }
+        4 => {
+            let g = sample(data, row, x * 2, d, false);
+            return Ok(packRgba(g, g, g, sample(data, row, x * 2 + 1, d, false)));
+        }
+        _ => {
+            return Ok(packRgba(
+                sample(data, row, x * 4, d, false), sample(data, row, x * 4 + 1, d, false),
+                sample(data, row, x * 4 + 2, d, false), sample(data, row, x * 4 + 3, d, false),
+            ));
+        }
+    }
+}
+
+fn decodePng(b: Slice<u8>, info: ImageInfo, pixels: SliceMut<u32>, scratch: SliceMut<u8>) -> Result<void, ImageError> {
+    let hd = pngHeader(b)?;
+    var s = BitIn { pos: 0, end: 0, next: hd.firstChunk, bits: 0, count: 0, failed: false };
+    let want = inflatedSize(hd);
+    let got = inflate(b, mut s, mut scratch[0..want])?;
+    if (got != want) {
+        return Err(ImageError.Truncated);
+    }
+    let bpp = if (hd.channels * hd.depth >= 8) hd.channels * hd.depth / 8 else 1;
+    var at: usize = 0;
+    for (p in 0usize..7) {
+        let x0 = if (hd.interlaced) PASS_X0[p] as usize else 0;
+        let y0 = if (hd.interlaced) PASS_Y0[p] as usize else 0;
+        let dx = if (hd.interlaced) PASS_DX[p] as usize else 1;
+        let dy = if (hd.interlaced) PASS_DY[p] as usize else 1;
+        let pw = if (hd.interlaced) passSize(hd.w, PASS_X0[p], PASS_DX[p]) else hd.w;
+        let ph = if (hd.interlaced) passSize(hd.h, PASS_Y0[p], PASS_DY[p]) else hd.h;
+        if (pw > 0 && ph > 0) {
+            let stride = rowBytes(hd, pw);
+            unfilter(mut scratch, at, ph, stride, bpp)?;
+            for (y in 0..ph) {
+                let row = at + y * (stride + 1) + 1;
+                for (x in 0..pw) {
+                    pixels[(y0 + y * dy) * info.w + x0 + x * dx] = pngPixel(b, hd, scratch, row, x)?;
+                }
+            }
+            at += ph * (stride + 1);
+        }
+        if (!hd.interlaced) {
+            break;
+        }
+    }
+    return Ok();
+}

@@ -1,0 +1,566 @@
+// SPDX-License-Identifier: MIT
+// Paths, the coverage rasterizer and paints.
+//
+// A path is built in local coordinates and stored in device space (each point goes through the current
+// transform), with cubics flattened to lines. Filling accumulates every edge's signed area into a float buffer
+// over the path's clipped bounding box (the analytic method of font-rs / stb_truetype), then sweeps each row:
+// the running sum is the winding coverage, |sum| clamped to 1. Contours with opposite orientation cancel, so a
+// hole (a border's interior, a ring's inside) is a reversed contour.
+
+const KAPPA: f32 = 0.5522847498;
+
+/// How a fill is painted, evaluated per pixel in local space.
+enum PaintKind {
+    Solid,
+    Linear,
+    Radial,
+    Image,
+}
+
+struct RGBAf {
+    r: f32;
+    g: f32;
+    b: f32;
+    a: f32;
+}
+
+struct Paint {
+    kind: PaintKind;
+    /// Premultiplied solid color.
+    color: RGBAf;
+    /// Device -> local, for gradients and images.
+    inverse: Affine2;
+    // Linear: t = ((p - start) . dir) / len2.  Radial: t = |p - center| / radius.
+    startX: f32;
+    startY: f32;
+    dirX: f32;
+    dirY: f32;
+    len2: f32;
+    radius: f32;
+    stops: [GradientStop; 4];
+    stopCount: usize;
+    spread: GradientSpread;
+    // Image.
+    image: usize;
+    box: Rect;
+    tint: Color;
+    tinted: bool;
+    opacity: f32;
+}
+
+fn solidPaint(c: Color) -> Paint {
+    let a = round<f32>(c.a as u32) / 255.0;
+    let stop = GradientStop { color: c, position: 0.0 };
+    return Paint {
+        kind: PaintKind.Solid,
+        color: RGBAf {
+            r: round<f32>(c.r as u32) / 255.0 * a,
+            g: round<f32>(c.g as u32) / 255.0 * a,
+            b: round<f32>(c.b as u32) / 255.0 * a,
+            a: a,
+        },
+        inverse: Affine2.identity(),
+        startX: 0.0,
+        startY: 0.0,
+        dirX: 0.0,
+        dirY: 0.0,
+        len2: 1.0,
+        radius: 1.0,
+        stops: [stop, stop, stop, stop],
+        stopCount: 0,
+        spread: GradientSpread.Pad,
+        image: 0,
+        box: Rect.zero(),
+        tint: c,
+        tinted: false,
+        opacity: 1.0,
+    };
+}
+
+/// Where coverage goes: the current layer (painted), or a clip mask being built.
+enum FillTarget {
+    Layer,
+    Mask(usize, i32, i32, i32),
+}
+
+// ---- path building ---------------------------------------------------------------------------------------------
+
+fn beginPath(r: borrow mut Raster) {
+    r.pointCount = 0;
+    r.contourCount = 0;
+}
+
+fn addPoint(r: borrow mut Raster, x: f32, y: f32) {
+    if (r.pointCount >= r.points.length) {
+        r.overflowed = true;
+        return;
+    }
+    let p = r.transforms.last().apply(Vec2 { x: x, y: y });
+    r.points[r.pointCount] = Pt { x: p.x, y: p.y };
+    r.pointCount += 1;
+}
+
+fn moveTo(r: borrow mut Raster, x: f32, y: f32) {
+    if (r.contourCount >= r.contourStarts.length) {
+        r.overflowed = true;
+        return;
+    }
+    r.contourStarts[r.contourCount] = r.pointCount;
+    r.contourCount += 1;
+    addPoint(mut r, x, y);
+}
+
+fn lineTo(r: borrow mut Raster, x: f32, y: f32) {
+    addPoint(mut r, x, y);
+}
+
+/// A cubic from the last point, flattened into line segments in proportion to its device-space size.
+fn cubicTo(r: borrow mut Raster, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+    if (r.pointCount == 0) {
+        return;
+    }
+    let m = r.transforms.last();
+    let last = r.points[r.pointCount - 1];
+    let a = m.apply(Vec2 { x: c1x, y: c1y });
+    let b = m.apply(Vec2 { x: c2x, y: c2y });
+    let e = m.apply(Vec2 { x: x, y: y });
+    let length = Math.hypot(
+        a.x - last.x,
+        a.y - last.y,
+    ) + Math.hypot(b.x - a.x, b.y - a.y) + Math.hypot(e.x - b.x, e.y - b.y);
+    let steps = truncate<u32>(Math.clamp((length * 1.5).sqrt() * 2.0, 2.0, 64.0));
+    // Flatten in local space so the points pass through the transform once, like every other point.
+    let inv = match (m.inverse()) {
+        Some(i) => i,
+        null => Affine2.identity(),
+    };
+    let p0 = inv.apply(Vec2 { x: last.x, y: last.y });
+    for (s in 1..steps + 1) {
+        let t = round<f32>(s) / round<f32>(steps);
+        let u = 1.0 - t;
+        let w0 = u * u * u;
+        let w1 = 3.0 * u * u * t;
+        let w2 = 3.0 * u * t * t;
+        let w3 = t * t * t;
+        addPoint(mut r, w0 * p0.x + w1 * c1x + w2 * c2x + w3 * x, w0 * p0.y + w1 * c1y + w2 * c2y + w3 * y);
+    }
+}
+
+/// A rounded rectangle with elliptical per-corner radii (rx/ry for TL, TR, BR, BL), clockwise on screen, or
+/// counter-clockwise when `reversed` (a hole). As thorvg_backend.c's cw_appendRoundedRectXY.
+fn roundedRectXY(r: borrow mut Raster, x: f32, y: f32, w: f32, h: f32, rx: [f32; 4], ry: [f32; 4], reversed: bool) {
+    let x1 = x + w;
+    let y1 = y + h;
+    if (!reversed) {
+        moveTo(mut r, x + rx[0], y);
+        lineTo(mut r, x1 - rx[1], y);
+        if (rx[1] > 0.0 || ry[1] > 0.0) {
+            cubicTo(mut r, x1 - rx[1] + rx[1] * KAPPA, y, x1, y + ry[1] - ry[1] * KAPPA, x1, y + ry[1]);
+        }
+        lineTo(mut r, x1, y1 - ry[2]);
+        if (rx[2] > 0.0 || ry[2] > 0.0) {
+            cubicTo(mut r, x1, y1 - ry[2] + ry[2] * KAPPA, x1 - rx[2] + rx[2] * KAPPA, y1, x1 - rx[2], y1);
+        }
+        lineTo(mut r, x + rx[3], y1);
+        if (rx[3] > 0.0 || ry[3] > 0.0) {
+            cubicTo(mut r, x + rx[3] - rx[3] * KAPPA, y1, x, y1 - ry[3] + ry[3] * KAPPA, x, y1 - ry[3]);
+        }
+        lineTo(mut r, x, y + ry[0]);
+        if (rx[0] > 0.0 || ry[0] > 0.0) {
+            cubicTo(mut r, x, y + ry[0] - ry[0] * KAPPA, x + rx[0] - rx[0] * KAPPA, y, x + rx[0], y);
+        }
+    } else {
+        moveTo(mut r, x + rx[0], y);
+        if (rx[0] > 0.0 || ry[0] > 0.0) {
+            cubicTo(mut r, x + rx[0] - rx[0] * KAPPA, y, x, y + ry[0] - ry[0] * KAPPA, x, y + ry[0]);
+        }
+        lineTo(mut r, x, y1 - ry[3]);
+        if (rx[3] > 0.0 || ry[3] > 0.0) {
+            cubicTo(mut r, x, y1 - ry[3] + ry[3] * KAPPA, x + rx[3] - rx[3] * KAPPA, y1, x + rx[3], y1);
+        }
+        lineTo(mut r, x1 - rx[2], y1);
+        if (rx[2] > 0.0 || ry[2] > 0.0) {
+            cubicTo(mut r, x1 - rx[2] + rx[2] * KAPPA, y1, x1, y1 - ry[2] + ry[2] * KAPPA, x1, y1 - ry[2]);
+        }
+        lineTo(mut r, x1, y + ry[1]);
+        if (rx[1] > 0.0 || ry[1] > 0.0) {
+            cubicTo(mut r, x1, y + ry[1] - ry[1] * KAPPA, x1 - rx[1] + rx[1] * KAPPA, y, x1 - rx[1], y);
+        }
+        lineTo(mut r, x + rx[0], y);
+    }
+}
+
+/// thorvg_backend.c's cw_clampRadii: scale radii down so adjacent pairs fit, and clamp at 0.
+fn clampRadii(w: f32, h: f32, c: Corners) -> Corners {
+    let f = c.fitted(w, h);
+    return Corners {
+        topLeft: f.topLeft.max(0.0),
+        topRight: f.topRight.max(0.0),
+        bottomRight: f.bottomRight.max(0.0),
+        bottomLeft: f.bottomLeft.max(0.0),
+    };
+}
+
+/// cw_appendRoundedRect: circular radii, the box grown by `grow` on every side (rounded corners grow with it).
+fn roundedRect(r: borrow mut Raster, b: Rect, cr: Corners, grow: f32, reversed: bool) {
+    let x = b.x - grow;
+    let y = b.y - grow;
+    let w = b.w + 2.0 * grow;
+    let h = b.h + 2.0 * grow;
+    if (w <= 0.0 || h <= 0.0) {
+        return;
+    }
+    var c = cr;
+    if (grow != 0.0) {
+        c.topLeft = if (c.topLeft > 0.0) c.topLeft + grow else 0.0;
+        c.topRight = if (c.topRight > 0.0) c.topRight + grow else 0.0;
+        c.bottomLeft = if (c.bottomLeft > 0.0) c.bottomLeft + grow else 0.0;
+        c.bottomRight = if (c.bottomRight > 0.0) c.bottomRight + grow else 0.0;
+    }
+    c = clampRadii(w, h, c);
+    let radii = [c.topLeft, c.topRight, c.bottomRight, c.bottomLeft];
+    roundedRectXY(mut r, x, y, w, h, radii, radii, reversed);
+}
+
+/// A full circle (four cubics), clockwise.
+fn circle(r: borrow mut Raster, cx: f32, cy: f32, radius: f32) {
+    let k = radius * KAPPA;
+    moveTo(mut r, cx, cy - radius);
+    cubicTo(mut r, cx + k, cy - radius, cx + radius, cy - k, cx + radius, cy);
+    cubicTo(mut r, cx + radius, cy + k, cx + k, cy + radius, cx, cy + radius);
+    cubicTo(mut r, cx - k, cy + radius, cx - radius, cy + k, cx - radius, cy);
+    cubicTo(mut r, cx - radius, cy - k, cx - k, cy - radius, cx, cy - radius);
+}
+
+/// A thick line with round caps (a stroke segment with round caps and joins, as a filled capsule).
+fn capsule(r: borrow mut Raster, ax: f32, ay: f32, bx: f32, by: f32, width: f32) {
+    let len = Math.hypot(bx - ax, by - ay);
+    let half = width / 2.0;
+    if (len < 0.0001) {
+        circle(mut r, ax, ay, half);
+        return;
+    }
+    let nx = -(by - ay) / len * half;
+    let ny = (bx - ax) / len * half;
+    let tx = (bx - ax) / len * half;
+    let ty = (by - ay) / len * half;
+    // Side, round cap at b (two quarter arcs), other side, round cap at a.
+    moveTo(mut r, ax + nx, ay + ny);
+    lineTo(mut r, bx + nx, by + ny);
+    cubicTo(
+        mut r,
+        bx + nx + tx * KAPPA,
+        by + ny + ty * KAPPA,
+        bx + tx + nx * KAPPA,
+        by + ty + ny * KAPPA,
+        bx + tx,
+        by + ty,
+    );
+    cubicTo(
+        mut r,
+        bx + tx - nx * KAPPA,
+        by + ty - ny * KAPPA,
+        bx - nx + tx * KAPPA,
+        by - ny + ty * KAPPA,
+        bx - nx,
+        by - ny,
+    );
+    lineTo(mut r, ax - nx, ay - ny);
+    cubicTo(
+        mut r,
+        ax - nx - tx * KAPPA,
+        ay - ny - ty * KAPPA,
+        ax - tx - nx * KAPPA,
+        ay - ty - ny * KAPPA,
+        ax - tx,
+        ay - ty,
+    );
+    cubicTo(
+        mut r,
+        ax - tx + nx * KAPPA,
+        ay - ty + ny * KAPPA,
+        ax + nx - tx * KAPPA,
+        ay + ny - ty * KAPPA,
+        ax + nx,
+        ay + ny,
+    );
+}
+
+// ---- rasterization ---------------------------------------------------------------------------------------------
+
+/// Accumulates one edge into `acc` (row stride `stride`, `rows` rows), coordinates relative to the box origin.
+/// The font-rs line accumulation, with x clamped into the box so area left of it still counts.
+fn accumulateLine(acc: SliceMut<f32>, stride: usize, rows: usize, maxX: f32, ax: f32, ay: f32, bx: f32, by: f32) {
+    if (ay == by) {
+        return;
+    }
+    let dir: f32 = if (ay < by) 1.0 else -1.0;
+    let x0p = if (ay < by) ax else bx;
+    let y0p = if (ay < by) ay else by;
+    let x1p = if (ay < by) bx else ax;
+    let y1p = if (ay < by) by else ay;
+    let dxdy = (x1p - x0p) / (y1p - y0p);
+    // The true x where the edge enters the first row; only per-row values are clamped into the box (area left of
+    // it still counts in full, area right of it is never read).
+    var xTrue = x0p;
+    if (y0p < 0.0) {
+        xTrue -= y0p * dxdy;
+    }
+    let rowsF = round<f32>(rows);
+    let yStart = truncate<i32>(y0p.max(0.0).min(rowsF));
+    let yEnd = truncate<i32>(y1p.ceil().min(rowsF).max(0.0));
+    var yi = yStart;
+    while (yi < yEnd) {
+        let yf = round<f32>(yi);
+        let line = idx(yi) * stride;
+        let dy = (yf + 1.0).min(y1p) - yf.max(y0p);
+        let xNextTrue = xTrue + dxdy * dy;
+        let x = Math.clamp(xTrue, 0.0, maxX);
+        let xnext = Math.clamp(xNextTrue, 0.0, maxX);
+        let d = dy * dir;
+        let lo = x.min(xnext);
+        let hi = x.max(xnext);
+        let lofloor = lo.floor();
+        let loi = truncate<usize>(lofloor);
+        let hiceil = hi.ceil();
+        let hii = truncate<usize>(hiceil);
+        if (hii <= loi + 1) {
+            let xmf = 0.5 * (x + xnext) - lofloor;
+            acc[line + loi] += d - d * xmf;
+            acc[line + loi + 1] += d * xmf;
+        } else {
+            let s = 1.0 / (hi - lo);
+            let x0f = lo - lofloor;
+            let a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+            let x1f = hi - hiceil + 1.0;
+            let am = 0.5 * s * x1f * x1f;
+            acc[line + loi] += d * a0;
+            if (hii == loi + 2) {
+                acc[line + loi + 1] += d * (1.0 - a0 - am);
+            } else {
+                let a1 = s * (1.5 - x0f);
+                acc[line + loi + 1] += d * (a1 - a0);
+                var xi = loi + 2;
+                while (xi < hii - 1) {
+                    acc[line + xi] += d * s;
+                    xi += 1;
+                }
+                let a2 = a1 + round<f32>(hii - loi - 3) * s;
+                acc[line + hii - 1] += d * (1.0 - a2 - am);
+            }
+            acc[line + hii] += d * am;
+        }
+        xTrue = xNextTrue;
+        yi += 1;
+    }
+}
+
+/// Fills the current path with `paint` into the current layer, or into a clip mask.
+fn fillPath(r: borrow mut Raster, paint: Paint, target: FillTarget) {
+    if (r.pointCount < 3) {
+        return;
+    }
+    // The bounding box, clipped to the clip region and the layer.
+    var minX = r.points[0].x;
+    var minY = r.points[0].y;
+    var maxX = minX;
+    var maxY = minY;
+    for (i in 1..r.pointCount) {
+        let p = r.points[i];
+        minX = minX.min(p.x);
+        minY = minY.min(p.y);
+        maxX = maxX.max(p.x);
+        maxY = maxY.max(p.y);
+    }
+    let clip = r.clips.last();
+    let layer = r.layers.last();
+    var bx0 = imax(imax(truncate<i32>(Math.clamp(minX.floor(), -1.0, 100000.0)), clip.x0), layer.x0);
+    var by0 = imax(imax(truncate<i32>(Math.clamp(minY.floor(), -1.0, 100000.0)), clip.y0), layer.y0);
+    var bx1 = imin(imin(truncate<i32>(Math.clamp(maxX.ceil(), -1.0, 100000.0)), clip.x1), layer.x1);
+    var by1 = imin(imin(truncate<i32>(Math.clamp(maxY.ceil(), -1.0, 100000.0)), clip.y1), layer.y1);
+    match (target) {
+        FillTarget.Mask(_, mx0, my0, mw) => {
+            bx0 = imax(bx0, mx0);
+            by0 = imax(by0, my0);
+            bx1 = imin(bx1, mx0 + mw);
+        }
+        _ => {}
+    }
+    if (bx1 <= bx0 || by1 <= by0) {
+        return;
+    }
+    let bw = idx(bx1 - bx0);
+    let bh = idx(by1 - by0);
+    let stride = bw + 2;
+    if (stride * bh > r.acc.length) {
+        r.overflowed = true;
+        return;
+    }
+    let ox = round<f32>(bx0);
+    let oy = round<f32>(by0);
+    let maxRel = round<f32>(bw);
+    for (c in 0..r.contourCount) {
+        let start = r.contourStarts[c];
+        let end = if (c + 1 < r.contourCount) r.contourStarts[c + 1] else r.pointCount;
+        if (end <= start + 1) {
+            continue;
+        }
+        for (i in start..end) {
+            let a = r.points[i];
+            let b = if (i + 1 < end) r.points[i + 1] else r.points[start];
+            accumulateLine(mut r.acc, stride, bh, maxRel, a.x - ox, a.y - oy, b.x - ox, b.y - oy);
+        }
+    }
+    // Sweep: running sums are the coverage; reset the buffer as it is read.
+    let layerStride = idx(layer.x1 - layer.x0);
+    // Solid paints skip per-pixel evaluation; fully covered opaque pixels are a plain store.
+    let solid = match (paint.kind) {
+        PaintKind.Solid => true,
+        _ => false,
+    };
+    let sc = paint.color;
+    let opaqueSolid = solid && sc.a >= 0.999;
+    let packedSolid = pack(sc.r, sc.g, sc.b, sc.a);
+    for (y in 0..bh) {
+        let row = y * stride;
+        let dy = by0 + truncate<i32>(y);
+        var sum: f32 = 0.0;
+        for (x in 0..bw) {
+            sum += r.acc[row + x];
+            r.acc[row + x] = 0.0;
+            let coverage = sum.abs().min(1.0);
+            if (coverage < 0.002) {
+                continue;
+            }
+            let dx = bx0 + truncate<i32>(x);
+            match (target) {
+                FillTarget.Layer => {
+                    let k = coverage * r.clipCoverage(clip, dx, dy);
+                    if (k < 0.002) {
+                        continue;
+                    }
+                    let di = layer.offset + idx(dy - layer.y0) * layerStride + idx(dx - layer.x0);
+                    if (opaqueSolid && k >= 0.999) {
+                        r.pool[di] = packedSolid;
+                    } else if (solid) {
+                        r.pool[di] = over(r.pool[di], sc.r * k, sc.g * k, sc.b * k, sc.a * k);
+                    } else {
+                        let c = evaluatePaint(r, paint, round<f32>(dx) + 0.5, round<f32>(dy) + 0.5);
+                        r.pool[di] = over(r.pool[di], c.r * k, c.g * k, c.b * k, c.a * k);
+                    }
+                }
+                FillTarget.Mask(offset, mx0, my0, mw) => {
+                    let mi = offset + (idx(dy - my0)) * (idx(mw)) + (idx(dx - mx0));
+                    let parent = r.clipCoverage(clip, dx, dy);
+                    r.masks[mi] = truncate<u8>(truncate<u32>(Math.clamp(coverage * parent * 255.0 + 0.5, 0.0, 255.0)));
+                }
+            }
+        }
+        r.acc[row + bw] = 0.0;
+        r.acc[row + bw + 1] = 0.0;
+    }
+}
+
+// ---- paints ----------------------------------------------------------------------------------------------------
+
+/// The premultiplied color of `paint` at device point (x, y).
+fn evaluatePaint(r: borrow Raster, paint: borrow Paint, x: f32, y: f32) -> RGBAf {
+    match (paint.kind) {
+        PaintKind.Solid => { return paint.color; }
+        PaintKind.Linear => {
+            let p = paint.inverse.apply(Vec2 { x: x, y: y });
+            let t = ((p.x - paint.startX) * paint.dirX + (p.y - paint.startY) * paint.dirY) / paint.len2;
+            return gradientColor(paint, t);
+        }
+        PaintKind.Radial => {
+            let p = paint.inverse.apply(Vec2 { x: x, y: y });
+            let t = Math.hypot(p.x - paint.startX, p.y - paint.startY) / paint.radius;
+            return gradientColor(paint, t);
+        }
+        PaintKind.Image => {
+            let p = paint.inverse.apply(Vec2 { x: x, y: y });
+            return sampleImage(r, paint, p.x, p.y);
+        }
+    }
+}
+
+fn spreadT(spread: GradientSpread, t: f32) -> f32 {
+    match (spread) {
+        GradientSpread.Pad => { return Math.clamp(t, 0.0, 1.0); }
+        GradientSpread.Repeat => { return t - t.floor(); }
+        GradientSpread.Reflect => {
+            let m = t - (t / 2.0).floor() * 2.0;
+            return if (m > 1.0) 2.0 - m else m;
+        }
+    }
+}
+
+/// The gradient's color at t (straight interpolation between the stops, then premultiplied).
+fn gradientColor(paint: borrow Paint, t: f32) -> RGBAf {
+    let u = spreadT(paint.spread, t);
+    let n = paint.stopCount;
+    var a = paint.stops[0];
+    var b = paint.stops[if (n > 1) n - 1 else 0];
+    if (u <= paint.stops[0].position) {
+        b = a;
+    } else if (u >= paint.stops[n - 1].position) {
+        a = b;
+    } else {
+        for (k in 0..n - 1) {
+            if (u >= paint.stops[k].position && u <= paint.stops[k + 1].position) {
+                a = paint.stops[k];
+                b = paint.stops[k + 1];
+                break;
+            }
+        }
+    }
+    let span = b.position - a.position;
+    let f = if (span > 0.00001) (u - a.position) / span else 0.0;
+    let alpha = Math.lerp(round<f32>(a.color.a as u32), round<f32>(b.color.a as u32), f) / 255.0;
+    let red = Math.lerp(round<f32>(a.color.r as u32), round<f32>(b.color.r as u32), f) / 255.0;
+    let green = Math.lerp(round<f32>(a.color.g as u32), round<f32>(b.color.g as u32), f) / 255.0;
+    let blue = Math.lerp(round<f32>(a.color.b as u32), round<f32>(b.color.b as u32), f) / 255.0;
+    return RGBAf { r: red * alpha, g: green * alpha, b: blue * alpha, a: alpha };
+}
+
+/// Bilinear sample of a registered image over `paint.box`, with the Tailwind-style tint and opacity.
+fn sampleImage(r: borrow Raster, paint: borrow Paint, lx: f32, ly: f32) -> RGBAf {
+    let rec = r.images.get(paint.image);
+    let wf = round<f32>(rec.w);
+    let hf = round<f32>(rec.h);
+    let u = (lx - paint.box.x) / paint.box.w * wf - 0.5;
+    let v = (ly - paint.box.y) / paint.box.h * hf - 0.5;
+    let u0 = u.floor();
+    let v0 = v.floor();
+    let fu = u - u0;
+    let fv = v - v0;
+    let c00 = texel(r, rec, u0, v0);
+    let c10 = texel(r, rec, u0 + 1.0, v0);
+    let c01 = texel(r, rec, u0, v0 + 1.0);
+    let c11 = texel(r, rec, u0 + 1.0, v0 + 1.0);
+    var c = RGBAf {
+        r: Math.lerp(Math.lerp(c00.r, c10.r, fu), Math.lerp(c01.r, c11.r, fu), fv),
+        g: Math.lerp(Math.lerp(c00.g, c10.g, fu), Math.lerp(c01.g, c11.g, fu), fv),
+        b: Math.lerp(Math.lerp(c00.b, c10.b, fu), Math.lerp(c01.b, c11.b, fu), fv),
+        a: Math.lerp(Math.lerp(c00.a, c10.a, fu), Math.lerp(c01.a, c11.a, fu), fv),
+    };
+    if (paint.tinted && c.a > 0.0) {
+        // ThorVG's tint effect (black -> tint), as thorvg_backend.c applies it to images.
+        let t = tintPixel(
+            pack(c.r, c.g, c.b, c.a),
+            Color.rgb(0, 0, 0),
+            Color.rgb(paint.tint.r, paint.tint.g, paint.tint.b),
+        );
+        c = RGBAf { r: chan(t, 0), g: chan(t, 8), b: chan(t, 16), a: chan(t, 24) };
+    }
+    return RGBAf { r: c.r * paint.opacity, g: c.g * paint.opacity, b: c.b * paint.opacity, a: c.a * paint.opacity };
+}
+
+/// An image texel (clamped to the edge), premultiplied.
+fn texel(r: borrow Raster, rec: ImageRecord, u: f32, v: f32) -> RGBAf {
+    let x = truncate<usize>(Math.clamp(u, 0.0, round<f32>(rec.w - 1)));
+    let y = truncate<usize>(Math.clamp(v, 0.0, round<f32>(rec.h - 1)));
+    let p = r.imagePool[rec.offset + y * rec.w + x];
+    let a = chan(p, 24);
+    return RGBAf { r: chan(p, 0) * a, g: chan(p, 8) * a, b: chan(p, 16) * a, a: a };
+}

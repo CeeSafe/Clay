@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: MIT
+// The software renderer as a ClayWind backend: each Command drawn the way thorvg_backend.c builds it for ThorVG.
+// Text is drawn by the font engine (Phase 5); until then Text commands are skipped.
+
+/// Vector icon ids for `Style.icon` (renderer.h's CW_ICON_*).
+public const ICON_CHECK: u32 = 1;
+public const ICON_CHEVRON_DOWN: u32 = 2;
+public const ICON_CHEVRON_RIGHT: u32 = 3;
+public const ICON_CLOSE: u32 = 4;
+public const ICON_PLUS: u32 = 5;
+public const ICON_MINUS: u32 = 6;
+public const ICON_DOT: u32 = 7;
+
+/// Text metrics from the loaded fonts, as the ThorVG backend measures (ClayWind_Thorvg_MeasureText/MeasureBaseline).
+impl<region r> TextMetrics for Raster<r> {
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims {
+        let size = if (config.fontSize > 0.0) config.fontSize else 16.0;
+        return Dims { w: this.measureWidth(utf8, config.fontId, size, config.letterSpacing), h: size };
+    }
+
+    fn baseline(borrow this, config: TextConfig) -> f32 {
+        let size = if (config.fontSize > 0.0) config.fontSize else 16.0;
+        return match (this.fontSlot(config.fontId)) {
+            Some(slot) => slot.info.ascent * size / slot.info.unitsPerEm,
+            null => 0.8 * size,
+        };
+    }
+}
+
+impl<region r> Backend for Raster<r> {
+    fn draw(borrow mut this, command: Command, text: Slice<u8>) {
+        match (command) {
+            Command.Fill(area, color, radius) => {
+                if (color.a == 0) {
+                    return;
+                }
+                beginPath(mut this);
+                roundedRect(mut this, area, radius, 0.0, false);
+                fillPath(mut this, solidPaint(color), FillTarget.Layer);
+            }
+            Command.Stroke(area, color, radius, widths) => { drawBorder(mut this, area, color, radius, widths); }
+            Command.Text(area, run) => { drawText(mut this, area, run, text); }
+            Command.Picture(area, tint, radius, handle) => { drawImage(mut this, area, tint, radius, handle); }
+            Command.CustomDraw(_, _, _, _) => {}
+            Command.ClipStart(area, radius, _, _) => { pushClipShape(mut this, area, radius); }
+            Command.ClipEnd => { this.popClip(); }
+            Command.TransformStart(_, t) => { this.pushTransform(transformMatrix(t)); }
+            Command.TransformEnd => { this.popTransform(); }
+            Command.DropShadow(area, shadow, radius) => { drawShadow(mut this, area, shadow, radius); }
+            Command.GradientFill(area, gradient, radius) => { drawGradient(mut this, area, gradient, radius); }
+            Command.RingStroke(area, ring, radius) => { drawRing(mut this, area, ring, radius); }
+            Command.IconDraw(area, icon) => { drawIcon(mut this, area, icon); }
+            Command.BlendStart(mode) => { this.pushLayer(LayerKind.BlendWith(mode)); }
+            Command.BlendEnd => { this.popLayer(); }
+            Command.OpacityStart(_, alpha) => { this.pushLayer(LayerKind.Opacity(alpha)); }
+            Command.OpacityEnd(_) => { this.popLayer(); }
+            Command.FilterStart(_, mode, amount) => { this.pushLayer(LayerKind.Filtered(mode, amount)); }
+            Command.FilterEnd(_, _) => { this.popLayer(); }
+        }
+    }
+}
+
+/// tvgb_transformStart: M = T(pivot) R(rotation) S(scale) Shear(skewX, skewY) T(-pivot).
+fn transformMatrix(t: TransformData) -> Affine2 {
+    let rad = Math.radians(t.rotation);
+    let c = Math.cos(rad);
+    let s = Math.sin(rad);
+    let sc = if (t.scale != 0.0) t.scale else 1.0;
+    let tx = if (t.skewX != 0.0) Math.tan(Math.radians(t.skewX)) else 0.0;
+    let ty = if (t.skewY != 0.0) Math.tan(Math.radians(t.skewY)) else 0.0;
+    // ThorVG's row-major e11 e12 / e21 e22 are our a c / b d.
+    let e11 = sc * (c - s * ty);
+    let e12 = sc * (c * tx - s);
+    let e21 = sc * (s + c * ty);
+    let e22 = sc * (s * tx + c);
+    let px = t.pivot.x;
+    let py = t.pivot.y;
+    return Affine2 { a: e11, b: e21, c: e12, d: e22, e: px - (e11 * px + e12 * py), f: py - (e21 * px + e22 * py) };
+}
+
+/// tvgb_border: the outer outline minus the inner one, whose corners are elliptical (radius minus the adjacent
+/// side widths, as in CSS).
+fn drawBorder(r: borrow mut Raster, b: Rect, color: Color, radius: Corners, w: BorderWidth) {
+    if (color.a == 0 || (w.left <= 0.0 && w.right <= 0.0 && w.top <= 0.0 && w.bottom <= 0.0)) {
+        return;
+    }
+    beginPath(mut r);
+    roundedRect(mut r, b, radius, 0.0, false);
+    let iw = b.w - w.left - w.right;
+    let ih = b.h - w.top - w.bottom;
+    if (iw > 0.0 && ih > 0.0) {
+        let c = clampRadii(b.w, b.h, radius);
+        let rx = [
+            (c.topLeft - w.left).max(0.0),
+            (c.topRight - w.right).max(0.0),
+            (c.bottomRight - w.right).max(0.0),
+            (c.bottomLeft - w.left).max(0.0),
+        ];
+        let ry = [
+            (c.topLeft - w.top).max(0.0),
+            (c.topRight - w.top).max(0.0),
+            (c.bottomRight - w.bottom).max(0.0),
+            (c.bottomLeft - w.bottom).max(0.0),
+        ];
+        roundedRectXY(mut r, b.x + w.left, b.y + w.top, iw, ih, rx, ry, true);
+    }
+    fillPath(mut r, solidPaint(color), FillTarget.Layer);
+}
+
+/// tvgb_ring: a stroke of `width` centred `offset + width/2` outside the box, with round joins: the region
+/// between the box grown by `offset` and by `offset + width`, its corner radii those of the stroke's edges.
+fn drawRing(r: borrow mut Raster, b: Rect, ring: Ring, radius: Corners) {
+    if (ring.color.a == 0 || ring.width <= 0.0) {
+        return;
+    }
+    let half = ring.width * 0.5;
+    let g = ring.offset + half;
+    let w = b.w + 2.0 * g;
+    let h = b.h + 2.0 * g;
+    if (w <= 0.0 || h <= 0.0) {
+        return;
+    }
+    // The stroked path's radii, as cw_appendRoundedRect grows and clamps them.
+    let path = clampRadii(w, h, Corners {
+        topLeft: if (radius.topLeft > 0.0) radius.topLeft + g else 0.0,
+        topRight: if (radius.topRight > 0.0) radius.topRight + g else 0.0,
+        bottomRight: if (radius.bottomRight > 0.0) radius.bottomRight + g else 0.0,
+        bottomLeft: if (radius.bottomLeft > 0.0) radius.bottomLeft + g else 0.0,
+    });
+    let pr = [path.topLeft, path.topRight, path.bottomRight, path.bottomLeft];
+    // Outer edge: radius + half (a round join makes sharp corners radius `half`); inner edge: radius - half.
+    let outer = [pr[0] + half, pr[1] + half, pr[2] + half, pr[3] + half];
+    let inner = [(pr[0] - half).max(0.0), (pr[1] - half).max(0.0), (pr[2] - half).max(0.0), (pr[3] - half).max(0.0)];
+    beginPath(mut r);
+    roundedRectXY(mut r, b.x - g - half, b.y - g - half, w + ring.width, h + ring.width, outer, outer, false);
+    // Where the stroked path is thinner than the stroke, the stroke covers it solid: no hole.
+    if (w > ring.width && h > ring.width) {
+        roundedRectXY(mut r, b.x - g + half, b.y - g + half, w - ring.width, h - ring.width, inner, inner, true);
+    }
+    fillPath(mut r, solidPaint(ring.color), FillTarget.Layer);
+}
+
+/// tvgb_shadow: the box offset and grown by `spread`, blurred with σ = blur / 2 (CSS: blur radius = 2σ).
+fn drawShadow(r: borrow mut Raster, area: Rect, shadow: Shadow, radius: Corners) {
+    if (shadow.color.a == 0) {
+        return;
+    }
+    let b = Rect { x: area.x + shadow.offsetX, y: area.y + shadow.offsetY, w: area.w, h: area.h };
+    if (shadow.blur > 0.5) {
+        let sigma = shadow.blur * 0.5;
+        // ThorVG extends the blur region by the box kernels' total; 3 sigma covers it.
+        let pad = (sigma * 3.0).ceil() + 2.0 + shadow.spread.max(0.0);
+        let bounds = r.currentTransform().bounds(
+            Rect { x: b.x - pad, y: b.y - pad, w: b.w + 2.0 * pad, h: b.h + 2.0 * pad },
+        );
+        let clip = r.currentClip();
+        let x0 = imax(truncate<i32>(Math.clamp(bounds.x.floor(), -1.0, 100000.0)), clip.x0);
+        let y0 = imax(truncate<i32>(Math.clamp(bounds.y.floor(), -1.0, 100000.0)), clip.y0);
+        let x1 = imin(truncate<i32>(Math.clamp((bounds.x + bounds.w).ceil(), -1.0, 100000.0)), clip.x1);
+        let y1 = imin(truncate<i32>(Math.clamp((bounds.y + bounds.h).ceil(), -1.0, 100000.0)), clip.y1);
+        r.pushLayerOver(LayerKind.Blurred(sigma * sigma), x0, y0, x1, y1);
+        beginPath(mut r);
+        roundedRect(mut r, b, radius, shadow.spread, false);
+        fillPath(mut r, solidPaint(shadow.color), FillTarget.Layer);
+        r.popLayer();
+    } else {
+        beginPath(mut r);
+        roundedRect(mut r, b, radius, shadow.spread, false);
+        fillPath(mut r, solidPaint(shadow.color), FillTarget.Layer);
+    }
+}
+
+/// tvgb_gradient: CSS linear (the gradient line through the centre, long enough for the corners to reach the end
+/// colors) or radial (circle, farthest corner, centred).
+fn drawGradient(r: borrow mut Raster, b: Rect, g: Gradient, radius: Corners) {
+    var paint = solidPaint(g.from);
+    let cx = b.x + b.w * 0.5;
+    let cy = b.y + b.h * 0.5;
+    match (g.kind) {
+        GradientKind.Radial => {
+            paint.kind = PaintKind.Radial;
+            let rr = Math.hypot(b.w, b.h) * 0.5;
+            paint.startX = cx;
+            paint.startY = cy;
+            paint.radius = if (rr > 0.0) rr else 1.0;
+        }
+        GradientKind.Linear => {
+            paint.kind = PaintKind.Linear;
+            var angle = g.angle;
+            if (!g.useAngle) {
+                angle = if (g.vertical) 180.0 else 90.0;
+            }
+            let a = Math.radians(angle);
+            let dx = Math.sin(a);
+            let dy = -Math.cos(a);
+            let half = ((b.w * dx).abs() + (b.h * dy).abs()) * 0.5;
+            paint.startX = cx - dx * half;
+            paint.startY = cy - dy * half;
+            paint.dirX = dx * 2.0 * half;
+            paint.dirY = dy * 2.0 * half;
+            let len2 = paint.dirX * paint.dirX + paint.dirY * paint.dirY;
+            paint.len2 = if (len2 > 0.0) len2 else 1.0;
+        }
+    }
+    if (g.stopCount == 0) {
+        paint.stops[0] = GradientStop { color: g.from, position: 0.0 };
+        paint.stops[1] = GradientStop { color: g.to, position: 1.0 };
+        paint.stopCount = 2;
+    } else {
+        var last: f32 = 0.0;
+        let n = if (g.stopCount > 4) 4usize else g.stopCount;
+        for (i in 0..n) {
+            // CSS: a stop before the previous one snaps to it.
+            let p = g.stops[i].position.max(last).min(1.0);
+            last = p;
+            paint.stops[i] = GradientStop { color: g.stops[i].color, position: p };
+        }
+        paint.stopCount = n;
+    }
+    paint.spread = g.spread;
+    paint.inverse = match (r.currentTransform().inverse()) {
+        Some(m) => m,
+        null => Affine2.identity(),
+    };
+    beginPath(mut r);
+    roundedRect(mut r, b, radius, 0.0, false);
+    fillPath(mut r, paint, FillTarget.Layer);
+}
+
+/// tvgb_icon: line/shape primitives in the centred square, stroked with round caps (default 2px), or filled.
+fn drawIcon(r: borrow mut Raster, b: Rect, icon: Icon) {
+    let sz = b.w.min(b.h);
+    let ox = b.x + (b.w - sz) * 0.5;
+    let oy = b.y + (b.h - sz) * 0.5;
+    let th = if (icon.stroke > 0.0) icon.stroke else 2.0;
+    beginPath(mut r);
+    if (icon.id == ICON_CHECK) {
+        capsule(mut r, ox + 0.20 * sz, oy + 0.55 * sz, ox + 0.42 * sz, oy + 0.74 * sz, th);
+        capsule(mut r, ox + 0.42 * sz, oy + 0.74 * sz, ox + 0.80 * sz, oy + 0.30 * sz, th);
+    } else if (icon.id == ICON_CHEVRON_DOWN) {
+        capsule(mut r, ox + 0.25 * sz, oy + 0.40 * sz, ox + 0.50 * sz, oy + 0.64 * sz, th);
+        capsule(mut r, ox + 0.50 * sz, oy + 0.64 * sz, ox + 0.75 * sz, oy + 0.40 * sz, th);
+    } else if (icon.id == ICON_CHEVRON_RIGHT) {
+        capsule(mut r, ox + 0.40 * sz, oy + 0.25 * sz, ox + 0.64 * sz, oy + 0.50 * sz, th);
+        capsule(mut r, ox + 0.64 * sz, oy + 0.50 * sz, ox + 0.40 * sz, oy + 0.75 * sz, th);
+    } else if (icon.id == ICON_CLOSE) {
+        capsule(mut r, ox + 0.27 * sz, oy + 0.27 * sz, ox + 0.73 * sz, oy + 0.73 * sz, th);
+        capsule(mut r, ox + 0.73 * sz, oy + 0.27 * sz, ox + 0.27 * sz, oy + 0.73 * sz, th);
+    } else if (icon.id == ICON_PLUS) {
+        capsule(mut r, ox + 0.5 * sz, oy + 0.2 * sz, ox + 0.5 * sz, oy + 0.8 * sz, th);
+        capsule(mut r, ox + 0.2 * sz, oy + 0.5 * sz, ox + 0.8 * sz, oy + 0.5 * sz, th);
+    } else if (icon.id == ICON_MINUS) {
+        capsule(mut r, ox + 0.2 * sz, oy + 0.5 * sz, ox + 0.8 * sz, oy + 0.5 * sz, th);
+    } else if (icon.id == ICON_DOT) {
+        circle(mut r, ox + 0.5 * sz, oy + 0.5 * sz, sz * 0.18);
+    } else {
+        return;
+    }
+    fillPath(mut r, solidPaint(icon.color), FillTarget.Layer);
+}
+
+/// tvgb_image: scaled to the box (bilinear), rounded corners clip it, a non-white tint remaps its luminance, and a
+/// partial tint alpha is the image's opacity.
+fn drawImage(r: borrow mut Raster, b: Rect, tint: Color, radius: Corners, handle: u32) {
+    if (b.w <= 0.0 || b.h <= 0.0) {
+        return;
+    }
+    let image = match (r.imageIndex(handle)) {
+        Some(k) => k,
+        null => { return; }
+    };
+    var paint = solidPaint(tint);
+    paint.kind = PaintKind.Image;
+    paint.image = image;
+    paint.box = b;
+    paint.tint = tint;
+    paint.tinted =
+        (tint.r != 0 || tint.g != 0 || tint.b != 0 || tint.a != 0) &&
+            !(tint.r == 255 && tint.g == 255 && tint.b == 255);
+    paint.opacity = if (tint.a > 0 && tint.a < 255) round<f32>(tint.a as u32) / 255.0 else 1.0;
+    paint.inverse = match (r.currentTransform().inverse()) {
+        Some(m) => m,
+        null => Affine2.identity(),
+    };
+    beginPath(mut r);
+    roundedRect(mut r, b, radius, 0.0, false);
+    fillPath(mut r, paint, FillTarget.Layer);
+}
+
+/// tvgb_scissorStart: clip to the box, following its rounded corners (CSS overflow:hidden). A plain, untransformed
+/// box is a rectangle; anything else rasterizes a coverage mask.
+fn pushClipShape(r: borrow mut Raster, area: Rect, radius: Corners) {
+    let parent = r.currentClip();
+    let m = r.currentTransform();
+    let identity = m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0;
+    let bounds = m.bounds(area);
+    let x0 = imax(truncate<i32>(Math.clamp(Math.round(bounds.x), -1.0, 100000.0)), parent.x0);
+    let y0 = imax(truncate<i32>(Math.clamp(Math.round(bounds.y), -1.0, 100000.0)), parent.y0);
+    let x1 = imax(imin(truncate<i32>(Math.clamp(Math.round(bounds.x + bounds.w), -1.0, 100000.0)), parent.x1), x0);
+    let y1 = imax(imin(truncate<i32>(Math.clamp(Math.round(bounds.y + bounds.h), -1.0, 100000.0)), parent.y1), y0);
+    if (identity && radius.isZero() && !parent.hasMask) {
+        r.clips.push(ClipState { x0: x0, y0: y0, x1: x1, y1: y1, hasMask: false, maskOffset: 0, maskTop: r.maskTop });
+        return;
+    }
+    let w = idx(x1 - x0);
+    let h = idx(y1 - y0);
+    let saved = r.maskTop;
+    if (r.maskTop + w * h > r.masks.length) {
+        r.overflowed = true;
+        r.clips.push(ClipState { x0: x0, y0: y0, x1: x1, y1: y1, hasMask: false, maskOffset: 0, maskTop: saved });
+        return;
+    }
+    let offset = r.maskTop;
+    for (i in 0..w * h) {
+        r.masks[offset + i] = 0;
+    }
+    r.maskTop += w * h;
+    beginPath(mut r);
+    roundedRect(mut r, area, radius, 0.0, false);
+    fillPath(mut r, solidPaint(Color.hex(WHITE)), FillTarget.Mask(offset, x0, y0, x1 - x0));
+    r.clips.push(ClipState { x0: x0, y0: y0, x1: x1, y1: y1, hasMask: true, maskOffset: offset, maskTop: saved });
+}
+
+/// tvgb_text: the run as one filled path. Glyphs advance by (advance + kerning) font units, scaled to `fontSize`
+/// pixels per em; the ascender line sits at the box top; letter spacing scales every advance so the run's width is
+/// the measured natural width plus `letterSpacing` per byte (as ThorVG's text spacing does).
+fn drawText(r: borrow mut Raster, area: Rect, run: TextRun, utf8: Slice<u8>) {
+    if (utf8.length == 0 || run.color.a == 0) {
+        return;
+    }
+    let slot = match (r.fontSlot(run.fontId)) {
+        Some(s) => s,
+        null => { return; }
+    };
+    let size = if (run.fontSize > 0.0) run.fontSize else 16.0;
+    let scale = size / slot.info.unitsPerEm;
+    var spacing: f32 = 1.0;
+    if (run.letterSpacing > 0.0) {
+        let natural = r.measureWidth(utf8, run.fontId, size, 0.0);
+        if (natural > 0.0) {
+            spacing = (natural + run.letterSpacing * round<f32>(utf8.length)) / natural;
+        }
+    }
+    let originX = area.x;
+    let originY = area.y + slot.info.ascent * scale;
+    beginPath(mut r);
+    var cursor: f32 = 0.0;
+    var previous: u32 = INVALID_GLYPH;
+    var i: usize = 0;
+    while (i < utf8.length) {
+        let cp = decodeUtf8(utf8, i);
+        i += cp[1] as usize;
+        if (cp[0] == 10) {
+            continue;
+        }
+        var outline = emptyOutline();
+        var glyph: u32 = INVALID_GLYPH;
+        var kernX: f32 = 0.0;
+        var advance: f32 = 0.0;
+        {
+            let d = r.fontPool[slot.offset..slot.offset + slot.size];
+            glyph = glyphIndex(d, slot.info, cp[0]);
+            if (glyph != INVALID_GLYPH) {
+                if (previous != INVALID_GLYPH) {
+                    kernX = kerning(d, slot.info, previous, glyph);
+                }
+                advance = glyphAdvance(d, slot.info, glyph);
+                let decoded = decodeGlyph(d, slot.info, glyph, cursor + kernX, 0.0, 1, mut outline);
+            }
+        }
+        if (glyph == INVALID_GLYPH) {
+            continue;
+        }
+        // Flush a long run before the path buffer fills.
+        if (r.pointCount + outline.ptCount * 24 > r.points.length) {
+            fillPath(mut r, solidPaint(run.color), FillTarget.Layer);
+            beginPath(mut r);
+        }
+        appendOutline(mut r, outline, originX, originY, scale);
+        cursor += (advance + kernX) * spacing;
+        previous = glyph;
+    }
+    fillPath(mut r, solidPaint(run.color), FillTarget.Layer);
+}
+
+/// Adds a decoded glyph outline (font units, y down) to the current path at `origin`, scaled.
+fn appendOutline(r: borrow mut Raster, o: borrow GlyphOutline, ox: f32, oy: f32, scale: f32) {
+    var p: usize = 0;
+    for (k in 0..o.opCount) {
+        let op = o.ops[k];
+        if (op == 0) {
+            moveTo(mut r, ox + o.xs[p] * scale, oy + o.ys[p] * scale);
+            p += 1;
+        } else if (op == 1) {
+            lineTo(mut r, ox + o.xs[p] * scale, oy + o.ys[p] * scale);
+            p += 1;
+        } else if (op == 2) {
+            cubicTo(
+                mut r, ox + o.xs[p] * scale, oy + o.ys[p] * scale, ox + o.xs[p + 1] * scale, oy + o.ys[p + 1] * scale,
+                ox + o.xs[p + 2] * scale, oy + o.ys[p + 2] * scale,
+            );
+            p += 3;
+        }
+    }
+}

@@ -1,0 +1,901 @@
+// SPDX-License-Identifier: MIT
+// The layout engine: a port of the ClayWind fork of Clay 0.14's layout core (clay.h). Elements are declared
+// depth-first with open/close/text, then `end` measures text, sizes, positions and emits render commands.
+//
+// Differences from the C code, none of which change results:
+// - storage is index-based fixed lists (collections.cee) instead of pointer arenas;
+// - text is measured in `endLayout` (generic over `TextMetrics`, so region-borrowing font engines work) rather than
+//   as it is declared, and FIT sizes are then
+//   computed children-first in reverse declaration order, which is exactly Clay's close order;
+// - the depth-first passes recurse instead of keeping an explicit stack;
+// - Clay's own transitions and debug view are not ported (ClayWind has its own transitions, transition.cee).
+// Pass structure, arithmetic and ordering follow clay.h function by function; names in comments point at them.
+
+/// Text measurement and font metrics, supplied by the font side (TrueType engine, terminal cells, tests).
+public interface TextMetrics {
+    /// The size of `utf8` set in `config`'s font (width includes letter spacing between glyphs).
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims;
+    /// Distance from the top of a line to its baseline, or a negative value to let the engine synthesize it.
+    fn baseline(borrow this, config: TextConfig) -> f32;
+}
+
+/// One measured word of a text element (Clay__MeasuredWord). `newline` marks a line break (length 0).
+struct Word {
+    start: usize;
+    length: usize;
+    width: f32;
+    newline: bool;
+}
+
+/// One line of wrapped text, as a byte range of the frame's text buffer.
+struct TextLine {
+    start: usize;
+    length: usize;
+    width: f32;
+    height: f32;
+}
+
+/// One element of the frame (Clay_LayoutElement).
+struct Node {
+    decl: Decl;
+    id: u32;
+    isText: bool;
+    text: TextConfig;
+    textStart: usize;
+    textLength: usize;
+    preferred: Dims;
+    minWord: f32;
+    containsNewlines: bool;
+    wordsStart: usize;
+    wordsCount: usize;
+    linesStart: usize;
+    linesCount: usize;
+    dims: Dims;
+    minDims: Dims;
+    childrenStart: usize;
+    childCount: usize;
+    floatingCount: usize;
+    hintHeight: f32;
+    wrapLineStretch: f32;
+    wrapLineSignature: u32;
+    aspectWidthShifted: bool;
+    widthPinned: bool;
+    unpinnedWidth: SizingAxis;
+    /// Index of the nearest clipping ancestor (or attached clip, for floating roots), if any.
+    clipIndex: usize?;
+    area: Rect;
+    placed: bool;
+    /// Children's extent plus padding, as Clay records it for scroll containers.
+    contentSize: Dims;
+}
+
+/// A layout tree root: the main tree (index 0) and every floating element (Clay__LayoutElementTreeRoot).
+struct TreeRoot {
+    index: usize;
+    parentIndex: usize?;
+    clipIndex: usize?;
+    zIndex: i32;
+}
+
+/// A size saved for a relayout pass (Clay__SizeSnapshot).
+struct Snapshot {
+    dims: Dims;
+    minDims: Dims;
+    heightMax: f32;
+}
+
+/// A named element's box, kept across frames (Clay's hash map bounding boxes, for @container queries).
+struct Remembered {
+    id: u32;
+    area: Rect;
+    frame: u32;
+}
+
+/// Text to draw, as a range of the frame's text buffer (`LayoutTree.textBytes`) plus its style.
+public struct TextRun {
+    public start: usize;
+    public length: usize;
+    public color: Color;
+    public fontId: u32;
+    public fontSize: f32;
+    public letterSpacing: f32;
+    public lineHeight: f32;
+}
+
+/// Scale/rotate/skew about a pivot (Clay_TransformRenderData).
+public struct TransformData {
+    public scale: f32;
+    public rotation: f32;
+    public skewX: f32;
+    public skewY: f32;
+    public pivot: Vec2;
+}
+
+/// One render command, in paint order (Clay_RenderCommand). Brackets (`*Start`/`*End`) nest.
+public enum Command {
+    Fill(Rect, Color, Corners),
+    Stroke(Rect, Color, Corners, BorderWidth),
+    Text(Rect, TextRun),
+    Picture(Rect, Color, Corners, u32),
+    CustomDraw(Rect, Color, Corners, u32),
+    ClipStart(Rect, Corners, bool, bool),
+    ClipEnd,
+    TransformStart(Rect, TransformData),
+    TransformEnd,
+    DropShadow(Rect, Shadow, Corners),
+    GradientFill(Rect, Gradient, Corners),
+    RingStroke(Rect, Ring, Corners),
+    IconDraw(Rect, Icon),
+    BlendStart(BlendMode),
+    BlendEnd,
+    OpacityStart(Rect, f32),
+    OpacityEnd(f32),
+    FilterStart(Rect, FilterMode, f32),
+    FilterEnd(FilterMode, f32),
+}
+
+/// How much one `LayoutTree` holds per frame.
+public struct LayoutCapacity {
+    public elements: usize;
+    public textBytes: usize;
+    public words: usize;
+    public lines: usize;
+    public commands: usize;
+
+    /// Room for `elements` elements with typical text and effects.
+    public fn of(elements: usize) -> LayoutCapacity => LayoutCapacity {
+        elements: elements,
+        textBytes: elements * 32,
+        words: elements * 8,
+        lines: elements * 4,
+        commands: elements * 6,
+    };
+}
+
+/// The most sizing passes a frame takes when widths depend on heights (CLAY_MAX_LAYOUT_PASSES).
+const MAX_LAYOUT_PASSES: u32 = 3;
+
+public struct LayoutTree<region r> {
+    nodes: FixedList<r, Node>;
+    children: FixedList<r, usize>;
+    childBuffer: FixedList<r, usize>;
+    openStack: FixedList<r, usize>;
+    clipStack: FixedList<r, usize>;
+    roots: FixedList<r, TreeRoot>;
+    bytes: FixedList<r, u8>;
+    words: FixedList<r, Word>;
+    lines: FixedList<r, TextLine>;
+    commands: FixedList<r, Command>;
+    order: FixedList<r, usize>;
+    snapshots: FixedList<r, Snapshot>;
+    scratch: FixedList<r, usize>;
+    remembered: FixedList<r, Remembered>;
+    pointerOver: FixedList<r, u32>;
+    screen: Dims;
+    frame: u32;
+    failed: bool;
+    relayoutCandidates: bool;
+    useHeightHints: bool;
+    hasBaselineMetric: bool;
+    cullingEnabled: bool;
+
+    public fn create(
+        memory: borrow(r) FixedBufferAllocator,
+        capacity: LayoutCapacity,
+    ) -> Result<LayoutTree<r>, AllocError> {
+        let n = capacity.elements;
+        let nodes = memory.allocArray(n, emptyNode())?;
+        let children = memory.allocArray(n, 0usize)?;
+        let childBuffer = memory.allocArray(n, 0usize)?;
+        let openStack = memory.allocArray(n, 0usize)?;
+        let clipStack = memory.allocArray(n, 0usize)?;
+        let roots = memory.allocArray(n, TreeRoot { index: 0, parentIndex: null, clipIndex: null, zIndex: 0 })?;
+        let text = memory.allocArray(capacity.textBytes, 0u8)?;
+        let words = memory.allocArray(capacity.words, Word { start: 0, length: 0, width: 0.0, newline: false })?;
+        let lines = memory.allocArray(capacity.lines, TextLine { start: 0, length: 0, width: 0.0, height: 0.0 })?;
+        let commands = memory.allocArray(capacity.commands, Command.ClipEnd)?;
+        let order = memory.allocArray(n, 0usize)?;
+        let snapshot = Snapshot { dims: Dims { w: 0.0, h: 0.0 }, minDims: Dims { w: 0.0, h: 0.0 }, heightMax: 0.0 };
+        let snapshots = memory.allocArray(n, snapshot)?;
+        let scratch = memory.allocArray(n, 0usize)?;
+        let remembered = memory.allocArray(n * 2, Remembered { id: 0, area: Rect.zero(), frame: 0 })?;
+        let pointerOver = memory.allocArray(n, 0u32)?;
+        return Ok(LayoutTree {
+            nodes: FixedList<Node>.over(nodes),
+            children: FixedList<usize>.over(children),
+            childBuffer: FixedList<usize>.over(childBuffer),
+            openStack: FixedList<usize>.over(openStack),
+            clipStack: FixedList<usize>.over(clipStack),
+            roots: FixedList<TreeRoot>.over(roots),
+            bytes: FixedList<u8>.over(text),
+            words: FixedList<Word>.over(words),
+            lines: FixedList<TextLine>.over(lines),
+            commands: FixedList<Command>.over(commands),
+            order: FixedList<usize>.over(order),
+            snapshots: FixedList<Snapshot>.over(snapshots),
+            scratch: FixedList<usize>.over(scratch),
+            remembered: FixedList<Remembered>.over(remembered),
+            pointerOver: FixedList<u32>.over(pointerOver),
+            screen: Dims { w: 0.0, h: 0.0 },
+            frame: 1,
+            failed: false,
+            relayoutCandidates: false,
+            useHeightHints: false,
+            hasBaselineMetric: false,
+            cullingEnabled: true,
+        });
+    }
+
+    /// Clay culls commands for elements entirely outside the screen; tests of off-screen geometry turn it off.
+    public fn setCulling(borrow mut this, enabled: bool) {
+        this.cullingEnabled = enabled;
+    }
+
+    /// Starts a frame on a `width` x `height` screen (Clay_BeginLayout): opens the fixed-size root container.
+    public fn begin(borrow mut this, width: f32, height: f32) {
+        this.nodes.clear();
+        this.children.clear();
+        this.childBuffer.clear();
+        this.openStack.clear();
+        this.clipStack.clear();
+        this.roots.clear();
+        this.bytes.clear();
+        this.words.clear();
+        this.lines.clear();
+        this.commands.clear();
+        this.failed = false;
+        this.relayoutCandidates = false;
+        this.frame += 1;
+        this.screen = Dims { w: width, h: height };
+        var root = emptyNode();
+        root.id = hashId("Clay__RootContainer");
+        root.decl.layout.width = SizingAxis.fixed(width);
+        root.decl.layout.height = SizingAxis.fixed(height);
+        this.nodes.push(root);
+        this.openStack.push(0);
+        this.roots.push(TreeRoot { index: 0, parentIndex: null, clipIndex: null, zIndex: 0 });
+    }
+
+    /// Opens an element with `id` (0 for anonymous; see `hashId`) configured by `decl`
+    /// (Clay__OpenElementWithId + Clay__ConfigureOpenElement).
+    public fn open(borrow mut this, id: u32, decl: Decl) {
+        if (this.failed || this.openStack.length() == 0) {
+            this.failed = true;
+            return;
+        }
+        let index = this.nodes.length();
+        let parent = this.openStack.last();
+        var node = emptyNode();
+        node.decl = decl;
+        node.id = if (id != 0) id else derivedId(
+            this.nodes.items[parent].id,
+            this.nodes.items[parent].childCount + this.nodes.items[parent].floatingCount,
+        );
+        node.clipIndex = this.currentClip();
+        if (!this.nodes.push(node) || !this.openStack.push(index)) {
+            this.failed = true;
+            return;
+        }
+        // Floating elements become tree roots of their own (Clay__ConfigureOpenElementPtr).
+        if (decl.floating.isFloating()) {
+            var parentIndex: usize? = parent;
+            var clip: usize? = this.currentClip();
+            match (decl.floating.attachTo) {
+                AttachTo.ElementWithId => {
+                    parentIndex = this.indexOf(decl.floating.parentId);
+                    clip = match (parentIndex) {
+                        Some(p) => this.nodes.items[p].clipIndex,
+                        null => null,
+                    };
+                }
+                AttachTo.Root => {
+                    parentIndex = 0;
+                }
+                _ => {}
+            }
+            if (!decl.floating.clipToParent) {
+                clip = null;
+            }
+            this.nodes.items[index].clipIndex = clip;
+            if (!this.roots.push(TreeRoot {
+                index: index, parentIndex: parentIndex, clipIndex: clip,
+                zIndex: decl.floating.zIndex,
+            })) {
+                this.failed = true;
+                return;
+            }
+            this.pushClip(clip);
+        }
+        if (decl.clip.any()) {
+            this.pushClip(index);
+        }
+    }
+
+    /// Closes the innermost open element (Clay__CloseElement), attaching its children.
+    public fn close(borrow mut this) {
+        if (this.failed || this.openStack.length() <= 1) {
+            return;
+        }
+        let index = this.openStack.last();
+        let decl = this.nodes.items[index].decl;
+        if (decl.clip.any() || decl.floating.isFloating()) {
+            this.clipStack.pop();
+        }
+        // Move this element's children from the buffer into its contiguous child range.
+        let count = this.nodes.items[index].childCount;
+        let bufferEnd = this.childBuffer.length();
+        this.nodes.items[index].childrenStart = this.children.length();
+        for (k in 0..count) {
+            if (!this.children.push(this.childBuffer.get(bufferEnd - count + k))) {
+                this.failed = true;
+                return;
+            }
+        }
+        this.childBuffer.count = bufferEnd - count;
+        if ((decl.layout.wrap && !decl.layout.isRow()) || decl.aspectRatio != 0.0) {
+            this.relayoutCandidates = true;
+        }
+        this.openStack.pop();
+        let parent = this.openStack.last();
+        if (decl.floating.isFloating()) {
+            this.nodes.items[parent].floatingCount += 1;
+            return;
+        }
+        this.nodes.items[parent].childCount += 1;
+        if (!this.childBuffer.push(index)) {
+            this.failed = true;
+        }
+    }
+
+    /// A text leaf (Clay__OpenTextElement). The bytes are copied into the frame's text buffer.
+    public fn text(borrow mut this, utf8: Slice<u8>, config: TextConfig) {
+        if (this.failed || this.openStack.length() == 0) {
+            this.failed = true;
+            return;
+        }
+        let parent = this.openStack.last();
+        let start = this.bytes.length();
+        for (b in utf8) {
+            if (!this.bytes.push(b)) {
+                this.failed = true;
+                return;
+            }
+        }
+        var node = emptyNode();
+        node.isText = true;
+        node.text = config;
+        node.textStart = start;
+        node.textLength = utf8.length;
+        node.id = derivedId(
+            this.nodes.items[parent].id,
+            this.nodes.items[parent].childCount + this.nodes.items[parent].floatingCount,
+        );
+        node.clipIndex = this.currentClip();
+        let index = this.nodes.length();
+        if (!this.nodes.push(node) || !this.childBuffer.push(index)) {
+            this.failed = true;
+            return;
+        }
+        this.nodes.items[parent].childCount += 1;
+    }
+
+    // ---- results ---------------------------------------------------------------------------------------------------
+
+    public fn commandCount(borrow this) -> usize => this.commands.length();
+
+    public fn command(borrow this, i: usize) -> Command => this.commands.get(i);
+
+    /// The bytes of a `TextRun`.
+    public fn textBytes(borrow this, run: TextRun) -> Slice<u8> => this.bytes.items[run.start..run.start + run.length];
+
+    /// The box of the element with `id` in the last laid-out frame (during a frame's build: the previous frame's),
+    /// or null if it was not in that frame (Clay_GetElementData). This is what @container queries read.
+    public fn boxOf(borrow this, id: u32) -> Rect? {
+        let slot = this.rememberedSlot(id);
+        if (slot == null) {
+            return null;
+        }
+        let entry = this.remembered.items[slot!];
+        if (entry.id != id || entry.frame + 1 < this.frame) {
+            return null;
+        }
+        return entry.area;
+    }
+
+    /// The id an element opened now with `id` gets: `id` itself, or the derived id of an anonymous element
+    /// (0) at the current position. Lets callers key per-element state (hover, transitions) before `open`.
+    public fn idFor(borrow this, id: u32) -> u32 {
+        if (id != 0 || this.openStack.length() == 0) {
+            return id;
+        }
+        let parent = this.openStack.last();
+        return derivedId(
+            this.nodes.items[parent].id,
+            this.nodes.items[parent].childCount + this.nodes.items[parent].floatingCount,
+        );
+    }
+
+    /// Hit-tests `point` against the last laid-out frame (Clay_SetPointerState): every element under it,
+    /// within its clip region, root by root from the top of the z-order down to the first capturing floating
+    /// root that contains it. Call before `begin`, which discards the previous frame's tree.
+    public fn hitTest(borrow mut this, point: Vec2) {
+        this.pointerOver.clear();
+        var r = this.roots.length();
+        while (r > 0) {
+            r -= 1;
+            let root = this.roots.items[r];
+            let found = hitTestNode(mut this, root.index, point);
+            let floating = this.nodes.items[root.index].decl.floating;
+            if (found && floating.isFloating() && !floating.passthrough) {
+                break;
+            }
+        }
+    }
+
+    /// Whether the element with `id` was under the pointer at the last `hitTest` (Clay_PointerOver).
+    public fn isPointerOver(borrow this, id: u32) -> bool {
+        for (i in 0..this.pointerOver.length()) {
+            if (this.pointerOver.items[i] == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The ids under the pointer at the last `hitTest`, outermost first, topmost tree root first.
+    public fn pointerOverCount(borrow this) -> usize => this.pointerOver.length();
+    public fn pointerOverAt(borrow this, i: usize) -> u32 => this.pointerOver.get(i);
+
+    /// The laid-out size and content size (children's extent plus padding) of the element with `id` in the
+    /// current tree, for scroll containers.
+    public fn scrollExtent(borrow this, id: u32) -> ScrollExtent? {
+        for (i in 0..this.nodes.length()) {
+            let node = this.nodes.items[i];
+            if (node.id == id && !node.isText && node.placed) {
+                return ScrollExtent { size: node.dims, content: node.contentSize, area: node.area };
+            }
+        }
+        return null;
+    }
+
+    /// The screen size the frame was laid out for.
+    public fn screenSize(borrow this) -> Dims => this.screen;
+
+    /// The element count of the frame (including the root and text elements).
+    public fn elementCount(borrow this) -> usize => this.nodes.length();
+
+    // ---- internals -------------------------------------------------------------------------------------------------
+
+    /// The innermost clipping element; the root (0) stands for "not clipped" (floating elements that escape).
+    fn currentClip(borrow this) -> usize? {
+        if (this.clipStack.length() == 0) {
+            return null;
+        }
+        let c = this.clipStack.last();
+        return if (c == 0) null else c;
+    }
+
+    /// Pushes a clip context; `null` (floating, not clipped) is recorded as the root, which never clips.
+    fn pushClip(borrow mut this, clip: usize?) {
+        let value = match (clip) {
+            Some(c) => c,
+            null => 0,
+        };
+        if (!this.clipStack.push(value)) {
+            this.failed = true;
+        }
+    }
+
+    /// The current frame's index of a named element declared so far.
+    fn indexOf(borrow this, id: u32) -> usize? {
+        for (i in 0..this.nodes.length()) {
+            if (this.nodes.items[i].id == id) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Open addressing over `remembered`: the slot holding `id`, or the empty/stale slot it would go in.
+    fn rememberedSlot(borrow this, id: u32) -> usize? {
+        let size = this.remembered.items.length;
+        if (size == 0) {
+            return null;
+        }
+        var slot = (id as usize) % size;
+        var probes: usize = 0;
+        while (probes < size) {
+            let entry = this.remembered.items[slot];
+            if (entry.id == id || entry.id == 0) {
+                return slot;
+            }
+            slot = (slot + 1) % size;
+            probes += 1;
+        }
+        return null;
+    }
+
+    /// Stores every placed element's box for the next frame's queries.
+    fn remember(borrow mut this) {
+        let size = this.remembered.items.length;
+        // Drop entries older than the previous frame so the table does not fill with ids that went away.
+        for (k in 0..size) {
+            if (this.remembered.items[k].id != 0 && this.remembered.items[k].frame + 1 < this.frame) {
+                this.remembered.items[k].id = 0;
+            }
+        }
+        for (i in 0..this.nodes.length()) {
+            let node = this.nodes.items[i];
+            if (!node.placed || node.isText) {
+                continue;
+            }
+            match (this.rememberedSlot(node.id)) {
+                Some(slot) => {
+                    this.remembered.items[slot] = Remembered { id: node.id, area: node.area, frame: this.frame };
+                }
+                null => {}
+            }
+        }
+    }
+}
+
+fn emptyNode() -> Node => Node {
+    decl: Decl.of(),
+    id: 0,
+    isText: false,
+    text: TextConfig.of(16.0),
+    textStart: 0,
+    textLength: 0,
+    preferred: Dims { w: 0.0, h: 0.0 },
+    minWord: 0.0,
+    containsNewlines: false,
+    wordsStart: 0,
+    wordsCount: 0,
+    linesStart: 0,
+    linesCount: 0,
+    dims: Dims { w: 0.0, h: 0.0 },
+    minDims: Dims { w: 0.0, h: 0.0 },
+    childrenStart: 0,
+    childCount: 0,
+    floatingCount: 0,
+    hintHeight: 0.0,
+    wrapLineStretch: 0.0,
+    wrapLineSignature: 0,
+    aspectWidthShifted: false,
+    widthPinned: false,
+    unpinnedWidth: SizingAxis.fit(),
+    clipIndex: null,
+    area: Rect.zero(),
+    placed: false,
+    contentSize: Dims { w: 0.0, h: 0.0 },
+};
+
+/// An anonymous element's id from its parent's id and position (Clay__HashNumber).
+fn derivedId(parent: u32, offset: usize) -> u32 {
+    var h = parent ^ 0x9E3779B9;
+    h = (h ^ truncate<u32>(offset)).wrappingMul(16777619);
+    h = (h ^ (h >> 15)).wrappingMul(2246822519);
+    return if (h == 0) 1 else h;
+}
+
+/// Child `k` of element `index`.
+fn childOf(l: borrow LayoutTree, index: usize, k: usize) -> usize =>
+    l.children.items[l.nodes.items[index].childrenStart + k];
+
+fn marginOf(l: borrow LayoutTree, index: usize) -> Sides =>
+    if (l.nodes.items[index].isText) Sides.all(0.0) else l.nodes.items[index].decl.layout.margin;
+
+fn translateOf(l: borrow LayoutTree, index: usize) -> Vec2 =>
+    if (l.nodes.items[index].isText) Vec2.zero() else l.nodes.items[index].decl.layout.translate;
+
+/// Text elements size as FIT, unwrappable (Clay__GetElementSizing).
+fn sizingOf(l: borrow LayoutTree, index: usize, xAxis: bool) -> SizingAxis {
+    if (l.nodes.items[index].isText) {
+        return SizingAxis.fit();
+    }
+    return if (xAxis) l.nodes.items[index].decl.layout.width else l.nodes.items[index].decl.layout.height;
+}
+
+fn usizeF(n: usize) -> f32 => round<f32>(n);
+
+fn floatEqual(a: f32, b: f32) -> bool {
+    let d = a - b;
+    return d < 0.01 && d > -0.01;
+}
+
+/// Measures every text element's words (Clay__MeasureTextCached) and its unwrapped size.
+fn measureAllText<M: TextMetrics>(l: borrow mut LayoutTree, metrics: borrow M) -> bool {
+    for (index in 0..l.nodes.length()) {
+        if (!l.nodes.items[index].isText) {
+            continue;
+        }
+        let node = l.nodes.items[index];
+        let config = node.text;
+        let base = node.textStart;
+        let total = node.textLength;
+        let space = [32u8];
+        let spaceWidth = metrics.measure(space[..], config).w;
+        var start: usize = 0;
+        var end: usize = 0;
+        var lineWidth: f32 = 0.0;
+        var measuredWidth: f32 = 0.0;
+        var measuredHeight: f32 = 0.0;
+        var minWord: f32 = 0.0;
+        var newlines = false;
+        let wordsStart = l.words.length();
+        while (end < total) {
+            let current = l.bytes.items[base + end];
+            if (current == ' ' || current == '\n') {
+                let length = end - start;
+                var d = Dims { w: 0.0, h: 0.0 };
+                if (length > 0) {
+                    d = metrics.measure(l.bytes.items[base + start..base + end], config);
+                }
+                minWord = minWord.max(d.w);
+                measuredHeight = measuredHeight.max(d.h);
+                if (current == ' ') {
+                    let w = d.w + spaceWidth;
+                    if (!l.words.push(Word { start: base + start, length: length + 1, width: w, newline: false })) {
+                        return false;
+                    }
+                    lineWidth += w;
+                } else {
+                    if (length > 0) {
+                        if (!l.words.push(Word { start: base + start, length: length, width: d.w, newline: false })) {
+                            return false;
+                        }
+                    }
+                    if (!l.words.push(Word { start: base + end + 1, length: 0, width: 0.0, newline: true })) {
+                        return false;
+                    }
+                    lineWidth += d.w;
+                    measuredWidth = measuredWidth.max(lineWidth);
+                    newlines = true;
+                    lineWidth = 0.0;
+                }
+                start = end + 1;
+            }
+            end += 1;
+        }
+        if (end > start) {
+            let d = metrics.measure(l.bytes.items[base + start..base + end], config);
+            if (!l.words.push(Word { start: base + start, length: end - start, width: d.w, newline: false })) {
+                return false;
+            }
+            lineWidth += d.w;
+            measuredHeight = measuredHeight.max(d.h);
+            minWord = minWord.max(d.w);
+        }
+        measuredWidth = measuredWidth.max(lineWidth) - config.letterSpacing;
+        let preferred = Dims { w: measuredWidth, h: measuredHeight };
+        let height = if (config.lineHeight > 0.0) config.lineHeight else measuredHeight;
+        l.nodes.items[index].preferred = preferred;
+        l.nodes.items[index].minWord = minWord;
+        l.nodes.items[index].containsNewlines = newlines;
+        l.nodes.items[index].wordsStart = wordsStart;
+        l.nodes.items[index].wordsCount = l.words.length() - wordsStart;
+        l.nodes.items[index].dims = Dims { w: measuredWidth, h: height };
+        l.nodes.items[index].minDims = Dims { w: minWord, h: height };
+    }
+    return true;
+}
+
+/// Clay__UpdateAspectRatioBox.
+fn updateAspectRatioBox(l: borrow mut LayoutTree, index: usize) {
+    let ratio = l.nodes.items[index].decl.aspectRatio;
+    if (ratio == 0.0) {
+        return;
+    }
+    let d = l.nodes.items[index].dims;
+    if (d.w == 0.0 && d.h != 0.0) {
+        l.nodes.items[index].dims.w = d.h * ratio;
+    } else if (d.w != 0.0 && d.h == 0.0) {
+        l.nodes.items[index].dims.h = d.w * (1.0 / ratio);
+    }
+}
+
+/// Clay__ApplyFlexBasis: a child's main-axis size starts at its basis, within its own min/max.
+fn applyFlexBasis(l: borrow mut LayoutTree, child: usize, xAxis: bool) {
+    if (l.nodes.items[child].isText || l.nodes.items[child].decl.layout.basis <= 0.0) {
+        return;
+    }
+    let sizing = sizingOf(l, child, xAxis);
+    if (sizing.isPercent()) {
+        return;
+    }
+    var value = l.nodes.items[child].decl.layout.basis.max(sizing.min);
+    if (sizing.max > 0.0) {
+        value = value.min(sizing.max);
+    }
+    if (xAxis) {
+        l.nodes.items[child].dims.w = value;
+    } else {
+        l.nodes.items[child].dims.h = value;
+    }
+}
+
+/// Clay__FlexMinMain: how far a child may be compressed along its parent's axis.
+fn flexMinMain(l: borrow LayoutTree, child: usize, xAxis: bool) -> f32 {
+    let node = l.nodes.items[child];
+    if (!node.isText && node.decl.layout.noShrink) {
+        return if (xAxis) node.dims.w else node.dims.h;
+    }
+    return if (xAxis) node.minDims.w else node.minDims.h;
+}
+
+/// Clay__ComputeIntrinsicSize: an element's FIT size and minimum from its children.
+fn computeIntrinsicSize(l: borrow mut LayoutTree, index: usize) {
+    let decl = l.nodes.items[index].decl;
+    let layout = decl.layout;
+    let clipH = decl.clip.horizontal;
+    let clipV = decl.clip.vertical;
+    let lr = layout.padding.left + layout.padding.right;
+    let tb = layout.padding.top + layout.padding.bottom;
+    let count = l.nodes.items[index].childCount;
+    var dims = Dims { w: 0.0, h: 0.0 };
+    var mins = Dims { w: 0.0, h: 0.0 };
+    let gaps = if (count > 0) usizeF(count - 1) * layout.childGap else 0.0;
+
+    if (layout.isRow()) {
+        dims.w = lr;
+        mins.w = lr;
+        for (k in 0..count) {
+            let child = childOf(l, index, k);
+            applyFlexBasis(mut l, child, true);
+            let c = l.nodes.items[child];
+            dims.w += c.dims.w;
+            dims.h = dims.h.max(c.dims.h + tb);
+            if (!clipH) {
+                let childMin = flexMinMain(l, child, true);
+                if (layout.wrap) {
+                    let m = marginOf(l, child);
+                    mins.w = mins.w.max(lr + childMin + m.left + m.right);
+                } else {
+                    mins.w += childMin;
+                }
+            }
+            if (!clipV) {
+                mins.h = mins.h.max(c.minDims.h + tb);
+            }
+        }
+        dims.w += gaps;
+        if (!clipH && !layout.wrap) {
+            mins.w += gaps;
+        }
+    } else {
+        let growWrap = layout.wrap && layout.height.isGrow();
+        dims.h = tb;
+        mins.h = tb;
+        for (k in 0..count) {
+            let child = childOf(l, index, k);
+            applyFlexBasis(mut l, child, false);
+            let c = l.nodes.items[child];
+            dims.h += c.dims.h;
+            dims.w = dims.w.max(c.dims.w + lr);
+            if (!clipV) {
+                let childMin = flexMinMain(l, child, false);
+                if (growWrap) {
+                    let m = marginOf(l, child);
+                    mins.h = mins.h.max(tb + childMin + m.top + m.bottom);
+                } else {
+                    mins.h += childMin;
+                }
+            }
+            if (!clipH) {
+                mins.w = mins.w.max(c.minDims.w + lr);
+            }
+        }
+        dims.h += gaps;
+        if (!clipV && !growWrap) {
+            mins.h += gaps;
+        }
+    }
+
+    // Clamp to the configured min/max; an unset max becomes unbounded (Clay writes it back into the config).
+    if (!layout.width.isPercent()) {
+        if (layout.width.max <= 0.0) {
+            l.nodes.items[index].decl.layout.width.max = MAX_FLOAT;
+        }
+        let w = l.nodes.items[index].decl.layout.width;
+        dims.w = dims.w.max(w.min).min(w.max);
+        mins.w = mins.w.max(w.min).min(w.max);
+    } else {
+        dims.w = 0.0;
+    }
+    if (!layout.height.isPercent()) {
+        if (layout.height.max <= 0.0) {
+            l.nodes.items[index].decl.layout.height.max = MAX_FLOAT;
+        }
+        let h = l.nodes.items[index].decl.layout.height;
+        dims.h = dims.h.max(h.min).min(h.max);
+        mins.h = mins.h.max(h.min).min(h.max);
+    } else {
+        dims.h = 0.0;
+    }
+    l.nodes.items[index].dims = dims;
+    l.nodes.items[index].minDims = mins;
+    updateAspectRatioBox(mut l, index);
+
+    // A FIT-width wrapping column is as wide as its columns, broken with the heights known now.
+    if (layout.wrap && !layout.isRow() && layout.width.isFit()) {
+        let w = l.nodes.items[index].decl.layout.width;
+        let columns = lr + measureWrapLines(l, index, false).linesCross;
+        let width = columns.max(w.min).min(w.max);
+        l.nodes.items[index].dims.w = width;
+        if (!clipH) {
+            l.nodes.items[index].minDims.w = width;
+        }
+    }
+}
+
+/// A scroll container's size, its content's size, and its box.
+public struct ScrollExtent {
+    public size: Dims;
+    public content: Dims;
+    public area: Rect;
+}
+
+/// The depth-first part of `hitTest` for one subtree; true when anything in it contains the point.
+fn hitTestNode(l: borrow mut LayoutTree, index: usize, point: Vec2) -> bool {
+    let node = l.nodes.items[index];
+    if (!node.placed) {
+        return false;
+    }
+    var found = false;
+    let insideClip = match (node.clipIndex) {
+        Some(c) => l.nodes.items[c].area.contains(point),
+        null => true,
+    };
+    if (node.area.contains(point) && insideClip) {
+        l.pointerOver.push(node.id);
+        found = true;
+    }
+    if (!node.isText) {
+        for (k in 0..node.childCount) {
+            let child = childOf(l, index, k);
+            if (hitTestNode(mut l, child, point)) {
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+/// Ends the frame: measures, sizes and positions everything and builds the render commands
+/// (Clay_EndLayout + Clay__CalculateFinalLayout). Err when the frame outgrew the capacity.
+public fn endLayout<M: TextMetrics>(l: borrow mut LayoutTree, metrics: borrow M) -> Result<void, AllocError> {
+    if (l.failed) {
+        return Err(AllocError.OutOfMemory);
+    }
+    // Close the root.
+    while (l.openStack.length() > 1) {
+        l.close();
+    }
+    let rootCount = l.nodes.items[0].childCount;
+    let bufferEnd = l.childBuffer.length();
+    l.nodes.items[0].childrenStart = l.children.length();
+    for (k in 0..rootCount) {
+        if (!l.children.push(l.childBuffer.get(bufferEnd - rootCount + k))) {
+            return Err(AllocError.OutOfMemory);
+        }
+    }
+    l.childBuffer.clear();
+
+    l.hasBaselineMetric = metrics.baseline(TextConfig.of(16.0)) >= 0.0;
+    if (!measureAllText(mut l, metrics)) {
+        return Err(AllocError.OutOfMemory);
+    }
+    // FIT sizes children-first: reverse declaration order is Clay's close order.
+    var i = l.nodes.length();
+    while (i > 0) {
+        i -= 1;
+        if (!l.nodes.items[i].isText) {
+            computeIntrinsicSize(mut l, i);
+        }
+    }
+    if (!calculateFinalLayout(mut l, metrics)) {
+        return Err(AllocError.OutOfMemory);
+    }
+    l.remember();
+    return Ok();
+}

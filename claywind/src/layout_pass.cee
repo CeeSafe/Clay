@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: MIT
+// One sizing pass (Clay__SizeLayout), the relayout passes for widths that depend on heights, and the driver
+// (Clay__CalculateFinalLayout's first half). Positioning and render commands are in layout_place.cee.
+
+/// Clay__SizeLayout: x sizing, text wrapping, aspect heights, height propagation, y sizing, aspect widths.
+fn sizeLayout<M: TextMetrics>(l: borrow mut LayoutTree, metrics: borrow M) -> bool {
+    sizeContainersAlongAxis(mut l, true);
+    if (!wrapAllText(mut l, metrics)) {
+        return false;
+    }
+    // Scale heights to aspect ratios (children only, as Clay collects them while sizing).
+    for (i in 0..l.nodes.length()) {
+        if (isAspectChild(l, i)) {
+            let ratio = l.nodes.items[i].decl.aspectRatio;
+            let height = (1.0 / ratio) * l.nodes.items[i].dims.w;
+            l.nodes.items[i].dims.h = height;
+            l.nodes.items[i].decl.layout.height.max = height;
+        }
+    }
+    // Propagate wrapped text and aspect heights up to the parents.
+    for (r in 0..l.roots.length()) {
+        let rootIndex = l.roots.items[r].index;
+        propagateHeights(mut l, rootIndex);
+    }
+    sizeContainersAlongAxis(mut l, false);
+    // Widths from aspect ratios; a shift means the parent was sized with a stale width.
+    for (i in 0..l.nodes.length()) {
+        if (isAspectChild(l, i)) {
+            let before = l.nodes.items[i].dims.w;
+            let width = l.nodes.items[i].decl.aspectRatio * l.nodes.items[i].dims.h;
+            l.nodes.items[i].dims.w = width;
+            l.nodes.items[i].aspectWidthShifted = !floatEqual(before, width);
+        }
+    }
+    return true;
+}
+
+/// A non-text element with an aspect ratio that is some element's child (not a tree root).
+fn isAspectChild(l: borrow LayoutTree, i: usize) -> bool {
+    let node = l.nodes.items[i];
+    return !node.isText && node.decl.aspectRatio != 0.0 && i != 0 && !node.decl.floating.isFloating();
+}
+
+/// The wrap-text step of Clay__SizeLayout for every text element.
+fn wrapAllText<M: TextMetrics>(l: borrow mut LayoutTree, metrics: borrow M) -> bool {
+    for (index in 0..l.nodes.length()) {
+        if (l.nodes.items[index].isText) {
+            if (!wrapText(mut l, index, metrics)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn wrapText<M: TextMetrics>(l: borrow mut LayoutTree, index: usize, metrics: borrow M) -> bool {
+    let node = l.nodes.items[index];
+    let config = node.text;
+    let width = node.dims.w;
+    let lineHeight = if (config.lineHeight > 0.0) config.lineHeight else node.preferred.h;
+    l.nodes.items[index].linesStart = l.lines.length();
+    l.nodes.items[index].linesCount = 0;
+    if (!node.containsNewlines && node.preferred.w <= width) {
+        if (!l.lines.push(
+            TextLine { start: node.textStart, length: node.textLength, width: node.dims.w, height: node.dims.h },
+        )) {
+            return false;
+        }
+        l.nodes.items[index].linesCount = 1;
+        return true;
+    }
+    let space = [32u8];
+    let spaceWidth = metrics.measure(space[..], config).w;
+    var lineWidth: f32 = 0.0;
+    var lineLength: usize = 0;
+    var lineStart = node.textStart;
+    var w: usize = 0;
+    var count: usize = 0;
+    while (w < node.wordsCount) {
+        let word = l.words.items[node.wordsStart + w];
+        if (lineLength == 0 && lineWidth + word.width > width) {
+            // The only word on the line is too wide: render it anyway.
+            if (!l.lines.push(
+                TextLine { start: word.start, length: word.length, width: word.width, height: lineHeight },
+            )) {
+                return false;
+            }
+            count += 1;
+            w += 1;
+            lineStart = word.start + word.length;
+        } else if (word.newline || lineWidth + word.width > width) {
+            let lastIndex = if (lineStart + lineLength > 0) lineStart + lineLength - 1 else 0;
+            let finalSpace = lineLength > 0 && l.bytes.items[lastIndex] == ' ';
+            if (!l.lines.push(TextLine {
+                start: lineStart,
+                length: if (finalSpace) lineLength - 1 else lineLength,
+                width: lineWidth - (if (finalSpace) spaceWidth else 0.0),
+                height: lineHeight,
+            })) {
+                return false;
+            }
+            count += 1;
+            if (lineLength == 0 || word.newline) {
+                w += 1;
+            }
+            lineWidth = 0.0;
+            lineLength = 0;
+            lineStart = word.start;
+        } else {
+            lineWidth += word.width + config.letterSpacing;
+            lineLength += word.length;
+            w += 1;
+        }
+    }
+    if (lineLength > 0) {
+        if (!l.lines.push(
+            TextLine {
+                start: lineStart,
+                length: lineLength,
+                width: lineWidth - config.letterSpacing,
+                height: lineHeight,
+            },
+        )) {
+            return false;
+        }
+        count += 1;
+    }
+    // line-clamp: keep `lineClamp` lines and ellipsize the last so text + "..." fits the width.
+    let clamp = config.lineClamp;
+    if (clamp > 0 && count > clamp) {
+        count = clamp;
+        let lastSlot = l.nodes.items[index].linesStart + clamp - 1;
+        let last = l.lines.items[lastSlot];
+        let dots = [46u8, 46u8, 46u8];
+        let ellipsisWidth = metrics.measure(dots[..], config).w;
+        var keep = last.length;
+        while (keep > 0) {
+            let measured = metrics.measure(l.bytes.items[last.start..last.start + keep], config).w;
+            if (measured + ellipsisWidth <= width) {
+                break;
+            }
+            keep -= 1;
+        }
+        let newStart = l.bytes.length();
+        for (k in 0..keep) {
+            let b = l.bytes.items[last.start + k];
+            if (!l.bytes.push(b)) {
+                return false;
+            }
+        }
+        for (k in 0..3) {
+            if (!l.bytes.push('.')) {
+                return false;
+            }
+        }
+        let newLength = keep + 3;
+        l.lines.items[lastSlot].start = newStart;
+        l.lines.items[lastSlot].length = newLength;
+        l.lines.items[lastSlot].width = metrics.measure(l.bytes.items[newStart..newStart + newLength], config).w;
+        l.lines.count = l.nodes.items[index].linesStart + clamp;
+    }
+    l.nodes.items[index].linesCount = count;
+    l.nodes.items[index].dims.h = lineHeight * usizeF(count);
+    return true;
+}
+
+/// The height-propagation step of Clay__SizeLayout, children first.
+fn propagateHeights(l: borrow mut LayoutTree, index: usize) {
+    let node = l.nodes.items[index];
+    if (node.isText || node.childCount == 0) {
+        return;
+    }
+    for (k in 0..node.childCount) {
+        let child = childOf(l, index, k);
+        propagateHeights(mut l, child);
+    }
+    let layout = l.nodes.items[index].decl.layout;
+    let hmin = layout.height.min;
+    let hmax = layout.height.max;
+    let tb = layout.padding.top + layout.padding.bottom;
+    if (layout.isRow() && layout.wrap) {
+        // A wrapped row is as tall as its lines; widths are final now. That height is its minimum too.
+        let content = tb + measureWrapLines(l, index, false).linesCross;
+        let height = content.max(hmin).min(hmax);
+        l.nodes.items[index].dims.h = height;
+        if (!l.nodes.items[index].decl.clip.vertical) {
+            l.nodes.items[index].minDims.h = l.nodes.items[index].minDims.h.max(height);
+        }
+    } else if (layout.isRow()) {
+        for (k in 0..node.childCount) {
+            let child = childOf(l, index, k);
+            let withPadding = (l.nodes.items[child].dims.h + tb).max(l.nodes.items[index].dims.h);
+            l.nodes.items[index].dims.h = withPadding.max(hmin).min(hmax);
+        }
+    } else {
+        var content = tb;
+        for (k in 0..node.childCount) {
+            let child = childOf(l, index, k);
+            applyFlexBasis(mut l, child, false);
+            content += l.nodes.items[child].dims.h;
+        }
+        content += usizeF(node.childCount - 1) * layout.childGap;
+        l.nodes.items[index].dims.h = content.max(hmin).min(hmax);
+    }
+}
+
+/// Clay__SnapshotSizes: every element root-first, breadth-first, with the sizes sizing overwrites.
+fn snapshotSizes(l: borrow mut LayoutTree) {
+    l.order.clear();
+    for (r in 0..l.roots.length()) {
+        l.order.push(l.roots.items[r].index);
+    }
+    var i: usize = 0;
+    while (i < l.order.length()) {
+        let index = l.order.items[i];
+        if (!l.nodes.items[index].isText) {
+            for (k in 0..l.nodes.items[index].childCount) {
+                l.order.push(childOf(l, index, k));
+            }
+        }
+        i += 1;
+    }
+    l.snapshots.clear();
+    for (k in 0..l.order.length()) {
+        let node = l.nodes.items[l.order.items[k]];
+        l.snapshots.push(Snapshot {
+            dims: node.dims,
+            minDims: node.minDims,
+            heightMax: if (node.isText) 0.0 else node.decl.layout.height.max,
+        });
+    }
+}
+
+/// Clay__RestoreSizes: rewind to the snapshot, then recompute FIT sizes children-first.
+fn restoreSizes(l: borrow mut LayoutTree) {
+    for (k in 0..l.order.length()) {
+        let index = l.order.items[k];
+        let snapshot = l.snapshots.items[k];
+        l.nodes.items[index].dims = snapshot.dims;
+        l.nodes.items[index].minDims = snapshot.minDims;
+        if (!l.nodes.items[index].isText) {
+            l.nodes.items[index].decl.layout.height.max = snapshot.heightMax;
+        }
+    }
+    var k = l.order.length();
+    while (k > 0) {
+        k -= 1;
+        let index = l.order.items[k];
+        if (!l.nodes.items[index].isText) {
+            computeIntrinsicSize(mut l, index);
+        }
+    }
+}
+
+/// Clay__PinWidth.
+fn pinWidth(l: borrow mut LayoutTree, index: usize, width: f32) {
+    if (!l.nodes.items[index].widthPinned) {
+        l.nodes.items[index].unpinnedWidth = l.nodes.items[index].decl.layout.width;
+        l.nodes.items[index].widthPinned = true;
+    }
+    l.nodes.items[index].decl.layout.width = SizingAxis.fixed(width);
+}
+
+/// Clay__PinHeightDependentWidths: record heights as hints, pin widths that came out wrong; true = pass again.
+fn pinHeightDependentWidths(l: borrow mut LayoutTree) -> bool {
+    var again = false;
+    for (k in 0..l.order.length()) {
+        let index = l.order.items[k];
+        l.nodes.items[index].hintHeight = l.nodes.items[index].dims.h;
+    }
+    for (k in 0..l.order.length()) {
+        let index = l.order.items[k];
+        let node = l.nodes.items[index];
+        if (node.isText) {
+            continue;
+        }
+        let layout = node.decl.layout;
+        if (layout.wrap && !layout.isRow()) {
+            if (wrapLineSignature(l, index, false) != node.wrapLineSignature) {
+                again = true;
+            }
+            let sizing = if (node.widthPinned) node.unpinnedWidth else layout.width;
+            if (sizing.isFit()) {
+                var columns = layout.padding.left + layout.padding.right + measureWrapLines(l, index, false).linesCross;
+                columns = columns.max(sizing.min).min(sizing.max);
+                if (!floatEqual(columns, node.dims.w)) {
+                    pinWidth(mut l, index, columns);
+                    again = true;
+                }
+            }
+        } else if (node.aspectWidthShifted) {
+            pinWidth(mut l, index, node.dims.w);
+            again = true;
+        }
+    }
+    return again;
+}
+
+/// Clay__UnpinWidths.
+fn unpinWidths(l: borrow mut LayoutTree) {
+    for (k in 0..l.order.length()) {
+        let index = l.order.items[k];
+        if (!l.nodes.items[index].isText && l.nodes.items[index].widthPinned) {
+            l.nodes.items[index].decl.layout.width = l.nodes.items[index].unpinnedWidth;
+            l.nodes.items[index].widthPinned = false;
+        }
+    }
+}
+
+/// Clay__CalculateFinalLayout: size (again while a height-dependent width needed fixing), sort the tree roots by
+/// z-index, then position everything and generate the render commands.
+fn calculateFinalLayout<M: TextMetrics>(l: borrow mut LayoutTree, metrics: borrow M) -> bool {
+    let relayout = l.relayoutCandidates;
+    let linesMark = l.lines.length();
+    let bytesMark = l.bytes.length();
+    if (relayout) {
+        snapshotSizes(mut l);
+    }
+    l.useHeightHints = false;
+    var pass: u32 = 1;
+    loop {
+        if (!sizeLayout(mut l, metrics)) {
+            return false;
+        }
+        if (!relayout || pass >= MAX_LAYOUT_PASSES || !pinHeightDependentWidths(mut l)) {
+            break;
+        }
+        restoreSizes(mut l);
+        l.lines.count = linesMark;
+        l.bytes.count = bytesMark;
+        l.useHeightHints = true;
+        pass += 1;
+    }
+    l.useHeightHints = false;
+    if (relayout) {
+        unpinWidths(mut l);
+    }
+    // Stable sort of the tree roots by z-index (Clay's bubble sort).
+    var sortMax = l.roots.length();
+    while (sortMax > 1) {
+        for (i in 0..sortMax - 1) {
+            let current = l.roots.items[i];
+            let next = l.roots.items[i + 1];
+            if (next.zIndex < current.zIndex) {
+                l.roots.items[i] = next;
+                l.roots.items[i + 1] = current;
+            }
+        }
+        sortMax -= 1;
+    }
+    l.commands.clear();
+    for (r in 0..l.roots.length()) {
+        let root = l.roots.items[r];
+        if (!placeRoot(mut l, root, metrics)) {
+            return false;
+        }
+    }
+    return true;
+}

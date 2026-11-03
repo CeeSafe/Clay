@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: MIT
+// ClayWind on CeeSafe: a small dashboard on the terminal host. Use the mouse (hover, click the tabs and +1,
+// wheel over the activity list) or the arrow keys; q or Esc quits.
+//
+// CLAYWIND_ONCE=1 renders one 80x24 frame as plain text and exits, without touching the terminal (for tests).
+// CLAYWIND_DUMP=<path> writes the last interactive frame to <path> as plain text on exit.
+
+import claywind;
+
+struct App {
+    tab: usize;
+    clicks: u32;
+    lastKey: u32;
+}
+
+fn tabName(i: usize) -> StringView => match (i) {
+    0 => "Overview",
+    1 => "Activity",
+    _ => "Settings",
+};
+
+fn tabId(i: usize) -> StringView => match (i) {
+    0 => "tab-0",
+    1 => "tab-1",
+    _ => "tab-2",
+};
+
+/// A tab/button: hover and active variants, eased colors.
+fn buttonStyle(name: StringView, selected: bool) -> Style => Style.row().id(name).px(2.0)
+    .bg(if (selected) EMERALD_600 else BLUE_600)
+    .hover(Style.of().bg(if (selected) EMERALD_500 else BLUE_500))
+    .active(Style.of().bg(BLUE_700))
+    .cursor(Cursor.Pointer)
+    .transition(TransitionSpec.colorsOnly().durationMs(150.0));
+
+/// The whole UI, in the closure (block) form: the closures change `app` while the `Ui` is lent to them.
+fn view(ui: borrow mut Ui, app: borrow mut App) {
+    ui.nest(Style.column().w(Size.grow()).h(Size.grow()).bg(SLATE_950).p(1.0).gap(1.0), (root) => {
+        root.nest(Style.row().w(Size.grow()).px(1.0).bg(SLATE_800).justify(Justify.Between), (header) => {
+            header.label("ClayWind on CeeSafe", Text.of().color(EMERALD_400).bold());
+            header.label("q quits", Text.of().color(SLATE_400));
+        });
+
+        root.nest(Style.row().gap(2.0), (tabs) => {
+            for (i in 0..3usize) {
+                tabs.nest(buttonStyle(tabId(i), app.tab == i), (b) => {
+                    b.label(tabName(i), Text.of());
+                });
+                if (tabs.clicked(tabId(i))) {
+                    app.tab = i;
+                }
+            }
+        });
+
+        root.nest(Style.row().w(Size.grow()).h(Size.grow()).gap(2.0), (body) => {
+            body.nest(Style.column().w(Size.grow()).h(Size.grow()).bg(SLATE_900).p(1.0).gap(1.0), (panel) => {
+                panel.label(tabName(app.tab), Text.of().color(SLATE_100).bold());
+                panel.nest(Style.row().gap(2.0).items(Items.Center), (line) => {
+                    line.nest(buttonStyle("plus", false), (b) => {
+                        b.label("+1", Text.of());
+                    });
+                    if (line.clicked("plus")) {
+                        app.clicks += 1;
+                    }
+                    var digits = [0u8; 32];
+                    var w = TextWriter.create(mut digits[..]);
+                    w.text("clicked ");
+                    w.decimal(app.clicks as u64);
+                    w.text(" times");
+                    line.labelBytes(w.written(), Text.of().color(SLATE_100));
+                });
+                panel.nest(Style.row().w(Size.percent(0.5)).bg(BLUE_700).px(1.0), (bar) => {
+                    bar.label("50% wide bar", Text.of());
+                });
+                panel.label(
+                    "Some longer text that wraps onto several lines when the panel is narrow enough.",
+                    Text.of().color(SLATE_400),
+                );
+            });
+            // A scroll container: wheel over it, or drag.
+            body.nest(Style.column().id("log").w(Size.fixed(24.0)).h(Size.grow()).bg(SLATE_800).px(1.0)
+                .scroll(ScrollAxis.Vertical), (log) => {
+                for (i in 0..40u32) {
+                    var buffer = [0u8; 32];
+                    var w = TextWriter.create(mut buffer[..]);
+                    w.text("event #");
+                    Format.padded(mut w, (i + 1) as i64, 2, '0');
+                    w.text(" processed");
+                    log.labelBytes(w.written(), Text.of().color(if (i % 5 == 0) EMERALD_400 else SLATE_400).mono());
+                }
+            });
+        });
+
+        root.nest(Style.row().w(Size.grow()).px(1.0).bg(SLATE_800).justify(Justify.Between), (footer) => {
+            footer.label(
+                if (footer.hovered(
+                    "plus",
+                )) "hovering +1" else if (footer.hovered("log")) "wheel to scroll" else "move the mouse",
+                Text.of().color(SLATE_400),
+            );
+            footer.label(keyLabel(app.lastKey), Text.of().color(SLATE_400));
+        });
+    });
+}
+
+/// A code for the last key shown in the footer (a stored `StringView` would need a region on `App`).
+fn keyCodeOf(event: Event) -> u32? => match (event) {
+    Event.Press(Key.Up) => 1,
+    Event.Press(Key.Down) => 2,
+    Event.Press(Key.Left) => 3,
+    Event.Press(Key.Right) => 4,
+    Event.Press(Key.Tab) => 5,
+    Event.Press(Key.Enter) => 6,
+    Event.Typed(_) => 7,
+    _ => null,
+};
+
+fn keyLabel(code: u32) -> StringView => match (code) {
+    1 => "key: up",
+    2 => "key: down",
+    3 => "key: left",
+    4 => "key: right",
+    5 => "key: tab",
+    6 => "key: enter",
+    7 => "key: typed",
+    _ => "no key yet",
+};
+
+/// One frame: build, lay out, draw into the cell grid.
+fn frame(ui: borrow mut Ui, platform: borrow mut dyn Platform, screen: borrow mut Screen, app: borrow mut App) {
+    let measure = CellMeasure { unused: 0 };
+    ui.begin(platform);
+    view(ui, app);
+    match (endFrame(mut ui, platform, measure)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    screen.clear();
+    ui.render(screen);
+}
+
+fn main() -> i32 {
+    var storage = [0u8; 4194304];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var ui = match (Ui.create(memory, UiCapacity.of(1024))) {
+        Ok(u) => u,
+        Err(_) => {
+            Console.writeErrorLine("claywind: not enough memory for the UI");
+            return 1;
+        }
+    };
+    var app = App { tab: 0, clicks: 0, lastKey: 0 };
+
+    if (Environment.variable("CLAYWIND_ONCE") != null) {
+        var screen = Screen.create(80, 24)!;
+        var term = Terminal.create(screen.size());
+        frame(mut ui, mut term, mut screen, mut app);
+        term.endFrame();
+        let text = screen.plain()!;
+        Console.writeBytes(text.view());
+        return 0;
+    }
+
+    let size = match (terminalSize()) {
+        Some(d) => d,
+        null => Dims { w: 80.0, h: 24.0 },
+    };
+    var screen = Screen.create(truncate<usize>(size.w), truncate<usize>(size.h))!;
+    var term = Terminal.create(screen.size());
+    let raw = RawMode.enter();
+    if (!raw.isActive()) {
+        Console.writeErrorLine("claywind: could not switch the terminal to raw mode (is stty available?)");
+        return 1;
+    }
+
+    var buffer = [0u8; 256];
+    var running = true;
+    var lastMs = Timer.now();
+    frame(mut ui, mut term, mut screen, mut app);
+    term.endFrame();
+    screen.present()!;
+    while (running) {
+        let n = match (Console.read(mut buffer[..])) {
+            Ok(k) => k,
+            Err(_) => 0,
+        };
+        if (n == 0) {
+            break;
+        }
+        // One frame per event, so a press and its release in the same read still make a click.
+        var at: usize = 0;
+        while (at < n) {
+            let d = decode(buffer[at..n]);
+            at += d.used;
+            match (d.event) {
+                Event.Quit => {
+                    running = false;
+                    break;
+                }
+                _ => {}
+            }
+            match (keyCodeOf(d.event)) {
+                Some(code) => { app.lastKey = code; }
+                null => {}
+            }
+            term.apply(d.event);
+            let now = Timer.now();
+            term.setFrameTime(round<f32>(now - lastMs) / 1000.0);
+            lastMs = now;
+            frame(mut ui, mut term, mut screen, mut app);
+            term.endFrame();
+        }
+        screen.present()!;
+    }
+    // CLAYWIND_DUMP=<path>: the last frame as plain text, for scripted tests over a pseudo-terminal.
+    match (Environment.variable("CLAYWIND_DUMP")) {
+        Some(path) => {
+            let text = screen.plain()!;
+            match (File.create(path)) {
+                Ok(f) => {
+                    var file = f;
+                    let written = file.write(text.view());
+                }
+                Err(_) => {}
+            }
+        }
+        null => {}
+    }
+    return 0;
+}

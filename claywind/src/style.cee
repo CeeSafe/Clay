@@ -1,0 +1,1320 @@
+// SPDX-License-Identifier: MIT
+// The Tailwind-flavoured style layer: the CeeSafe form of renderer.h's ComponentOptions + ParseComponentOptions.
+//
+// C's designated initialisers (`(ComponentOptions){.p = 16, .bg = SLATE_900}`) become a builder
+// (`Style.row().p(16).bg(SLATE_900)`), and the runtime-parsed strings ("grow-0", "a-md", "sb", "br") become
+// typed values (`Size.grow()`, `Radius.Md`, `Justify.Between`, `inset(true, true)`). A style holds `Props`:
+// every field optional, "unset" meaning "keep what is there", exactly as ParseComponentOptions overlays a
+// non-zero field. State variants are styles too, `hover(Style.of().bg(BLUE_500))`, and only their props are used.
+
+/// FNV-1a hash of an element id: ids are hashed when the style is built, so no `StringView` is stored.
+public fn hashId(text: StringView) -> u32 => hashBytes(text.bytes());
+
+/// `hashId` over raw bytes (for ids built at run time, e.g. with a `TextWriter`). Never 0, which means anonymous.
+public fn hashBytes(bytes: Slice<u8>) -> u32 {
+    var h: u32 = 2166136261;
+    for (b in bytes) {
+        h = (h ^ (b as u32)).wrappingMul(16777619);
+    }
+    return if (h == 0) 1 else h;
+}
+
+/// Sizing shorthands (renderer.h's "fit-0" / "grow-0" / "fixed-40" / "percent-0.5").
+public struct Size {
+    public fn fit() -> SizingAxis => SizingAxis.fit();
+    public fn grow() -> SizingAxis => SizingAxis.grow();
+    public fn fixed(px: f32) -> SizingAxis => SizingAxis.fixed(px);
+    /// `fraction` of the parent's inner size, 0..1 (Tailwind w-1/2 = 0.5).
+    public fn percent(fraction: f32) -> SizingAxis => SizingAxis.percentOf(fraction);
+}
+
+/// The Tailwind spacing scale: n * 4px (SPACE(n)).
+public fn space(n: f32) -> f32 => n * 4.0;
+
+/// Tailwind rounded-* sizes.
+public enum Radius {
+    None,
+    Xs,
+    Sm,
+    Md,
+    Lg,
+    Xl,
+    Xl2,
+    Xl3,
+    Full,
+}
+
+public fn radiusPx(r: Radius) -> f32 => match (r) {
+    Radius.None => 0.0,
+    Radius.Xs => 2.0,
+    Radius.Sm => 4.0,
+    Radius.Md => 6.0,
+    Radius.Lg => 8.0,
+    Radius.Xl => 12.0,
+    Radius.Xl2 => 16.0,
+    Radius.Xl3 => 24.0,
+    Radius.Full => 9999.0,
+};
+
+/// Main-axis distribution (Tailwind justify-*).
+public enum Justify {
+    Start,
+    Center,
+    End,
+    Between,
+    Around,
+    Evenly,
+}
+
+/// Cross-axis alignment (Tailwind items-*). `Stretch` is items-stretch (FIT children fill the cross axis).
+public enum Items {
+    Start,
+    Center,
+    End,
+    Baseline,
+    Stretch,
+}
+
+/// Overflow scrolling (renderer.h `.scroll = "v" / "h" / "b"`).
+public enum ScrollAxis {
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+/// Tailwind absolute / fixed.
+public enum Position {
+    Absolute,
+    Fixed,
+}
+
+/// Tailwind shadow-* presets.
+public enum ShadowSize {
+    Sm,
+    Md,
+    Lg,
+    Xl,
+}
+
+/// Gradient direction (bg-gradient-to-*, the legacy vertical/horizontal flags, and bg-radial).
+public enum GradientDir {
+    Horizontal,
+    Vertical,
+    ToTop,
+    ToTopRight,
+    ToRight,
+    ToBottomRight,
+    ToBottom,
+    ToBottomLeft,
+    ToLeft,
+    ToTopLeft,
+    Radial,
+}
+
+/// A gradient as the builder collects it (gradFrom/gradVia/gradTo/gradient/gradAngle/grad*Pos).
+struct GradientSpec {
+    from: Color;
+    via: Color?;
+    to: Color;
+    dir: GradientDir;
+    angle: f32;
+    fromPos: f32;
+    viaPos: f32;
+    toPos: f32;
+}
+
+/// Every option of renderer.h's ComponentOptions, each optional ("unset" leaves the declaration alone).
+/// Booleans are switches: they can turn a feature on, as in C, not off.
+struct Props {
+    background: Color?;
+    gap: f32?;
+    gapX: f32?;
+    gapY: f32?;
+    wrap: bool;
+    reverse: bool;
+    stretch: bool;
+    baseline: bool;
+    scroll: ScrollAxis?;
+    clip: bool;
+    aspect: f32?;
+    divide: f32?;
+    divideColor: Color?;
+    padTop: f32?;
+    padBottom: f32?;
+    padLeft: f32?;
+    padRight: f32?;
+    marTop: f32?;
+    marBottom: f32?;
+    marLeft: f32?;
+    marRight: f32?;
+    justify: Justify?;
+    items: Items?;
+    alignX: AxisAlign?;
+    alignY: AxisAlign?;
+    content: AlignContent?;
+    radius: Corners?;
+    border: Border?;
+    width: SizingAxis?;
+    height: SizingAxis?;
+    both: SizingAxis?;
+    basis: f32?;
+    noShrink: bool;
+    minW: f32?;
+    maxW: f32?;
+    minH: f32?;
+    maxH: f32?;
+    image: u32?;
+    position: Position?;
+    top: f32;
+    left: f32;
+    right: f32;
+    bottom: f32;
+    insetRight: bool;
+    insetBottom: bool;
+    z: i32;
+    cursor: Cursor?;
+    tx: f32?;
+    ty: f32?;
+    scale: f32?;
+    rotate: f32?;
+    skewX: f32?;
+    skewY: f32?;
+    shadow: ShadowSize?;
+    shadowColor: Color?;
+    ring: Ring?;
+    gradient: GradientSpec?;
+    blend: BlendMode?;
+    opacity: f32?;
+    icon: Icon?;
+    filter: FilterMode?;
+    filterAmount: f32;
+}
+
+fn noProps() -> Props => Props {
+    background: null,
+    gap: null,
+    gapX: null,
+    gapY: null,
+    wrap: false,
+    reverse: false,
+    stretch: false,
+    baseline: false,
+    scroll: null,
+    clip: false,
+    aspect: null,
+    divide: null,
+    divideColor: null,
+    padTop: null,
+    padBottom: null,
+    padLeft: null,
+    padRight: null,
+    marTop: null,
+    marBottom: null,
+    marLeft: null,
+    marRight: null,
+    justify: null,
+    items: null,
+    alignX: null,
+    alignY: null,
+    content: null,
+    radius: null,
+    border: null,
+    width: null,
+    height: null,
+    both: null,
+    basis: null,
+    noShrink: false,
+    minW: null,
+    maxW: null,
+    minH: null,
+    maxH: null,
+    image: null,
+    position: null,
+    top: 0.0,
+    left: 0.0,
+    right: 0.0,
+    bottom: 0.0,
+    insetRight: false,
+    insetBottom: false,
+    z: 0,
+    cursor: null,
+    tx: null,
+    ty: null,
+    scale: null,
+    rotate: null,
+    skewX: null,
+    skewY: null,
+    shadow: null,
+    shadowColor: null,
+    ring: null,
+    gradient: null,
+    blend: null,
+    opacity: null,
+    icon: null,
+    filter: null,
+    filterAmount: 0.0,
+};
+
+/// The default light-gray text/icon color of renderer.h (229, 231, 235).
+public const DEFAULT_INK: u32 = 0xE5E7EBFF;
+
+/// Overlays `p` onto `d` (ParseComponentOptions, in its order, so later options win the same way).
+fn applyProps(d: borrow mut Decl, p: Props) {
+    let row = d.layout.isRow();
+    match (p.background) {
+        Some(c) => { d.background = c; }
+        null => {}
+    }
+    match (p.gap) {
+        Some(g) => {
+            d.layout.childGap = g;
+            d.layout.childGapCross = g;
+        }
+        null => {}
+    }
+    if (p.wrap) {
+        d.layout.wrap = true;
+    }
+    // gap-x / gap-y: horizontal / vertical whatever the direction.
+    match (p.gapX) {
+        Some(x) => {
+            if (row) {
+                d.layout.childGap = x;
+            } else {
+                d.layout.childGapCross = x;
+            }
+        }
+        null => {}
+    }
+    match (p.gapY) {
+        Some(y) => {
+            if (row) {
+                d.layout.childGapCross = y;
+            } else {
+                d.layout.childGap = y;
+            }
+        }
+        null => {}
+    }
+    match (p.image) {
+        Some(i) => { d.image = i; }
+        null => {}
+    }
+    if (p.reverse) {
+        d.layout.reverse = true;
+    }
+    if (p.stretch) {
+        d.layout.stretch = true;
+    }
+    match (p.tx) {
+        Some(v) => { d.layout.translate.x = v; }
+        null => {}
+    }
+    match (p.ty) {
+        Some(v) => { d.layout.translate.y = v; }
+        null => {}
+    }
+    match (p.scale) {
+        Some(v) => { d.layout.scale = v; }
+        null => {}
+    }
+    match (p.rotate) {
+        Some(v) => { d.layout.rotation = v; }
+        null => {}
+    }
+    match (p.skewX) {
+        Some(v) => { d.layout.skewX = v; }
+        null => {}
+    }
+    match (p.skewY) {
+        Some(v) => { d.layout.skewY = v; }
+        null => {}
+    }
+    // Shadow presets (renderer.h: sm 1/3, md 4/8, lg 10/16, xl 20/28; default color black at 70/255).
+    match (p.shadow) {
+        Some(size) => {
+            let color = match (p.shadowColor) {
+                Some(c) => c,
+                null => Color.rgba(0, 0, 0, 70),
+            };
+            let oy: f32 = match (size) {
+                ShadowSize.Sm => 1.0,
+                ShadowSize.Md => 4.0,
+                ShadowSize.Lg => 10.0,
+                ShadowSize.Xl => 20.0,
+            };
+            let blur: f32 = match (size) {
+                ShadowSize.Sm => 3.0,
+                ShadowSize.Md => 8.0,
+                ShadowSize.Lg => 16.0,
+                ShadowSize.Xl => 28.0,
+            };
+            d.shadow = Shadow { color: color, offsetX: 0.0, offsetY: oy, blur: blur, spread: 0.0 };
+        }
+        null => {}
+    }
+    match (p.ring) {
+        Some(r) => {
+            if (r.color.a > 0) {
+                d.ring = r;
+            }
+        }
+        null => {}
+    }
+    match (p.gradient) {
+        Some(g) => { d.gradient = resolveGradient(g); }
+        null => {}
+    }
+    match (p.blend) {
+        Some(b) => { d.layout.blend = b; }
+        null => {}
+    }
+    match (p.opacity) {
+        Some(o) => { d.layout.opacity = o; }
+        null => {}
+    }
+    match (p.icon) {
+        Some(i) => { d.icon = i; }
+        null => {}
+    }
+    match (p.filter) {
+        Some(f) => {
+            d.layout.filter = f;
+            d.layout.filterAmount = match (f) {
+                FilterMode.Blur => if (p.filterAmount != 0.0) p.filterAmount else 4.0,
+                FilterMode.Brightness => if (p.filterAmount != 0.0) p.filterAmount else 1.3,
+                _ => d.layout.filterAmount,
+            };
+        }
+        null => {}
+    }
+    match (p.content) {
+        Some(c) => { d.layout.alignContent = c; }
+        null => {}
+    }
+    // justify-*: the main axis.
+    match (p.justify) {
+        Some(j) => {
+            let a = match (j) {
+                Justify.Start => AxisAlign.Start,
+                Justify.Center => AxisAlign.Center,
+                Justify.End => AxisAlign.End,
+                Justify.Between => AxisAlign.Between,
+                Justify.Around => AxisAlign.Around,
+                Justify.Evenly => AxisAlign.Evenly,
+            };
+            if (row) {
+                d.layout.alignX = a;
+            } else {
+                d.layout.alignY = a;
+            }
+        }
+        null => {}
+    }
+    // absolute / fixed + inset + z: anchors at the matching edges, offsets pointing inward.
+    match (p.position) {
+        Some(pos) => {
+            d.floating.attachTo = match (pos) {
+                Position.Absolute => AttachTo.Parent,
+                Position.Fixed => AttachTo.Root,
+            };
+            let anchorRight = p.right != 0.0 || p.insetRight;
+            let anchorBottom = p.bottom != 0.0 || p.insetBottom;
+            let point =
+                if (anchorRight) (if (anchorBottom) AttachPoint.RightBottom else AttachPoint.RightTop) else (if (anchorBottom) AttachPoint.LeftBottom else AttachPoint.LeftTop);
+            d.floating.element = point;
+            d.floating.parent = point;
+            d.floating.offset = Vec2 {
+                x: if (anchorRight) -p.right else p.left,
+                y: if (anchorBottom) -p.bottom else p.top,
+            };
+            d.floating.zIndex = p.z;
+        }
+        null => {}
+    }
+    match (p.padTop) {
+        Some(v) => { d.layout.padding.top = v; }
+        null => {}
+    }
+    match (p.padBottom) {
+        Some(v) => { d.layout.padding.bottom = v; }
+        null => {}
+    }
+    match (p.padLeft) {
+        Some(v) => { d.layout.padding.left = v; }
+        null => {}
+    }
+    match (p.padRight) {
+        Some(v) => { d.layout.padding.right = v; }
+        null => {}
+    }
+    match (p.marTop) {
+        Some(v) => { d.layout.margin.top = v; }
+        null => {}
+    }
+    match (p.marBottom) {
+        Some(v) => { d.layout.margin.bottom = v; }
+        null => {}
+    }
+    match (p.marLeft) {
+        Some(v) => { d.layout.margin.left = v; }
+        null => {}
+    }
+    match (p.marRight) {
+        Some(v) => { d.layout.margin.right = v; }
+        null => {}
+    }
+    // Absolute axes first, then items-* on the cross axis (as `.align` then `.baseline` in C).
+    match (p.alignX) {
+        Some(a) => { d.layout.alignX = a; }
+        null => {}
+    }
+    match (p.alignY) {
+        Some(a) => { d.layout.alignY = a; }
+        null => {}
+    }
+    match (p.items) {
+        Some(i) => {
+            let a = match (i) {
+                Items.Start => AxisAlign.Start,
+                Items.Center => AxisAlign.Center,
+                Items.End => AxisAlign.End,
+                Items.Baseline => AxisAlign.Baseline,
+                Items.Stretch => if (row) d.layout.alignY else d.layout.alignX,
+            };
+            match (i) {
+                Items.Stretch => { d.layout.stretch = true; }
+                _ => {}
+            }
+            if (row) {
+                d.layout.alignY = a;
+            } else {
+                d.layout.alignX = a;
+            }
+        }
+        null => {}
+    }
+    if (p.baseline) {
+        if (row) {
+            d.layout.alignY = AxisAlign.Baseline;
+        } else {
+            d.layout.alignX = AxisAlign.Baseline;
+        }
+    }
+    // Scroll axes (the child offset is filled in by the Ui from its scroll state), or overflow-hidden.
+    match (p.scroll) {
+        Some(ScrollAxis.Vertical) => {
+            d.clip = Clip { horizontal: false, vertical: true, childOffset: d.clip.childOffset };
+        }
+        Some(ScrollAxis.Horizontal) => {
+            d.clip = Clip { horizontal: true, vertical: false, childOffset: d.clip.childOffset };
+        }
+        Some(ScrollAxis.Both) => {
+            d.clip = Clip { horizontal: true, vertical: true, childOffset: d.clip.childOffset };
+        }
+        null => {
+            if (p.clip) {
+                d.clip = Clip { horizontal: true, vertical: true, childOffset: Vec2.zero() };
+            }
+        }
+    }
+    match (p.aspect) {
+        Some(a) => { d.aspectRatio = a; }
+        null => {}
+    }
+    match (p.radius) {
+        Some(r) => { d.cornerRadius = r; }
+        null => {}
+    }
+    match (p.border) {
+        Some(b) => {
+            if (b.color.a != 0) {
+                d.border = b;
+            }
+        }
+        null => {}
+    }
+    match (p.divide) {
+        Some(w) => {
+            d.border.width.betweenChildren = w;
+            match (p.divideColor) {
+                Some(c) => {
+                    if (c.a != 0) {
+                        d.border.color = c;
+                    }
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    match (p.both) {
+        Some(a) => {
+            d.layout.width = a;
+            d.layout.height = a;
+        }
+        null => {}
+    }
+    match (p.height) {
+        Some(a) => { d.layout.height = a; }
+        null => {}
+    }
+    match (p.width) {
+        Some(a) => { d.layout.width = a; }
+        null => {}
+    }
+    if (!d.layout.width.isPercent()) {
+        match (p.minW) {
+            Some(v) => { d.layout.width.min = v; }
+            null => {}
+        }
+        match (p.maxW) {
+            Some(v) => { d.layout.width.max = v; }
+            null => {}
+        }
+    }
+    if (!d.layout.height.isPercent()) {
+        match (p.minH) {
+            Some(v) => { d.layout.height.min = v; }
+            null => {}
+        }
+        match (p.maxH) {
+            Some(v) => { d.layout.height.max = v; }
+            null => {}
+        }
+    }
+    match (p.basis) {
+        Some(b) => { d.layout.basis = b; }
+        null => {}
+    }
+    if (p.noShrink) {
+        d.layout.noShrink = true;
+    }
+}
+
+/// The gradient block of ParseComponentOptions.
+fn resolveGradient(spec: GradientSpec) -> Gradient {
+    var g = Gradient.none();
+    g.from = spec.from;
+    g.to = spec.to;
+    let angle: f32? = match (spec.dir) {
+        GradientDir.ToTop => 0.0,
+        GradientDir.ToTopRight => 45.0,
+        GradientDir.ToRight => 90.0,
+        GradientDir.ToBottomRight => 135.0,
+        GradientDir.ToBottom => 180.0,
+        GradientDir.ToBottomLeft => 225.0,
+        GradientDir.ToLeft => 270.0,
+        GradientDir.ToTopLeft => 315.0,
+        _ => null,
+    };
+    match (spec.dir) {
+        GradientDir.Vertical => { g.vertical = true; }
+        GradientDir.Radial => { g.kind = GradientKind.Radial; }
+        _ => {}
+    }
+    match (angle) {
+        Some(a) => {
+            g.useAngle = true;
+            g.angle = a;
+        }
+        null => {}
+    }
+    if (spec.angle != 0.0) {
+        g.useAngle = true;
+        g.angle = spec.angle;
+        g.kind = GradientKind.Linear;
+    }
+    // Keep the legacy axis flag meaningful for renderers that only know vertical/horizontal.
+    if (g.useAngle) {
+        let a = Math.radians(g.angle);
+        g.vertical = Math.cos(a).abs() >= Math.sin(a).abs();
+    }
+    let hasVia = spec.via != null;
+    if (hasVia || spec.fromPos != 0.0 || spec.toPos != 0.0 || spec.viaPos != 0.0) {
+        let fromPos = spec.fromPos / 100.0;
+        let toPos = if (spec.toPos != 0.0) spec.toPos / 100.0 else 1.0;
+        g.stops[0] = GradientStop { color: spec.from, position: fromPos };
+        var count: usize = 1;
+        match (spec.via) {
+            Some(v) => {
+                let viaPos = if (spec.viaPos != 0.0) spec.viaPos / 100.0 else (fromPos + toPos) * 0.5;
+                g.stops[1] = GradientStop { color: v, position: viaPos };
+                count = 2;
+            }
+            null => {}
+        }
+        g.stops[count] = GradientStop { color: spec.to, position: toPos };
+        g.stopCount = count + 1;
+    }
+    return g;
+}
+
+/// A container's style: its kind's defaults, an id, the base props, the state variants and transitions.
+public struct Style {
+    base: Decl;
+    elementId: u32;
+    props: Props;
+    hoverProps: Props?;
+    activeProps: Props?;
+    focusProps: Props?;
+    disabledProps: Props?;
+    groupProps: Props?;
+    groupId: u32;
+    focused: bool;
+    disabledNow: bool;
+    transitionSpec: TransitionSpec?;
+
+    fn kind(base: Decl) -> Style => Style {
+        base: base,
+        elementId: 0,
+        props: noProps(),
+        hoverProps: null,
+        activeProps: null,
+        focusProps: null,
+        disabledProps: null,
+        groupProps: null,
+        groupId: 0,
+        focused: false,
+        disabledNow: false,
+        transitionSpec: null,
+    };
+
+    /// `Box(...)`: a column that fits its content.
+    public fn box() -> Style {
+        var d = Decl.of();
+        d.layout.direction = Direction.Column;
+        return Style.kind(d);
+    }
+    /// `Column(...)`.
+    public fn column() -> Style => Style.box();
+    /// `Row(...)`.
+    public fn row() -> Style => Style.kind(Decl.of());
+    /// `Separator(...)`: grows on both axes.
+    public fn separator() -> Style {
+        var d = Decl.of();
+        d.layout.width = SizingAxis.grow();
+        d.layout.height = SizingAxis.grow();
+        return Style.kind(d);
+    }
+    /// A props-only style, for state variants: `hover(Style.of().bg(BLUE_500))`.
+    public fn of() -> Style => Style.row();
+
+    /// The declaration the base props produce (no variants), e.g. for tests.
+    public fn baseDecl(this) -> Decl {
+        var d = this.base;
+        applyProps(mut d, this.props);
+        return d;
+    }
+
+    public fn elementIdOf(this) -> u32 => this.elementId;
+    public fn transitionOf(this) -> TransitionSpec? => this.transitionSpec;
+    public fn cursorOf(this) -> Cursor? => this.props.cursor;
+    public fn isEnabled(this) -> bool => !this.disabledNow;
+
+    // ---- identity and state ------------------------------------------------------------------------------------
+
+    public fn id(this, name: StringView) -> Style {
+        var s = this;
+        s.elementId = hashId(name);
+        return s;
+    }
+    public fn idHash(this, hash: u32) -> Style {
+        var s = this;
+        s.elementId = hash;
+        return s;
+    }
+    public fn hover(this, v: Style) -> Style {
+        var s = this;
+        s.hoverProps = v.props;
+        return s;
+    }
+    public fn active(this, v: Style) -> Style {
+        var s = this;
+        s.activeProps = v.props;
+        return s;
+    }
+    public fn focus(this, v: Style) -> Style {
+        var s = this;
+        s.focusProps = v.props;
+        return s;
+    }
+    public fn disabled(this, v: Style) -> Style {
+        var s = this;
+        s.disabledProps = v.props;
+        return s;
+    }
+    /// group-hover / peer-hover: `v` applies while the element named `group` is hovered.
+    public fn groupHover(this, group: StringView, v: Style) -> Style {
+        var s = this;
+        s.groupId = hashId(group);
+        s.groupProps = v.props;
+        return s;
+    }
+    public fn isFocused(this, on: bool) -> Style {
+        var s = this;
+        s.focused = on;
+        return s;
+    }
+    public fn isDisabled(this, on: bool) -> Style {
+        var s = this;
+        s.disabledNow = on;
+        return s;
+    }
+    public fn transition(this, spec: TransitionSpec) -> Style {
+        var s = this;
+        s.transitionSpec = spec;
+        return s;
+    }
+    public fn cursor(this, c: Cursor) -> Style {
+        var s = this;
+        s.props.cursor = c;
+        return s;
+    }
+
+    // ---- color and effects -------------------------------------------------------------------------------------
+
+    public fn bg(this, color: u32) -> Style {
+        var s = this;
+        s.props.background = Color.hex(color);
+        return s;
+    }
+    public fn opacity(this, o: f32) -> Style {
+        var s = this;
+        s.props.opacity = o;
+        return s;
+    }
+    public fn shadow(this, size: ShadowSize) -> Style {
+        var s = this;
+        s.props.shadow = size;
+        return s;
+    }
+    public fn shadowColor(this, color: u32) -> Style {
+        var s = this;
+        s.props.shadowColor = Color.hex(color);
+        return s;
+    }
+    /// ring-{width} ring-{color} ring-offset-{offset}.
+    public fn ring(this, width: f32, color: u32, offset: f32) -> Style {
+        var s = this;
+        s.props.ring = Ring { color: Color.hex(color), width: width, offset: offset };
+        return s;
+    }
+    /// bg-gradient-{dir} from-{from} to-{to}.
+    public fn gradient(this, dir: GradientDir, from: u32, to: u32) -> Style {
+        var s = this;
+        s.props.gradient = GradientSpec {
+            from: Color.hex(from), via: null, to: Color.hex(to), dir: dir, angle: 0.0,
+            fromPos: 0.0, viaPos: 0.0, toPos: 0.0,
+        };
+        return s;
+    }
+    /// via-{color} (needs `gradient` first).
+    public fn via(this, color: u32) -> Style {
+        var s = this;
+        match (s.props.gradient) {
+            Some(g) => {
+                var spec = g;
+                spec.via = Color.hex(color);
+                s.props.gradient = spec;
+            }
+            null => {}
+        }
+        return s;
+    }
+    /// from-{a}% via-{b}% to-{c}% (0 = default 0 / midpoint / 100).
+    public fn stops(this, fromPct: f32, viaPct: f32, toPct: f32) -> Style {
+        var s = this;
+        match (s.props.gradient) {
+            Some(g) => {
+                var spec = g;
+                spec.fromPos = fromPct;
+                spec.viaPos = viaPct;
+                spec.toPos = toPct;
+                s.props.gradient = spec;
+            }
+            null => {}
+        }
+        return s;
+    }
+    /// An explicit CSS angle in degrees (0 = to top, 90 = to right).
+    public fn gradientAngle(this, degrees: f32) -> Style {
+        var s = this;
+        match (s.props.gradient) {
+            Some(g) => {
+                var spec = g;
+                spec.angle = degrees;
+                s.props.gradient = spec;
+            }
+            null => {}
+        }
+        return s;
+    }
+    public fn blend(this, mode: BlendMode) -> Style {
+        var s = this;
+        s.props.blend = mode;
+        return s;
+    }
+    public fn blur(this, radius: f32) -> Style {
+        var s = this;
+        s.props.filter = FilterMode.Blur;
+        s.props.filterAmount = radius;
+        return s;
+    }
+    public fn grayscale(this) -> Style {
+        var s = this;
+        s.props.filter = FilterMode.Grayscale;
+        return s;
+    }
+    public fn brightness(this, factor: f32) -> Style {
+        var s = this;
+        s.props.filter = FilterMode.Brightness;
+        s.props.filterAmount = factor;
+        return s;
+    }
+    /// A vector icon (ICON_*) centered in the element; color 0 = the default ink.
+    public fn icon(this, iconId: u32, color: u32, stroke: f32) -> Style {
+        var s = this;
+        s.props.icon = Icon { id: iconId, color: Color.hex(if (color == 0) DEFAULT_INK else color), stroke: stroke };
+        return s;
+    }
+    public fn image(this, handle: u32) -> Style {
+        var s = this;
+        s.props.image = handle;
+        return s;
+    }
+
+    // ---- borders and corners -----------------------------------------------------------------------------------
+
+    public fn rounded(this, r: Radius) -> Style => this.corners(Corners.all(radiusPx(r)));
+    public fn roundedT(this, r: Radius) -> Style =>
+        this.corners(Corners { topLeft: radiusPx(r), topRight: radiusPx(r), bottomRight: 0.0, bottomLeft: 0.0 });
+    public fn roundedB(this, r: Radius) -> Style =>
+        this.corners(Corners { topLeft: 0.0, topRight: 0.0, bottomRight: radiusPx(r), bottomLeft: radiusPx(r) });
+    public fn roundedL(this, r: Radius) -> Style =>
+        this.corners(Corners { topLeft: radiusPx(r), topRight: 0.0, bottomRight: 0.0, bottomLeft: radiusPx(r) });
+    public fn roundedR(this, r: Radius) -> Style =>
+        this.corners(Corners { topLeft: 0.0, topRight: radiusPx(r), bottomRight: radiusPx(r), bottomLeft: 0.0 });
+    /// Arbitrary per-corner radii.
+    public fn corners(this, c: Corners) -> Style {
+        var s = this;
+        s.props.radius = c;
+        return s;
+    }
+    /// border-{width} border-{color} on all sides.
+    public fn border(this, width: f32, color: u32) -> Style => this.borderSides(BorderWidth.all(width), color);
+    public fn borderT(this, width: f32, color: u32) -> Style =>
+        this.borderSides(BorderWidth { left: 0.0, right: 0.0, top: width, bottom: 0.0, betweenChildren: 0.0 }, color);
+    public fn borderB(this, width: f32, color: u32) -> Style =>
+        this.borderSides(BorderWidth { left: 0.0, right: 0.0, top: 0.0, bottom: width, betweenChildren: 0.0 }, color);
+    public fn borderL(this, width: f32, color: u32) -> Style =>
+        this.borderSides(BorderWidth { left: width, right: 0.0, top: 0.0, bottom: 0.0, betweenChildren: 0.0 }, color);
+    public fn borderR(this, width: f32, color: u32) -> Style =>
+        this.borderSides(BorderWidth { left: 0.0, right: width, top: 0.0, bottom: 0.0, betweenChildren: 0.0 }, color);
+    public fn borderSides(this, widths: BorderWidth, color: u32) -> Style {
+        var s = this;
+        s.props.border = Border { color: Color.hex(color), width: widths };
+        return s;
+    }
+    /// divide-{width} (and its color; 0 keeps the border color).
+    public fn divide(this, width: f32, color: u32) -> Style {
+        var s = this;
+        s.props.divide = width;
+        if (color != 0) {
+            s.props.divideColor = Color.hex(color);
+        }
+        return s;
+    }
+
+    // ---- spacing -----------------------------------------------------------------------------------------------
+
+    public fn p(this, v: f32) -> Style {
+        var s = this;
+        s.props.padTop = v;
+        s.props.padBottom = v;
+        s.props.padLeft = v;
+        s.props.padRight = v;
+        return s;
+    }
+    public fn px(this, v: f32) -> Style {
+        var s = this;
+        s.props.padLeft = v;
+        s.props.padRight = v;
+        return s;
+    }
+    public fn py(this, v: f32) -> Style {
+        var s = this;
+        s.props.padTop = v;
+        s.props.padBottom = v;
+        return s;
+    }
+    public fn pt(this, v: f32) -> Style {
+        var s = this;
+        s.props.padTop = v;
+        return s;
+    }
+    public fn pb(this, v: f32) -> Style {
+        var s = this;
+        s.props.padBottom = v;
+        return s;
+    }
+    public fn pl(this, v: f32) -> Style {
+        var s = this;
+        s.props.padLeft = v;
+        return s;
+    }
+    public fn pr(this, v: f32) -> Style {
+        var s = this;
+        s.props.padRight = v;
+        return s;
+    }
+    public fn m(this, v: f32) -> Style {
+        var s = this;
+        s.props.marTop = v;
+        s.props.marBottom = v;
+        s.props.marLeft = v;
+        s.props.marRight = v;
+        return s;
+    }
+    public fn mx(this, v: f32) -> Style {
+        var s = this;
+        s.props.marLeft = v;
+        s.props.marRight = v;
+        return s;
+    }
+    public fn my(this, v: f32) -> Style {
+        var s = this;
+        s.props.marTop = v;
+        s.props.marBottom = v;
+        return s;
+    }
+    public fn mt(this, v: f32) -> Style {
+        var s = this;
+        s.props.marTop = v;
+        return s;
+    }
+    public fn mb(this, v: f32) -> Style {
+        var s = this;
+        s.props.marBottom = v;
+        return s;
+    }
+    public fn ml(this, v: f32) -> Style {
+        var s = this;
+        s.props.marLeft = v;
+        return s;
+    }
+    public fn mr(this, v: f32) -> Style {
+        var s = this;
+        s.props.marRight = v;
+        return s;
+    }
+    public fn gap(this, v: f32) -> Style {
+        var s = this;
+        s.props.gap = v;
+        return s;
+    }
+    public fn gapX(this, v: f32) -> Style {
+        var s = this;
+        s.props.gapX = v;
+        return s;
+    }
+    public fn gapY(this, v: f32) -> Style {
+        var s = this;
+        s.props.gapY = v;
+        return s;
+    }
+
+    // ---- flex --------------------------------------------------------------------------------------------------
+
+    public fn justify(this, j: Justify) -> Style {
+        var s = this;
+        s.props.justify = j;
+        return s;
+    }
+    public fn items(this, i: Items) -> Style {
+        var s = this;
+        s.props.items = i;
+        return s;
+    }
+    /// Absolute-axis alignment (renderer.h `.align = "{y}{x}"`), for when main/cross is not what you mean.
+    public fn alignXY(this, x: AxisAlign, y: AxisAlign) -> Style {
+        var s = this;
+        s.props.alignX = x;
+        s.props.alignY = y;
+        return s;
+    }
+    /// Shorthand for centering both ways (`.align = "cc"`).
+    public fn center(this) -> Style => this.alignXY(AxisAlign.Center, AxisAlign.Center);
+    public fn wrap(this) -> Style {
+        var s = this;
+        s.props.wrap = true;
+        return s;
+    }
+    public fn content(this, c: AlignContent) -> Style {
+        var s = this;
+        s.props.content = c;
+        return s;
+    }
+    public fn reverse(this) -> Style {
+        var s = this;
+        s.props.reverse = true;
+        return s;
+    }
+    public fn basis(this, px: f32) -> Style {
+        var s = this;
+        s.props.basis = px;
+        return s;
+    }
+    public fn shrink0(this) -> Style {
+        var s = this;
+        s.props.noShrink = true;
+        return s;
+    }
+
+    // ---- sizing ------------------------------------------------------------------------------------------------
+
+    public fn w(this, a: SizingAxis) -> Style {
+        var s = this;
+        s.props.width = a;
+        return s;
+    }
+    public fn h(this, a: SizingAxis) -> Style {
+        var s = this;
+        s.props.height = a;
+        return s;
+    }
+    /// size-*: both axes.
+    public fn size(this, a: SizingAxis) -> Style {
+        var s = this;
+        s.props.both = a;
+        return s;
+    }
+    public fn minW(this, px: f32) -> Style {
+        var s = this;
+        s.props.minW = px;
+        return s;
+    }
+    public fn maxW(this, px: f32) -> Style {
+        var s = this;
+        s.props.maxW = px;
+        return s;
+    }
+    public fn minH(this, px: f32) -> Style {
+        var s = this;
+        s.props.minH = px;
+        return s;
+    }
+    public fn maxH(this, px: f32) -> Style {
+        var s = this;
+        s.props.maxH = px;
+        return s;
+    }
+    public fn aspect(this, ratio: f32) -> Style {
+        var s = this;
+        s.props.aspect = ratio;
+        return s;
+    }
+
+    // ---- overflow ----------------------------------------------------------------------------------------------
+
+    /// overflow-*-auto: scroll on an axis (the Ui feeds the scroll offset).
+    public fn scroll(this, axis: ScrollAxis) -> Style {
+        var s = this;
+        s.props.scroll = axis;
+        return s;
+    }
+    /// overflow-hidden.
+    public fn clip(this) -> Style {
+        var s = this;
+        s.props.clip = true;
+        return s;
+    }
+
+    // ---- position and transforms -------------------------------------------------------------------------------
+
+    public fn absolute(this) -> Style {
+        var s = this;
+        s.props.position = Position.Absolute;
+        return s;
+    }
+    public fn fixed(this) -> Style {
+        var s = this;
+        s.props.position = Position.Fixed;
+        return s;
+    }
+    public fn top(this, v: f32) -> Style {
+        var s = this;
+        s.props.top = v;
+        return s;
+    }
+    public fn left(this, v: f32) -> Style {
+        var s = this;
+        s.props.left = v;
+        return s;
+    }
+    public fn right(this, v: f32) -> Style {
+        var s = this;
+        s.props.right = v;
+        return s;
+    }
+    public fn bottom(this, v: f32) -> Style {
+        var s = this;
+        s.props.bottom = v;
+        return s;
+    }
+    /// Anchor to the right and/or bottom edge at a 0 offset (renderer.h `.inset = "br"`).
+    public fn inset(this, right: bool, bottom: bool) -> Style {
+        var s = this;
+        s.props.insetRight = right;
+        s.props.insetBottom = bottom;
+        return s;
+    }
+    public fn z(this, index: i32) -> Style {
+        var s = this;
+        s.props.z = index;
+        return s;
+    }
+    public fn translate(this, x: f32, y: f32) -> Style {
+        var s = this;
+        s.props.tx = x;
+        s.props.ty = y;
+        return s;
+    }
+    public fn scale(this, factor: f32) -> Style {
+        var s = this;
+        s.props.scale = factor;
+        return s;
+    }
+    public fn rotate(this, degrees: f32) -> Style {
+        var s = this;
+        s.props.rotate = degrees;
+        return s;
+    }
+    public fn skew(this, xDegrees: f32, yDegrees: f32) -> Style {
+        var s = this;
+        s.props.skewX = xDegrees;
+        s.props.skewY = yDegrees;
+        return s;
+    }
+}
+
+// ---- text ----------------------------------------------------------------------------------------------------------
+
+/// Font ids as the host loads them (renderer.h's FONT_18..FONT_24, FONT_BOLD, FONT_MONO).
+public const FONT_18: u32 = 0;
+public const FONT_20: u32 = 1;
+public const FONT_22: u32 = 2;
+public const FONT_24: u32 = 3;
+public const FONT_BOLD: u32 = 4;
+public const FONT_MONO: u32 = 5;
+/// Tailwind text-* sizes mapped to the font presets.
+public const TEXT_SM: u32 = 0;
+public const TEXT_BASE: u32 = 0;
+public const TEXT_LG: u32 = 1;
+public const TEXT_XL: u32 = 2;
+public const TEXT_2XL: u32 = 3;
+
+/// renderer.h's TextOptions as a builder (`Text.of().font(TEXT_XL).color(SLATE_100).bold()`).
+public struct Text {
+    textColor: Color?;
+    fontPreset: u32;
+    px: f32;
+    spacing: f32;
+    lineHeight: f32;
+    alignment: TextAlign;
+    wrapping: TextWrap;
+    lines: usize;
+    isBold: bool;
+    isMono: bool;
+
+    public fn of() -> Text => Text {
+        textColor: null,
+        fontPreset: FONT_18,
+        px: 0.0,
+        spacing: 0.0,
+        lineHeight: 0.0,
+        alignment: TextAlign.Left,
+        wrapping: TextWrap.Words,
+        lines: 0,
+        isBold: false,
+        isMono: false,
+    };
+
+    public fn color(this, c: u32) -> Text {
+        var t = this;
+        t.textColor = Color.hex(c);
+        return t;
+    }
+    /// A font preset (FONT_* / TEXT_*).
+    public fn font(this, id: u32) -> Text {
+        var t = this;
+        t.fontPreset = id;
+        return t;
+    }
+    /// text-[Npx]; 0 = the preset's size.
+    public fn size(this, pixels: f32) -> Text {
+        var t = this;
+        t.px = pixels;
+        return t;
+    }
+    public fn tracking(this, letterSpacing: f32) -> Text {
+        var t = this;
+        t.spacing = letterSpacing;
+        return t;
+    }
+    public fn leading(this, height: f32) -> Text {
+        var t = this;
+        t.lineHeight = height;
+        return t;
+    }
+    public fn align(this, a: TextAlign) -> Text {
+        var t = this;
+        t.alignment = a;
+        return t;
+    }
+    public fn wrap(this, w: TextWrap) -> Text {
+        var t = this;
+        t.wrapping = w;
+        return t;
+    }
+    /// line-clamp-N (1 = truncate).
+    public fn clamp(this, n: usize) -> Text {
+        var t = this;
+        t.lines = n;
+        return t;
+    }
+    public fn bold(this) -> Text {
+        var t = this;
+        t.isBold = true;
+        return t;
+    }
+    public fn mono(this) -> Text {
+        var t = this;
+        t.isMono = true;
+        return t;
+    }
+
+    /// The engine's text configuration (ParseTextOptions).
+    public fn config(this) -> TextConfig {
+        let face = if (this.isMono) FONT_MONO else if (this.isBold) FONT_BOLD else this.fontPreset;
+        // Bold and mono faces use the 18px base size, as renderer.h's fontPx[] lookup does.
+        let presetPx: f32 = match (face) {
+            1 => 20.0,
+            2 => 22.0,
+            3 => 24.0,
+            _ => 18.0,
+        };
+        var c = TextConfig.of(if (this.px > 0.0) this.px else presetPx);
+        c.fontId = face;
+        c.letterSpacing = this.spacing;
+        c.lineHeight = this.lineHeight;
+        c.lineClamp = this.lines;
+        c.align = this.alignment;
+        c.wrap = this.wrapping;
+        c.color = match (this.textColor) {
+            Some(col) => col,
+            null => Color.hex(DEFAULT_INK),
+        };
+        return c;
+    }
+}

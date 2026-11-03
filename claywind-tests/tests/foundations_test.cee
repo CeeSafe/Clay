@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MIT
+// Colors, geometry, transforms and formatting.
+
+import claywind;
+
+@test
+fn paletteMatchesTailwind() -> Result<void, TestFailure> {
+    let c = Color.hex(SLATE_900);
+    Check.equalU64(15, c.r as u64)?;
+    Check.equalU64(23, c.g as u64)?;
+    Check.equalU64(42, c.b as u64)?;
+    Check.equalU64(255, c.a as u64)?;
+    Check.equalU64(BLUE_500 as u64, Color.hex(BLUE_500).packed() as u64)?;
+    Check.equalU64(0x3B82F680, withAlpha(BLUE_500, 128) as u64)?;
+    Check.equalU64(ZINC_50 as u64, theme(false, ZINC_950, ZINC_50) as u64)?;
+    Check.isTrue(Color.hex(NONE).a == 0, "NONE is transparent")?;
+    return Ok();
+}
+
+@test
+fn rectOperations() -> Result<void, TestFailure> {
+    let a = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+    let b = Rect { x: 5.0, y: 5.0, w: 10.0, h: 10.0 };
+    let i = Rects.intersect(a, b);
+    near32("intersect x", 5.0, i.x, 0.0)?;
+    near32("intersect w", 5.0, i.w, 0.0)?;
+    let u = Rects.union(a, b);
+    near32("union w", 15.0, u.w, 0.0)?;
+    let far = Rect { x: 50.0, y: 50.0, w: 1.0, h: 1.0 };
+    Check.isTrue(Rects.isEmpty(Rects.intersect(a, far)), "disjoint boxes do not overlap")?;
+    let inner = Rects.inset(a, Sides.all(2.0));
+    near32("inset", 6.0, inner.w, 0.0)?;
+    Check.isTrue(a.contains(Vec2 { x: 9.9, y: 0.0 }), "contains edge")?;
+    Check.isFalse(a.contains(Vec2 { x: 10.0, y: 0.0 }), "right edge is exclusive")?;
+    return Ok();
+}
+
+@test
+fn cornersFitTheBox() -> Result<void, TestFailure> {
+    // rounded-full on a 40x20 pill: radii 9999 shrink to 10 (half the height).
+    let c = Corners.all(9999.0).fitted(40.0, 20.0);
+    near32("pill radius", 10.0, c.topLeft, 1e-3)?;
+    let unchanged = Corners.all(4.0).fitted(40.0, 20.0);
+    near32("small radius", 4.0, unchanged.bottomRight, 0.0)?;
+    return Ok();
+}
+
+@test
+fn affineTransforms() -> Result<void, TestFailure> {
+    let r = Affine2.rotation(90.0);
+    let p = r.apply(Vec2 { x: 1.0, y: 0.0 });
+    near32("rotate x", 0.0, p.x, 1e-6)?;
+    near32("rotate y", 1.0, p.y, 1e-6)?;
+
+    // scale(2) about (10, 10) keeps the pivot fixed.
+    let s = Affine2.scaling(2.0, 2.0).about(10.0, 10.0);
+    let pivot = s.apply(Vec2 { x: 10.0, y: 10.0 });
+    near32("pivot x", 10.0, pivot.x, 1e-5)?;
+    let corner = s.apply(Vec2 { x: 0.0, y: 0.0 });
+    near32("scaled corner", -10.0, corner.x, 1e-5)?;
+
+    // inverse undoes a composite transform.
+    let t = Affine2.translation(3.0, -2.0).after(Affine2.rotation(30.0)).after(Affine2.skewing(10.0, 0.0));
+    let back = t.inverse()!.apply(t.apply(Vec2 { x: 7.0, y: 4.0 }));
+    near32("inverse x", 7.0, back.x, 1e-4)?;
+    near32("inverse y", 4.0, back.y, 1e-4)?;
+    Check.isTrue(Affine2.scaling(0.0, 1.0).inverse() == null, "singular has no inverse")?;
+
+    // a 45-degree rotation of a unit square spans sqrt(2).
+    let bounds = Affine2.rotation(45.0).bounds(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
+    near32("bounds", 1.4142135, bounds.w, 1e-5)?;
+    return Ok();
+}
+
+fn formatted(value: f32, decimals: u32, expected: StringView) -> Result<void, TestFailure> {
+    var buffer = [0u8; 40];
+    var w = TextWriter.create(mut buffer[..]);
+    Format.fixed(mut w, value, decimals);
+    return Check.equalBytes(expected.bytes(), w.written());
+}
+
+@test
+fn fixedPointFormatting() -> Result<void, TestFailure> {
+    formatted(3.14159, 2, "3.14")?;
+    formatted(2.5, 0, "3")?;
+    formatted(-0.006, 2, "-0.01")?;
+    formatted(-0.004, 2, "0.00")?; // rounds to zero: no sign
+    formatted(-1.25, 1, "-1.3")?;
+    formatted(0.0, 3, "0.000")?;
+    formatted(1234.5, 1, "1234.5")?;
+    formatted(59.96, 1, "60.0")?;
+    return Ok();
+}
+
+@test
+fn paddedIntegers() -> Result<void, TestFailure> {
+    var buffer = [0u8; 40];
+    var w = TextWriter.create(mut buffer[..]);
+    Format.padded(mut w, -42, 5, ' ');
+    w.byte('|');
+    Format.padded(mut w, 7, 3, '0');
+    w.byte('|');
+    Format.padded(mut w, -9223372036854775807 - 1, 1, ' ');
+    return Check.equalBytes("  -42|007|-9223372036854775808".bytes(), w.written());
+}

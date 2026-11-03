@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MIT
+// Tailwind-style transitions, ported from claywind_transition.h. A small retained store keeps each element's
+// displayed animatable values, keyed by element id; every frame they ease toward the target declaration instead of
+// snapping. Groups: colors (background + border color), opacity, transform (translate, scale, rotation).
+// One clock per element; the first sighting snaps. Values are kept in f32 (Clay colors are floats), so in-between
+// colors round only when written back.
+
+/// Easing curves (quadratic, as claywind_transition.h; CSS cubic-bezier curves are `CubicBezier` in math.cee).
+public enum Ease {
+    Linear,
+    In,
+    Out,
+    InOut,
+}
+
+/// What an element animates, and how (ClayWind_TransitionSpec).
+public struct TransitionSpec {
+    public colors: bool;
+    public opacity: bool;
+    public transform: bool;
+    /// Seconds; <= 0 means 0.15.
+    public duration: f32;
+    /// Seconds to hold the start value after a target change (Tailwind delay-*).
+    public delay: f32;
+    public ease: Ease;
+
+    /// Tailwind `transition-colors` etc. with the Tailwind defaults (150ms, ease-in-out).
+    public fn colorsOnly() -> TransitionSpec =>
+        TransitionSpec { colors: true, opacity: false, transform: false, duration: 0.15, delay: 0.0, ease: Ease.InOut };
+    public fn opacityOnly() -> TransitionSpec =>
+        TransitionSpec { colors: false, opacity: true, transform: false, duration: 0.15, delay: 0.0, ease: Ease.InOut };
+    public fn transformOnly() -> TransitionSpec =>
+        TransitionSpec { colors: false, opacity: false, transform: true, duration: 0.15, delay: 0.0, ease: Ease.InOut };
+    public fn all() -> TransitionSpec =>
+        TransitionSpec { colors: true, opacity: true, transform: true, duration: 0.15, delay: 0.0, ease: Ease.InOut };
+
+    public fn durationMs(this, ms: f32) -> TransitionSpec {
+        var s = this;
+        s.duration = ms / 1000.0;
+        return s;
+    }
+    public fn delayMs(this, ms: f32) -> TransitionSpec {
+        var s = this;
+        s.delay = ms / 1000.0;
+        return s;
+    }
+    public fn easing(this, e: Ease) -> TransitionSpec {
+        var s = this;
+        s.ease = e;
+        return s;
+    }
+
+    fn any(this) -> bool => this.colors || this.opacity || this.transform;
+}
+
+/// A color with float channels, for interpolation.
+struct ColorF {
+    r: f32;
+    g: f32;
+    b: f32;
+    a: f32;
+}
+
+fn toF(c: Color) -> ColorF =>
+    ColorF {
+        r: round<f32>(c.r as u32),
+        g: round<f32>(c.g as u32),
+        b: round<f32>(c.b as u32),
+        a: round<f32>(c.a as u32),
+    };
+
+fn channel(v: f32) -> u8 => truncate<u8>(truncate<u32>(Math.clamp(v + 0.5, 0.0, 255.0)));
+
+fn toColor(c: ColorF) -> Color => Color { r: channel(c.r), g: channel(c.g), b: channel(c.b), a: channel(c.a) };
+
+fn lerpColor(a: ColorF, b: ColorF, e: f32) -> ColorF => ColorF {
+    r: a.r + (b.r - a.r) * e,
+    g: a.g + (b.g - a.g) * e,
+    b: a.b + (b.b - a.b) * e,
+    a: a.a + (b.a - a.a) * e,
+};
+
+fn colorNear(a: ColorF, b: ColorF) -> bool =>
+    (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs() + (a.a - b.a).abs() < 0.5;
+
+/// The animatable values of one element.
+struct Values {
+    bg: ColorF;
+    border: ColorF;
+    opacity: f32;
+    tx: f32;
+    ty: f32;
+    scale: f32;
+    rotate: f32;
+}
+
+/// One element's animation (ClayWind__Anim).
+struct Anim {
+    id: u32;
+    lastFrame: u32;
+    active: bool;
+    elapsed: f32;
+    duration: f32;
+    ease: Ease;
+    shown: Values;
+    start: Values;
+    target: Values;
+}
+
+fn zeroValues() -> Values {
+    let c = ColorF { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+    return Values { bg: c, border: c, opacity: 0.0, tx: 0.0, ty: 0.0, scale: 0.0, rotate: 0.0 };
+}
+
+fn freeAnim() -> Anim => Anim {
+    id: 0,
+    lastFrame: 0,
+    active: false,
+    elapsed: 0.0,
+    duration: 0.0,
+    ease: Ease.Linear,
+    shown: zeroValues(),
+    start: zeroValues(),
+    target: zeroValues(),
+};
+
+/// ClayWind__ease.
+public fn applyEase(mode: Ease, t: f32) -> f32 {
+    if (t <= 0.0) {
+        return 0.0;
+    }
+    if (t >= 1.0) {
+        return 1.0;
+    }
+    return match (mode) {
+        Ease.In => t * t,
+        Ease.Out => t * (2.0 - t),
+        Ease.InOut => if (t < 0.5) 2.0 * t * t else -1.0 + (4.0 - 2.0 * t) * t,
+        Ease.Linear => t,
+    };
+}
+
+/// The retained animation store (fixed size; the least recently used slot is reused when full).
+public struct Transitions<region r> {
+    anims: SliceMut<r, Anim>;
+    frame: u32;
+
+    public fn create(memory: borrow(r) FixedBufferAllocator, slots: usize) -> Result<Transitions<r>, AllocError> {
+        let anims = memory.allocArray(slots, freeAnim())?;
+        return Ok(Transitions { anims: anims, frame: 0 });
+    }
+
+    /// Advances the frame counter used for slot reuse (ClayWind_TransitionTick). Once per frame.
+    public fn tick(borrow mut this) {
+        this.frame = this.frame.wrappingAdd(1);
+    }
+
+    /// Eases `decl`'s enabled groups toward their current (target) values over `dt` seconds, in place
+    /// (ClayWind_TransitionApply). Call after variants are applied.
+    public fn apply(borrow mut this, id: u32, spec: TransitionSpec, dt: f32, decl: borrow mut Decl) {
+        if (!spec.any() || this.anims.length == 0) {
+            return;
+        }
+        let target = Values {
+            bg: toF(decl.background),
+            border: toF(decl.border.color),
+            opacity: if (decl.layout.opacity == 0.0) 1.0 else decl.layout.opacity,
+            tx: decl.layout.translate.x,
+            ty: decl.layout.translate.y,
+            scale: if (decl.layout.scale == 0.0) 1.0 else decl.layout.scale,
+            rotate: decl.layout.rotation,
+        };
+        let slot = this.slotFor(id);
+        this.anims[slot].lastFrame = this.frame;
+        let duration = if (spec.duration > 0.0) spec.duration else 0.15;
+        if (!this.anims[slot].active) {
+            // First sighting: snap to the target.
+            this.anims[slot].active = true;
+            this.anims[slot].shown = target;
+            this.anims[slot].start = target;
+            this.anims[slot].target = target;
+            this.anims[slot].duration = duration;
+            this.anims[slot].ease = spec.ease;
+            this.anims[slot].elapsed = duration;
+        } else {
+            let old = this.anims[slot].target;
+            var changed = false;
+            if (spec.colors && (!colorNear(target.bg, old.bg) || !colorNear(target.border, old.border))) {
+                changed = true;
+            }
+            if (spec.opacity && (target.opacity - old.opacity).abs() > 0.001) {
+                changed = true;
+            }
+            if (spec.transform && ((target.tx - old.tx).abs() > 0.01 || (target.ty - old.ty).abs() > 0.01 ||
+                (target.scale - old.scale).abs() > 0.001 || (target.rotate - old.rotate).abs() > 0.01)) {
+                changed = true;
+            }
+            if (changed) {
+                // Restart from what is on screen, so a mid-flight re-target eases smoothly.
+                this.anims[slot].start = this.anims[slot].shown;
+                this.anims[slot].target = target;
+                this.anims[slot].elapsed = if (spec.delay > 0.0) -spec.delay else 0.0;
+                this.anims[slot].duration = duration;
+                this.anims[slot].ease = spec.ease;
+            }
+            this.anims[slot].elapsed += dt;
+            let a = this.anims[slot];
+            let e = applyEase(a.ease, if (a.duration > 0.0) a.elapsed / a.duration else 1.0);
+            this.anims[slot].shown = Values {
+                bg: lerpColor(a.start.bg, a.target.bg, e),
+                border: lerpColor(a.start.border, a.target.border, e),
+                opacity: Math.lerp(a.start.opacity, a.target.opacity, e),
+                tx: Math.lerp(a.start.tx, a.target.tx, e),
+                ty: Math.lerp(a.start.ty, a.target.ty, e),
+                scale: Math.lerp(a.start.scale, a.target.scale, e),
+                rotate: Math.lerp(a.start.rotate, a.target.rotate, e),
+            };
+        }
+        let shown = this.anims[slot].shown;
+        if (spec.colors) {
+            decl.background = toColor(shown.bg);
+            decl.border.color = toColor(shown.border);
+        }
+        if (spec.opacity) {
+            decl.layout.opacity = shown.opacity;
+        }
+        if (spec.transform) {
+            decl.layout.translate = Vec2 { x: shown.tx, y: shown.ty };
+            decl.layout.scale = shown.scale;
+            decl.layout.rotation = shown.rotate;
+        }
+    }
+
+    /// The displayed background of element `id` in float channels (for tests), or null.
+    public fn shownBackground(borrow this, id: u32) -> Color? {
+        for (i in 0..this.anims.length) {
+            if (this.anims[i].active && this.anims[i].id == id) {
+                return toColor(this.anims[i].shown.bg);
+            }
+        }
+        return null;
+    }
+
+    /// ClayWind__animSlot: the slot for `id`, or a free one, or the least recently used one (reset).
+    fn slotFor(borrow mut this, id: u32) -> usize {
+        var freeSlot: usize? = null;
+        var oldest: usize = 0;
+        for (i in 0..this.anims.length) {
+            let a = this.anims[i];
+            if (a.active && a.id == id) {
+                return i;
+            }
+            if (!a.active && freeSlot == null) {
+                freeSlot = i;
+            }
+            if (a.lastFrame < this.anims[oldest].lastFrame) {
+                oldest = i;
+            }
+        }
+        let slot = match (freeSlot) {
+            Some(f) => f,
+            null => oldest,
+        };
+        this.anims[slot] = freeAnim();
+        this.anims[slot].id = id;
+        return slot;
+    }
+}

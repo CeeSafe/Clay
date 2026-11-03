@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: MIT
+// Fixed-capacity storage for the freestanding core. `Vector` needs the hosted runtime (N0293), so the core keeps
+// its per-frame data in caller-provided slices instead, carved from a `FixedBufferAllocator`. This is the same
+// model as Clay's single fixed arena (`Clay_MinMemorySize`), and it never allocates during a frame.
+
+/// A list of up to `items.length` Copy values over a borrowed slice.
+public struct FixedList<region r, T: Copy> {
+    items: SliceMut<r, T>;
+    count: usize;
+
+    public fn over(items: SliceMut<r, T>) -> FixedList<r, T> => FixedList { items: items, count: 0 };
+
+    /// Appends `value`; false when the list is full (the value is dropped).
+    public fn push(borrow mut this, value: T) -> bool {
+        if (this.count >= this.items.length) {
+            return false;
+        }
+        this.items[this.count] = value;
+        this.count += 1;
+        return true;
+    }
+
+    public fn pop(borrow mut this) {
+        if (this.count > 0) {
+            this.count -= 1;
+        }
+    }
+
+    public fn clear(borrow mut this) {
+        this.count = 0;
+    }
+
+    public fn length(borrow this) -> usize => this.count;
+
+    /// Element `i`; an index at or past `length()` stops the program, like any out-of-bounds index.
+    public fn get(borrow this, i: usize) -> T {
+        if (i >= this.count) {
+            // Indexing one past the slice is the bounds-check stop; there is no stale read.
+            return this.items[this.items.length];
+        }
+        return this.items[i];
+    }
+
+    public fn last(borrow this) -> T => this.get(this.count - 1);
+}

@@ -1,0 +1,693 @@
+// SPDX-License-Identifier: MIT
+// The immediate-mode UI context: renderer.h's frame loop and element opening on top of the layout engine.
+//
+// Per frame: `begin(platform)` hit-tests the pointer against the previous frame's layout (as Clay_SetPointerState
+// does), updates scroll containers (Clay_UpdateScrollContainers: wheel, drag, momentum) and opens the root; elements
+// are declared with `open`/`close` (or `nest` with a closure) and `label`; `end` lays out and records what the next
+// frame needs; `render` sends the commands to a backend.
+//
+// An element's style is resolved as RendererOpenElement does: base props, then hover (pointer over it), active
+// (hovered and pressed), group-hover, focus, and disabled (which wins and suppresses the rest), then transitions.
+
+/// Tailwind breakpoints from the screen width (GetBreakpoint): sm < 768 <= md < 1024 <= lg < 1280 <= xl.
+public enum Breakpoint {
+    Sm,
+    Md,
+    Lg,
+    Xl,
+}
+
+/// One scroll container's state across frames (Clay__ScrollContainerDataInternal).
+struct ScrollState {
+    id: u32;
+    position: Vec2;
+    momentum: Vec2;
+    scrollOrigin: Vec2;
+    pointerOrigin: Vec2;
+    pointerActive: bool;
+    momentumTime: f32;
+    content: Dims;
+    size: Dims;
+    area: Rect;
+    horizontal: bool;
+    vertical: bool;
+    openThisFrame: bool;
+}
+
+/// How much a `Ui` holds.
+public struct UiCapacity {
+    public layout: LayoutCapacity;
+    public animations: usize;
+    public scrollContainers: usize;
+
+    public fn of(elements: usize) -> UiCapacity => UiCapacity {
+        layout: LayoutCapacity.of(elements),
+        animations: 512,
+        scrollContainers: 64,
+    };
+}
+
+public struct Ui<region r> {
+    tree: LayoutTree<r>;
+    animations: Transitions<r>;
+    scrolls: FixedList<r, ScrollState>;
+    pressedIds: FixedList<r, u32>;
+    clickedIds: FixedList<r, u32>;
+    pointerState: Pointer;
+    frameDt: f32;
+    cursorWanted: Cursor;
+    darkMode: bool;
+    screen: Dims;
+    // Keys and text for this frame (copied from the platform at `begin`).
+    keysDown: u64;
+    keysPressed: u64;
+    keysRepeated: u64;
+    chars: FixedList<r, u32>;
+    charRead: usize;
+    clock: f64;
+    // Focus and drag capture (controls.h's ClayWind_focusedId / ClayWind_activeId), and this frame's focusables.
+    focusedId: u32;
+    activeId: u32;
+    focusables: FixedList<r, u32>;
+
+    /// A context whose memory comes from `memory`, which it borrows for its whole life.
+    public fn create(memory: borrow(r) FixedBufferAllocator, capacity: UiCapacity) -> Result<Ui<r>, AllocError> {
+        let tree = LayoutTree.create(memory, capacity.layout)?;
+        let animations = Transitions.create(memory, capacity.animations)?;
+        let empty = ScrollState {
+            id: 0,
+            position: Vec2.zero(),
+            momentum: Vec2.zero(),
+            scrollOrigin: Vec2.zero(),
+            pointerOrigin: Vec2.zero(),
+            pointerActive: false,
+            momentumTime: 0.0,
+            content: Dims { w: 0.0, h: 0.0 },
+            size: Dims { w: 0.0, h: 0.0 },
+            area: Rect.zero(),
+            horizontal: false,
+            vertical: false,
+            openThisFrame: false,
+        };
+        let scrolls = memory.allocArray(capacity.scrollContainers, empty)?;
+        let pressed = memory.allocArray(capacity.layout.elements, 0u32)?;
+        let clicked = memory.allocArray(capacity.layout.elements, 0u32)?;
+        let chars = memory.allocArray(64, 0u32)?;
+        let focusables = memory.allocArray(64, 0u32)?;
+        return Ok(Ui {
+            tree: tree,
+            animations: animations,
+            scrolls: FixedList<ScrollState>.over(scrolls),
+            pressedIds: FixedList<u32>.over(pressed),
+            clickedIds: FixedList<u32>.over(clicked),
+            pointerState: Pointer.at(Vec2 { x: -1.0, y: -1.0 }),
+            frameDt: 0.0,
+            cursorWanted: Cursor.Default,
+            darkMode: false,
+            screen: Dims { w: 0.0, h: 0.0 },
+            keysDown: 0,
+            keysPressed: 0,
+            keysRepeated: 0,
+            chars: FixedList<u32>.over(chars),
+            charRead: 0,
+            clock: 0.0,
+            focusedId: 0,
+            activeId: 0,
+            focusables: FixedList<u32>.over(focusables),
+        });
+    }
+
+    // ---- the frame -------------------------------------------------------------------------------------------------
+
+    /// Starts a frame (ClayWind_BeginFrame): input, hit-testing against the last frame, scrolling, the root.
+    public fn begin(borrow mut this, platform: borrow mut dyn Platform) {
+        let pointer = platform.pointer();
+        this.pointerState = pointer;
+        this.frameDt = platform.frameTime();
+        this.clock = platform.time();
+        this.keysDown = 0;
+        this.keysPressed = 0;
+        this.keysRepeated = 0;
+        for (i in 0..KEY_COUNT) {
+            let key = keyAt(i);
+            let bit = 1u64 << (i as u64);
+            if (platform.keyDown(key)) {
+                this.keysDown |= bit;
+            }
+            if (platform.keyPressed(key)) {
+                this.keysPressed |= bit;
+            }
+            if (platform.keyRepeated(key)) {
+                this.keysRepeated |= bit;
+            }
+        }
+        this.chars.clear();
+        this.charRead = 0;
+        loop {
+            let c = platform.nextChar();
+            if (c == 0 || !this.chars.push(c)) {
+                break;
+            }
+        }
+        this.focusables.clear();
+        this.tree.hitTest(pointer.position);
+
+        // Clicks: an element is clicked when the pointer went down and came back up over it.
+        this.clickedIds.clear();
+        if (pointer.pressed) {
+            this.pressedIds.clear();
+            for (i in 0..this.tree.pointerOverCount()) {
+                this.pressedIds.push(this.tree.pointerOverAt(i));
+            }
+        }
+        if (pointer.released) {
+            for (i in 0..this.pressedIds.length()) {
+                let id = this.pressedIds.get(i);
+                if (this.tree.isPointerOver(id)) {
+                    this.clickedIds.push(id);
+                }
+            }
+            this.pressedIds.clear();
+        }
+
+        let dt = this.frameDt;
+        this.updateScrollContainers(pointer.wheel, dt);
+        this.animations.tick();
+        this.cursorWanted = Cursor.Default;
+        this.screen = platform.screenSize();
+        this.tree.begin(this.screen.w, this.screen.h);
+    }
+
+    /// Sends the frame's commands to a backend, in paint order.
+    public fn render(borrow this, backend: borrow mut dyn Backend) {
+        let none = [0u8; 1];
+        for (i in 0..this.tree.commandCount()) {
+            let command = this.tree.command(i);
+            match (command) {
+                Command.Text(_, run) => { backend.draw(command, this.tree.textBytes(run)); }
+                _ => { backend.draw(command, none[0..0]); }
+            }
+        }
+    }
+
+    /// The command at `i` and its text bytes (empty unless it is a Text command), for `renderInto`.
+    public fn commandCount(borrow this) -> usize => this.tree.commandCount();
+    public fn commandAt(borrow this, i: usize) -> Command => this.tree.command(i);
+    public fn textOf(borrow this, command: Command) -> Slice<u8> {
+        return match (command) {
+            Command.Text(_, run) => this.tree.textBytes(run),
+            _ => this.tree.textBytes(
+                TextRun {
+                    start: 0,
+                    length: 0,
+                    color: Color.hex(0),
+                    fontId: 0,
+                    fontSize: 0.0,
+                    letterSpacing: 0.0,
+                    lineHeight: 0.0,
+                },
+            ),
+        };
+    }
+
+    // ---- elements --------------------------------------------------------------------------------------------------
+
+    /// Opens a container styled by `style`; its children follow until the matching `close`.
+    public fn open(borrow mut this, style: Style) {
+        let id = this.tree.idFor(style.elementId);
+        var decl = style.base;
+        applyProps(mut decl, style.props);
+        let enabled = !style.disabledNow;
+        let hovered = this.tree.isPointerOver(id);
+        if (enabled && hovered) {
+            match (style.hoverProps) {
+                Some(p) => { applyProps(mut decl, p); }
+                null => {}
+            }
+            if (this.pointerState.down) {
+                match (style.activeProps) {
+                    Some(p) => { applyProps(mut decl, p); }
+                    null => {}
+                }
+            }
+        }
+        if (enabled && style.groupId != 0 && this.tree.isPointerOver(style.groupId)) {
+            match (style.groupProps) {
+                Some(p) => { applyProps(mut decl, p); }
+                null => {}
+            }
+        }
+        if (enabled && style.focused) {
+            match (style.focusProps) {
+                Some(p) => { applyProps(mut decl, p); }
+                null => {}
+            }
+        }
+        if (style.disabledNow) {
+            match (style.disabledProps) {
+                Some(p) => { applyProps(mut decl, p); }
+                null => {}
+            }
+        }
+        match (style.transitionSpec) {
+            Some(spec) => {
+                let dt = this.frameDt;
+                this.animations.apply(id, spec, dt, mut decl);
+            }
+            null => {}
+        }
+        if (decl.clip.any() && style.props.scroll != null) {
+            decl.clip.childOffset = this.scrollOffsetFor(id, decl.clip);
+        }
+        this.tree.open(style.elementId, decl);
+        if (enabled && hovered) {
+            match (style.props.cursor) {
+                Some(c) => { this.cursorWanted = c; }
+                null => {}
+            }
+        }
+    }
+
+    /// Closes the innermost open container.
+    public fn close(borrow mut this) {
+        this.tree.close();
+    }
+
+    /// `open(style)`, then `body`, then `close()`: the block form of the C `Box(...) { ... }` macro.
+    public fn nest(borrow mut this, style: Style, body: borrow mut fn(borrow mut Ui<r>)) {
+        this.open(style);
+        body(mut this);
+        this.close();
+    }
+
+    /// A text leaf (Label).
+    public fn label(borrow mut this, text: StringView, look: Text) {
+        this.tree.text(text.bytes(), look.config());
+    }
+
+    /// A text leaf from UTF-8 bytes, such as a `TextWriter`'s output (LabelF with F()).
+    public fn labelBytes(borrow mut this, utf8: Slice<u8>, look: Text) {
+        this.tree.text(utf8, look.config());
+    }
+
+    // ---- state queries ---------------------------------------------------------------------------------------------
+
+    /// Whether the element named `name` is under the pointer (as of the last layout).
+    public fn hovered(borrow this, name: StringView) -> bool => this.tree.isPointerOver(hashId(name));
+
+    /// Whether it is hovered with the button down (Tailwind active:).
+    public fn pressed(borrow this, name: StringView) -> bool => this.pointerState.down && this.hovered(name);
+
+    /// Whether it was pressed and released under the pointer this frame.
+    public fn clicked(borrow this, name: StringView) -> bool => this.clickedHash(hashId(name));
+
+    public fn clickedHash(borrow this, id: u32) -> bool {
+        for (i in 0..this.clickedIds.length()) {
+            if (this.clickedIds.get(i) == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public fn pointer(borrow this) -> Pointer => this.pointerState;
+
+    // ---- keys, text and the clock (claywind_platform.h's wrappers, as of this frame's `begin`) -------------------
+
+    public fn keyDown(borrow this, k: Key) -> bool => (this.keysDown & (1u64 << (keyIndex(k) as u64))) != 0;
+    public fn keyPressed(borrow this, k: Key) -> bool => (this.keysPressed & (1u64 << (keyIndex(k) as u64))) != 0;
+    public fn keyRepeated(borrow this, k: Key) -> bool => (this.keysRepeated & (1u64 << (keyIndex(k) as u64))) != 0;
+    /// Pressed or OS-repeated this frame.
+    public fn keyHit(borrow this, k: Key) -> bool => this.keyPressed(k) || this.keyRepeated(k);
+    public fn shiftDown(borrow this) -> bool => this.keyDown(Key.LeftShift) || this.keyDown(Key.RightShift);
+
+    /// The next character typed this frame, or 0 (ClayWind_CharPressed: each is consumed once).
+    public fn nextChar(borrow mut this) -> u32 {
+        if (this.charRead >= this.chars.length()) {
+            return 0;
+        }
+        let c = this.chars.get(this.charRead);
+        this.charRead += 1;
+        return c;
+    }
+
+    /// Seconds since start, from the platform (ClayWind_Time).
+    public fn time(borrow this) -> f64 => this.clock;
+
+    // ---- clicks, focus and capture (controls.h's helpers) ----------------------------------------------------------
+
+    /// ClayWind_Clicked: the pointer is over element `id` and the primary button went down this frame.
+    public fn pressedOn(borrow this, id: u32) -> bool => this.pointerState.pressed && this.tree.isPointerOver(id);
+
+    /// The secondary (right) button went down over element `id` this frame.
+    public fn secondaryPressedOn(borrow this, id: u32) -> bool =>
+        this.pointerState.secondaryPressed && this.tree.isPointerOver(id);
+
+    /// ClayWind_PressedOutside: the primary button went down over neither `a` nor `b` (0 = none).
+    public fn pressedOutside(borrow this, a: u32, b: u32) -> bool {
+        if (!this.pointerState.pressed) {
+            return false;
+        }
+        let over = this.tree.isPointerOver(a) || (b != 0 && this.tree.isPointerOver(b));
+        return !over;
+    }
+
+    /// Whether element `id` is under the pointer (as of the last layout).
+    public fn overHash(borrow this, id: u32) -> bool => this.tree.isPointerOver(id);
+
+    public fn hasFocus(borrow this, id: u32) -> bool => this.focusedId != 0 && this.focusedId == id;
+    public fn hasFocusNamed(borrow this, name: StringView) -> bool => this.hasFocus(hashId(name));
+    public fn setFocus(borrow mut this, id: u32) {
+        this.focusedId = id;
+    }
+    public fn clearFocus(borrow mut this) {
+        this.focusedId = 0;
+    }
+    public fn focused(borrow this) -> u32 => this.focusedId;
+
+    /// The control capturing a drag (ClayWind_activeId); 0 = none.
+    public fn captured(borrow this) -> u32 => this.activeId;
+    public fn capture(borrow mut this, id: u32) {
+        this.activeId = id;
+    }
+
+    /// ClayWind_RegisterFocusable: `id` takes part in Tab cycling this frame.
+    public fn registerFocusable(borrow mut this, id: u32) {
+        this.focusables.push(id);
+    }
+
+    /// The box element `id` had in the last laid-out frame.
+    public fn boxOfHash(borrow this, id: u32) -> Rect? => this.tree.boxOf(id);
+
+    /// The frame delta the transitions advance by, in seconds.
+    public fn frameTime(borrow this) -> f32 => this.frameDt;
+
+    public fn screenSize(borrow this) -> Dims => this.screen;
+
+    /// GetBreakpoint.
+    public fn breakpoint(borrow this) -> Breakpoint {
+        let w = this.screen.w;
+        if (w >= 1280.0) {
+            return Breakpoint.Xl;
+        }
+        if (w >= 1024.0) {
+            return Breakpoint.Lg;
+        }
+        if (w >= 768.0) {
+            return Breakpoint.Md;
+        }
+        return Breakpoint.Sm;
+    }
+
+    /// Dark mode (ClayWind_darkMode) and THEME(dark, light).
+    public fn setDarkMode(borrow mut this, on: bool) {
+        this.darkMode = on;
+    }
+    public fn isDarkMode(borrow this) -> bool => this.darkMode;
+    public fn theme(borrow this, dark: u32, light: u32) -> u32 => if (this.darkMode) dark else light;
+
+    /// @container: the size the element named `name` had on the previous frame (0 before its first layout).
+    public fn containerSize(borrow this, name: StringView) -> Dims {
+        return match (this.tree.boxOf(hashId(name))) {
+            Some(b) => Dims { w: b.w, h: b.h },
+            null => Dims { w: 0.0, h: 0.0 },
+        };
+    }
+    public fn containerWidth(borrow this, name: StringView) -> f32 => this.containerSize(name).w;
+    public fn containerHeight(borrow this, name: StringView) -> f32 => this.containerSize(name).h;
+
+    /// The laid-out box of an element in the last frame.
+    public fn boxOf(borrow this, name: StringView) -> Rect? => this.tree.boxOf(hashId(name));
+
+    /// The engine, for render commands and anything this layer does not wrap.
+    public fn layout(borrow this) -> borrow(this) LayoutTree<r> => borrow this.tree;
+
+    // ---- scrolling -------------------------------------------------------------------------------------------------
+
+    /// The scroll offset of the container named `name` (0, 0 if it is not one).
+    public fn scrollOffset(borrow this, name: StringView) -> Vec2 {
+        return match (this.scrollSlot(hashId(name))) {
+            Some(k) => this.scrolls.items[k].position,
+            null => Vec2.zero(),
+        };
+    }
+
+    /// ScrollContainerByY / ByX: moves by a delta, clamped to the content.
+    public fn scrollBy(borrow mut this, name: StringView, dx: f32, dy: f32) {
+        match (this.scrollSlot(hashId(name))) {
+            Some(k) => {
+                let s = this.scrolls.items[k];
+                let minX = -(s.content.w - s.size.w).max(0.0);
+                let minY = -(s.content.h - s.size.h).max(0.0);
+                this.scrolls.items[k].position = Vec2 {
+                    x: (s.position.x + dx).max(minX).min(0.0),
+                    y: (s.position.y + dy).max(minY).min(0.0),
+                };
+            }
+            null => {}
+        }
+    }
+
+    /// ScrollContainerTop.
+    public fn scrollToTop(borrow mut this, name: StringView) {
+        match (this.scrollSlot(hashId(name))) {
+            Some(k) => { this.scrolls.items[k].position.y = 0.0; }
+            null => {}
+        }
+    }
+
+    /// ScrollContainerBottom.
+    public fn scrollToBottom(borrow mut this, name: StringView) {
+        match (this.scrollSlot(hashId(name))) {
+            Some(k) => {
+                let s = this.scrolls.items[k];
+                this.scrolls.items[k].position.y = -(s.content.h - s.size.h).max(0.0);
+            }
+            null => {}
+        }
+    }
+
+    fn scrollSlot(borrow this, id: u32) -> usize? {
+        for (k in 0..this.scrolls.length()) {
+            if (this.scrolls.items[k].id == id) {
+                return k;
+            }
+        }
+        return null;
+    }
+
+    /// The child offset for a scroll container being declared (Clay_GetScrollOffset), creating its state.
+    fn scrollOffsetFor(borrow mut this, id: u32, clip: Clip) -> Vec2 {
+        match (this.scrollSlot(id)) {
+            Some(k) => {
+                this.scrolls.items[k].openThisFrame = true;
+                this.scrolls.items[k].horizontal = clip.horizontal;
+                this.scrolls.items[k].vertical = clip.vertical;
+                return this.scrolls.items[k].position;
+            }
+            null => {
+                let fresh = ScrollState {
+                    id: id,
+                    position: Vec2.zero(),
+                    momentum: Vec2.zero(),
+                    scrollOrigin: Vec2 { x: -1.0, y: -1.0 },
+                    pointerOrigin: Vec2.zero(),
+                    pointerActive: false,
+                    momentumTime: 0.0,
+                    content: Dims { w: 0.0, h: 0.0 },
+                    size: Dims { w: 0.0, h: 0.0 },
+                    area: Rect.zero(),
+                    horizontal: clip.horizontal,
+                    vertical: clip.vertical,
+                    openThisFrame: true,
+                };
+                this.scrolls.push(fresh);
+                return Vec2.zero();
+            }
+        }
+    }
+
+    /// Clay_UpdateScrollContainers with drag scrolling enabled: momentum, then wheel and drag on the deepest
+    /// hovered scroll container.
+    fn updateScrollContainers(borrow mut this, wheel: Vec2, dt: f32) {
+        let pointerActive = this.pointerState.down;
+        var best: usize? = null;
+        var bestDepth: usize = 0;
+        for (k in 0..this.scrolls.length()) {
+            this.scrolls.items[k].openThisFrame = false;
+            var s = this.scrolls.items[k];
+            if (!pointerActive && s.pointerActive) {
+                let xDiff = s.position.x - s.scrollOrigin.x;
+                if (xDiff < -10.0 || xDiff > 10.0) {
+                    s.momentum.x = xDiff / (s.momentumTime * 25.0);
+                }
+                let yDiff = s.position.y - s.scrollOrigin.y;
+                if (yDiff < -10.0 || yDiff > 10.0) {
+                    s.momentum.y = yDiff / (s.momentumTime * 25.0);
+                }
+                s.pointerActive = false;
+                s.pointerOrigin = Vec2.zero();
+                s.scrollOrigin = Vec2.zero();
+                s.momentumTime = 0.0;
+            }
+            let scrolled = wheel.x != 0.0 || wheel.y != 0.0;
+            s.position.x += s.momentum.x;
+            s.momentum.x *= 0.95;
+            if ((s.momentum.x > -0.1 && s.momentum.x < 0.1) || scrolled) {
+                s.momentum.x = 0.0;
+            }
+            s.position.x = s.position.x.max(-(s.content.w - s.size.w).max(0.0)).min(0.0);
+            s.position.y += s.momentum.y;
+            s.momentum.y *= 0.95;
+            if ((s.momentum.y > -0.1 && s.momentum.y < 0.1) || scrolled) {
+                s.momentum.y = 0.0;
+            }
+            s.position.y = s.position.y.max(-(s.content.h - s.size.h).max(0.0)).min(0.0);
+            this.scrolls.items[k] = s;
+            // The deepest scroll container under the pointer gets the wheel and the drag.
+            for (j in 0..this.tree.pointerOverCount()) {
+                if (this.tree.pointerOverAt(j) == s.id && (best == null || j >= bestDepth)) {
+                    best = k;
+                    bestDepth = j;
+                }
+            }
+        }
+        match (best) {
+            Some(k) => {
+                var s = this.scrolls.items[k];
+                let canV = s.vertical && s.content.h > s.size.h;
+                let canH = s.horizontal && s.content.w > s.size.w;
+                if (canV) {
+                    s.position.y += wheel.y * 10.0;
+                }
+                if (canH) {
+                    s.position.x += wheel.x * 10.0;
+                }
+                if (pointerActive) {
+                    s.momentum = Vec2.zero();
+                    let p = this.pointerState.position;
+                    if (!s.pointerActive) {
+                        s.pointerOrigin = p;
+                        s.scrollOrigin = s.position;
+                        s.pointerActive = true;
+                    } else {
+                        var dx: f32 = 0.0;
+                        var dy: f32 = 0.0;
+                        if (canH) {
+                            let old = s.position.x;
+                            s.position.x = (s.scrollOrigin.x + (p.x - s.pointerOrigin.x)).min(0.0).max(
+                                -(s.content.w - s.area.w),
+                            );
+                            dx = s.position.x - old;
+                        }
+                        if (canV) {
+                            let old = s.position.y;
+                            s.position.y = (s.scrollOrigin.y + (p.y - s.pointerOrigin.y)).min(0.0).max(
+                                -(s.content.h - s.area.h),
+                            );
+                            dy = s.position.y - old;
+                        }
+                        if (dx > -0.1 && dx < 0.1 && dy > -0.1 && dy < 0.1 && s.momentumTime > 0.15) {
+                            s.momentumTime = 0.0;
+                            s.pointerOrigin = p;
+                            s.scrollOrigin = s.position;
+                        } else {
+                            s.momentumTime += dt;
+                        }
+                    }
+                }
+                if (canV) {
+                    s.position.y = s.position.y.min(0.0).max(-(s.content.h - s.size.h));
+                }
+                if (canH) {
+                    s.position.x = s.position.x.min(0.0).max(-(s.content.w - s.size.w));
+                }
+                this.scrolls.items[k] = s;
+            }
+            null => {}
+        }
+    }
+}
+
+/// Sends `ui`'s commands to any backend, by bound rather than `dyn`: backends with region parameters (such as the
+/// software `Raster`, which borrows its memory) cannot become `dyn` values (ADR 0054), but implement the interface.
+public fn renderInto<B: Backend>(ui: borrow Ui, backend: borrow mut B) {
+    for (i in 0..ui.commandCount()) {
+        let command = ui.commandAt(i);
+        backend.draw(command, ui.textOf(command));
+    }
+}
+
+/// Sends a `LayoutTree`'s commands to any backend (for code that drives the engine without a `Ui`).
+public fn renderTree<B: Backend>(tree: borrow LayoutTree, backend: borrow mut B) {
+    for (i in 0..tree.commandCount()) {
+        let command = tree.command(i);
+        match (command) {
+            Command.Text(_, run) => { backend.draw(command, tree.textBytes(run)); }
+            _ => {
+                backend.draw(
+                    command,
+                    tree.textBytes(
+                        TextRun {
+                            start: 0,
+                            length: 0,
+                            color: Color.hex(0),
+                            fontId: 0,
+                            fontSize: 0.0,
+                            letterSpacing: 0.0,
+                            lineHeight: 0.0,
+                        },
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Ends the frame: lays out, keeps what scrolling needs, and shows the cursor the hovered elements asked for.
+public fn endFrame<M: TextMetrics>(
+    ui: borrow mut Ui,
+    platform: borrow mut dyn Platform,
+    metrics: borrow M,
+) -> Result<void, AllocError> {
+    let result = endLayout(mut ui.tree, metrics);
+    // Scroll containers that were declared this frame record their size and content; the rest go away.
+    var k: usize = 0;
+    while (k < ui.scrolls.length()) {
+        let state = ui.scrolls.items[k];
+        if (!state.openThisFrame) {
+            let last = ui.scrolls.length() - 1;
+            ui.scrolls.items[k] = ui.scrolls.items[last];
+            ui.scrolls.pop();
+            continue;
+        }
+        match (ui.tree.scrollExtent(state.id)) {
+            Some(e) => {
+                ui.scrolls.items[k].size = e.size;
+                ui.scrolls.items[k].content = e.content;
+                ui.scrolls.items[k].area = e.area;
+            }
+            null => {}
+        }
+        k += 1;
+    }
+    platform.setCursor(ui.cursorWanted);
+    // ClayWind_EndControls: Tab / Shift-Tab move focus through the controls registered this frame.
+    let count = ui.focusables.length();
+    if (ui.keyPressed(Key.Tab) && count > 0) {
+        var index: usize? = null;
+        for (i in 0..count) {
+            if (ui.focusables.get(i) == ui.focusedId) {
+                index = i;
+                break;
+            }
+        }
+        let back = ui.shiftDown();
+        let next = match (index) {
+            Some(i) => if (back) (i + count - 1) % count else (i + 1) % count,
+            null => if (back) count - 1 else 0,
+        };
+        ui.focusedId = ui.focusables.get(next);
+    }
+    return result;
+}

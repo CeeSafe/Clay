@@ -1,0 +1,821 @@
+// SPDX-License-Identifier: MIT
+// The C ClayWind's headless geometry tests (tests/layout_test.c), ported case for case: same trees, same expected
+// numbers, same 0.5px tolerance. Transitions (Phase 3) and the framebuffer gradient (Phase 4) are ported with
+// those phases.
+
+import claywind;
+
+@test
+fn justifySpaceModes() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    // Three 100px boxes in a 600px row: between 0/250/500, around 50/250/450, evenly 75/250/425.
+    for (m in 0..3) {
+        t.begin(1000.0, 1000.0);
+        var row = fixedBox(600.0, 100.0);
+        row.layout.alignX = if (m == 0) AxisAlign.Between else if (m == 1) AxisAlign.Around else AxisAlign.Evenly;
+        t.open(hashId("jrow"), row);
+        leaf(mut t, "j0", fixedBox(100.0, 100.0));
+        leaf(mut t, "j1", fixedBox(100.0, 100.0));
+        leaf(mut t, "j2", fixedBox(100.0, 100.0));
+        t.close();
+        finishTree(mut t)?;
+        let x0: f32 = if (m == 0) 0.0 else if (m == 1) 50.0 else 75.0;
+        let x2: f32 = if (m == 0) 500.0 else if (m == 1) 450.0 else 425.0;
+        expect("x0", boxIn(t, "j0").x, x0)?;
+        expect("x1", boxIn(t, "j1").x, 250.0)?;
+        expect("x2", boxIn(t, "j2").x, x2)?;
+    }
+    return Ok();
+}
+
+@test
+fn reverseRowAndColumn() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var row = fixedBox(500.0, 100.0);
+    row.layout.childGap = 20.0;
+    row.layout.reverse = true;
+    t.open(hashId("rrow"), row);
+    leaf(mut t, "r0", fixedBox(100.0, 100.0));
+    leaf(mut t, "r1", fixedBox(100.0, 100.0));
+    leaf(mut t, "r2", fixedBox(100.0, 100.0));
+    t.close();
+    var col = column(SizingAxis.fixed(100.0), SizingAxis.fixed(300.0));
+    col.layout.childGap = 10.0;
+    col.layout.reverse = true;
+    t.open(hashId("rcol"), col);
+    leaf(mut t, "c0", fixedBox(100.0, 50.0));
+    leaf(mut t, "c1", fixedBox(100.0, 50.0));
+    leaf(mut t, "c2", fixedBox(100.0, 50.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("r2 x (first slot)", boxIn(t, "r2").x, 0.0)?;
+    expect("r1 x (middle)", boxIn(t, "r1").x, 120.0)?;
+    expect("r0 x (last slot)", boxIn(t, "r0").x, 240.0)?;
+    let top = boxIn(t, "rcol").y;
+    expect("c2 y (first slot)", boxIn(t, "c2").y - top, 0.0)?;
+    expect("c1 y (middle)", boxIn(t, "c1").y - top, 60.0)?;
+    expect("c0 y (last slot)", boxIn(t, "c0").y - top, 120.0)?;
+    return Ok();
+}
+
+@test
+fn defaultRowAndStretch() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var row = fixedBox(500.0, 100.0);
+    row.layout.childGap = 20.0;
+    t.open(hashId("brow"), row);
+    leaf(mut t, "b0", fixedBox(100.0, 100.0));
+    leaf(mut t, "b1", fixedBox(100.0, 100.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("b0 x", boxIn(t, "b0").x, 0.0)?;
+    expect("b1 x", boxIn(t, "b1").x, 120.0)?;
+
+    t.begin(1000.0, 1000.0);
+    var srow = fixedBox(400.0, 200.0);
+    srow.layout.stretch = true;
+    t.open(hashId("srow"), srow);
+    leaf(mut t, "s_fit", sized(SizingAxis.fixed(100.0), SizingAxis.fit()));
+    leaf(mut t, "s_fixed", fixedBox(100.0, 60.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("fit child stretched h", boxIn(t, "s_fit").h, 200.0)?;
+    expect("fixed child kept h", boxIn(t, "s_fixed").h, 60.0)?;
+    return Ok();
+}
+
+@test
+fn marginsShiftAndShrinkGrowSpace() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("mrow"), fixedBox(500.0, 100.0));
+    var a = fixedBox(100.0, 100.0);
+    a.layout.margin.left = 10.0;
+    a.layout.margin.right = 5.0;
+    leaf(mut t, "ma", a);
+    var b = fixedBox(100.0, 100.0);
+    b.layout.margin.left = 20.0;
+    leaf(mut t, "mb", b);
+    leaf(mut t, "mg", sized(SizingAxis.grow(), SizingAxis.fixed(100.0)));
+    t.close();
+    finishTree(mut t)?;
+    expect("a x (left margin)", boxIn(t, "ma").x, 10.0)?;
+    expect("b x", boxIn(t, "mb").x, 135.0)?;
+    expect("grow x", boxIn(t, "mg").x, 235.0)?;
+    expect("grow width", boxIn(t, "mg").w, 265.0)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("mc"), column(SizingAxis.fixed(200.0), SizingAxis.fixed(300.0)));
+    var c0 = fixedBox(50.0, 50.0);
+    c0.layout.margin.top = 10.0;
+    c0.layout.margin.left = 30.0;
+    leaf(mut t, "mc0", c0);
+    var c1 = fixedBox(50.0, 50.0);
+    c1.layout.margin.top = -20.0;
+    leaf(mut t, "mc1", c1);
+    t.close();
+    finishTree(mut t)?;
+    let top = boxIn(t, "mc").y;
+    expect("c0 y (top margin)", boxIn(t, "mc0").y - top, 10.0)?;
+    expect("c0 x (left margin)", boxIn(t, "mc0").x, 30.0)?;
+    expect("c1 y (negative margin pulls up)", boxIn(t, "mc1").y - top, 40.0)?;
+    return Ok();
+}
+
+@test
+fn translateIsVisualOnly() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("trow"), fixedBox(500.0, 100.0));
+    var a = fixedBox(100.0, 100.0);
+    a.layout.translate = Vec2 { x: 15.0, y: 5.0 };
+    t.open(hashId("t_a"), a);
+    leaf(mut t, "t_child", fixedBox(20.0, 20.0));
+    t.close();
+    leaf(mut t, "t_b", fixedBox(100.0, 100.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("a x shifted", boxIn(t, "t_a").x, 15.0)?;
+    expect("a y shifted", boxIn(t, "t_a").y, 5.0)?;
+    expect("child inherits shift x", boxIn(t, "t_child").x, 15.0)?;
+    expect("child inherits shift y", boxIn(t, "t_child").y, 5.0)?;
+    expect("sibling b unaffected", boxIn(t, "t_b").x, 100.0)?;
+    return Ok();
+}
+
+@test
+fn flexWrapBasics() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var w = sized(SizingAxis.fixed(250.0), SizingAxis.fit());
+    w.layout.childGap = 10.0;
+    w.layout.childGapCross = 20.0;
+    w.layout.wrap = true;
+    t.open(hashId("wrapc"), w);
+    leaf(mut t, "w0", fixedBox(100.0, 30.0));
+    leaf(mut t, "w1", fixedBox(100.0, 30.0));
+    leaf(mut t, "w2", fixedBox(100.0, 30.0));
+    leaf(mut t, "w3", fixedBox(100.0, 30.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("w0 x", boxIn(t, "w0").x, 0.0)?;
+    expect("w0 y", boxIn(t, "w0").y, 0.0)?;
+    expect("w1 x", boxIn(t, "w1").x, 110.0)?;
+    expect("w1 y", boxIn(t, "w1").y, 0.0)?;
+    expect("w2 x", boxIn(t, "w2").x, 0.0)?;
+    expect("w2 y", boxIn(t, "w2").y, 50.0)?;
+    expect("w3 x", boxIn(t, "w3").x, 110.0)?;
+    expect("w3 y", boxIn(t, "w3").y, 50.0)?;
+    expect("container height", boxIn(t, "wrapc").h, 80.0)?;
+    return Ok();
+}
+
+@test
+fn flexWrapJustifyPerLine() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    for (m in 0..3) {
+        t.begin(1000.0, 1000.0);
+        var w = sized(SizingAxis.fixed(250.0), SizingAxis.fit());
+        w.layout.childGap = 10.0;
+        w.layout.wrap = true;
+        w.layout.alignX = if (m == 0) AxisAlign.Center else if (m == 1) AxisAlign.Between else AxisAlign.End;
+        t.open(hashId("wj"), w);
+        leaf(mut t, "wj0", fixedBox(100.0, 30.0));
+        leaf(mut t, "wj1", fixedBox(100.0, 30.0));
+        leaf(mut t, "wj2", fixedBox(100.0, 30.0));
+        t.close();
+        finishTree(mut t)?;
+        let want0: f32 = if (m == 0) 20.0 else if (m == 1) 0.0 else 40.0;
+        let want1: f32 = if (m == 0) 130.0 else 150.0;
+        let want2: f32 = if (m == 0) 75.0 else if (m == 1) 0.0 else 150.0;
+        expect("wj0 x", boxIn(t, "wj0").x, want0)?;
+        expect("wj1 x", boxIn(t, "wj1").x, want1)?;
+        expect("wj2 x (line 2)", boxIn(t, "wj2").x, want2)?;
+    }
+    return Ok();
+}
+
+@test
+fn flexWrapCrossAlignWithinLine() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    for (m in 0..2) {
+        t.begin(1000.0, 1000.0);
+        var w = fixedBox(250.0, 300.0);
+        w.layout.childGap = 10.0;
+        w.layout.childGapCross = 5.0;
+        w.layout.wrap = true;
+        w.layout.alignY = if (m == 0) AxisAlign.Center else AxisAlign.End;
+        t.open(hashId("wa"), w);
+        leaf(mut t, "wa0", fixedBox(100.0, 30.0));
+        leaf(mut t, "wa1", fixedBox(100.0, 50.0));
+        leaf(mut t, "wa2", fixedBox(100.0, 20.0));
+        t.close();
+        finishTree(mut t)?;
+        expect("wa0 y", boxIn(t, "wa0").y, if (m == 0) 10.0 else 20.0)?;
+        expect("wa1 y", boxIn(t, "wa1").y, 0.0)?;
+        expect("wa2 y (line 2)", boxIn(t, "wa2").y, 55.0)?;
+    }
+    return Ok();
+}
+
+@test
+fn flexWrapReverseAndMargins() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var w = sized(SizingAxis.fixed(250.0), SizingAxis.fit());
+    w.layout.childGap = 10.0;
+    w.layout.wrap = true;
+    w.layout.reverse = true;
+    t.open(hashId("wr"), w);
+    leaf(mut t, "wr0", fixedBox(100.0, 30.0));
+    leaf(mut t, "wr1", fixedBox(100.0, 30.0));
+    leaf(mut t, "wr2", fixedBox(100.0, 30.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("reverse wr1 x", boxIn(t, "wr1").x, 0.0)?;
+    expect("reverse wr0 x", boxIn(t, "wr0").x, 110.0)?;
+    expect("reverse wr2 x", boxIn(t, "wr2").x, 0.0)?;
+    expect("reverse wr2 y", boxIn(t, "wr2").y, 30.0)?;
+
+    t.begin(1000.0, 1000.0);
+    var wm = sized(SizingAxis.fixed(250.0), SizingAxis.fit());
+    wm.layout.wrap = true;
+    t.open(hashId("wm"), wm);
+    var m0 = fixedBox(100.0, 30.0);
+    m0.layout.margin = Sides { top: 5.0, right: 10.0, bottom: 0.0, left: 10.0 };
+    leaf(mut t, "wm0", m0);
+    var m1 = fixedBox(100.0, 30.0);
+    m1.layout.margin = Sides { top: 0.0, right: 10.0, bottom: 0.0, left: 10.0 };
+    leaf(mut t, "wm1", m1);
+    leaf(mut t, "wm2", m1);
+    t.close();
+    finishTree(mut t)?;
+    expect("margin wm0 x", boxIn(t, "wm0").x, 10.0)?;
+    expect("margin wm0 y", boxIn(t, "wm0").y, 5.0)?;
+    expect("margin wm1 x", boxIn(t, "wm1").x, 130.0)?;
+    expect("margin wm2 x (wrapped)", boxIn(t, "wm2").x, 10.0)?;
+    expect("margin wm2 y", boxIn(t, "wm2").y, 35.0)?;
+    expect("margin container h", boxIn(t, "wm").h, 65.0)?;
+    return Ok();
+}
+
+@test
+fn flexWrapColumn() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var c = column(SizingAxis.fit(), SizingAxis.fixed(100.0));
+    c.layout.childGap = 10.0;
+    c.layout.childGapCross = 20.0;
+    c.layout.wrap = true;
+    t.open(hashId("wc"), c);
+    leaf(mut t, "wc0", fixedBox(40.0, 40.0));
+    leaf(mut t, "wc1", fixedBox(40.0, 40.0));
+    leaf(mut t, "wc2", fixedBox(40.0, 40.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("wc0 y", boxIn(t, "wc0").y, 0.0)?;
+    expect("wc1 y", boxIn(t, "wc1").y, 50.0)?;
+    expect("wc2 x (col2)", boxIn(t, "wc2").x, 60.0)?;
+    expect("wc2 y (col2 top)", boxIn(t, "wc2").y, 0.0)?;
+    return Ok();
+}
+
+@test
+fn flexWrapNotSqueezed() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("sq"), column(SizingAxis.fixed(300.0), SizingAxis.fixed(100.0)));
+    var c = column(SizingAxis.grow(), SizingAxis.fit());
+    c.layout.childGap = 8.0;
+    c.layout.wrap = true;
+    t.open(hashId("sq_col"), c);
+    leaf(mut t, "sq0", fixedBox(60.0, 26.0));
+    leaf(mut t, "sq1", fixedBox(60.0, 26.0));
+    leaf(mut t, "sq2", fixedBox(60.0, 26.0));
+    t.close();
+    leaf(mut t, "sq_more", fixedBox(10.0, 80.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("column keeps its full height", boxIn(t, "sq_col").h, 94.0)?;
+    expect("children stay in one column", boxIn(t, "sq2").x, boxIn(t, "sq0").x)?;
+    expect("sq2 below sq1", boxIn(t, "sq2").y, 68.0)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("rq"), column(SizingAxis.fixed(250.0), SizingAxis.fixed(60.0)));
+    var r = sized(SizingAxis.grow(), SizingAxis.fit());
+    r.layout.childGap = 10.0;
+    r.layout.childGapCross = 10.0;
+    r.layout.wrap = true;
+    t.open(hashId("rq_row"), r);
+    leaf(mut t, "rq0", fixedBox(100.0, 26.0));
+    leaf(mut t, "rq1", fixedBox(100.0, 26.0));
+    leaf(mut t, "rq2", fixedBox(100.0, 26.0));
+    t.close();
+    leaf(mut t, "rq_after", fixedBox(10.0, 40.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("row keeps 2 lines of height", boxIn(t, "rq_row").h, 62.0)?;
+    expect("next sibling below both lines", boxIn(t, "rq_after").y, 62.0)?;
+    return Ok();
+}
+
+@test
+fn flexWrapSizing() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var g = fixedBox(250.0, 200.0);
+    g.layout.childGap = 10.0;
+    g.layout.wrap = true;
+    t.open(hashId("wg"), g);
+    leaf(mut t, "wg0", fixedBox(100.0, 40.0));
+    leaf(mut t, "wg1", sized(SizingAxis.fixed(100.0), SizingAxis.grow()));
+    leaf(mut t, "wg2", sized(SizingAxis.growBetween(60.0, 0.0), SizingAxis.fixed(30.0)));
+    t.close();
+    finishTree(mut t)?;
+    expect("off-axis grow = line height", boxIn(t, "wg1").h, 40.0)?;
+    expect("grow child wraps to line 2", boxIn(t, "wg2").y, 40.0)?;
+    expect("grow child fills its line", boxIn(t, "wg2").w, 250.0)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("wp"), sized(SizingAxis.fixed(250.0), SizingAxis.fit()));
+    var f = sized(SizingAxis.fit(), SizingAxis.fit());
+    f.layout.wrap = true;
+    t.open(hashId("wf"), f);
+    leaf(mut t, "wf0", fixedBox(100.0, 30.0));
+    leaf(mut t, "wf1", fixedBox(100.0, 30.0));
+    leaf(mut t, "wf2", fixedBox(100.0, 30.0));
+    t.close();
+    t.close();
+    finishTree(mut t)?;
+    expect("fit wrap compressed to parent", boxIn(t, "wf").w, 250.0)?;
+    expect("fit wrap: wf2 on line 2", boxIn(t, "wf2").y, 30.0)?;
+    expect("fit wrap height (2 lines)", boxIn(t, "wf").h, 60.0)?;
+    return Ok();
+}
+
+@test
+fn alignContentModes() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    // start, center, end, between, around, evenly, stretch: y of line 1 and line 2.
+    let want1 = [0, 650, 1300, 0, 325, 433, 0];
+    let want2 = [400, 1050, 1700, 1700, 1375, 1267, 1050];
+    for (m in 0..7usize) {
+        t.begin(1000.0, 1000.0);
+        var a = fixedBox(250.0, 200.0);
+        a.layout.childGap = 10.0;
+        a.layout.childGapCross = 10.0;
+        a.layout.wrap = true;
+        a.layout.alignContent = match (m) {
+            0 => AlignContent.Start,
+            1 => AlignContent.Center,
+            2 => AlignContent.End,
+            3 => AlignContent.Between,
+            4 => AlignContent.Around,
+            5 => AlignContent.Evenly,
+            _ => AlignContent.Stretch,
+        };
+        t.open(hashId("ac"), a);
+        leaf(mut t, "ac0", fixedBox(100.0, 30.0));
+        leaf(mut t, "ac1", sized(SizingAxis.fixed(100.0), SizingAxis.grow()));
+        leaf(mut t, "ac2", fixedBox(100.0, 30.0));
+        t.close();
+        finishTree(mut t)?;
+        expect("line 1 y", boxIn(t, "ac0").y, round<f32>(want1[m]) / 10.0)?;
+        expect("line 2 y", boxIn(t, "ac2").y, round<f32>(want2[m]) / 10.0)?;
+    }
+    expect("stretch: grow child fills grown line", boxIn(t, "ac1").h, 95.0)?;
+
+    t.begin(1000.0, 1000.0);
+    var o = fixedBox(250.0, 50.0);
+    o.layout.childGap = 10.0;
+    o.layout.childGapCross = 10.0;
+    o.layout.wrap = true;
+    o.layout.alignContent = AlignContent.Evenly;
+    t.open(hashId("ao"), o);
+    leaf(mut t, "ao0", fixedBox(100.0, 30.0));
+    leaf(mut t, "ao1", fixedBox(100.0, 30.0));
+    leaf(mut t, "ao2", fixedBox(100.0, 30.0));
+    t.close();
+    t.setCulling(false);
+    finishTree(mut t)?;
+    expect("overflow evenly -> centered", boxIn(t, "ao0").y, -10.0)?;
+
+    t.begin(1000.0, 1000.0);
+    var c = column(SizingAxis.fixed(200.0), SizingAxis.fixed(100.0));
+    c.layout.childGap = 10.0;
+    c.layout.wrap = true;
+    c.layout.alignContent = AlignContent.Between;
+    t.open(hashId("acc"), c);
+    leaf(mut t, "acc0", fixedBox(40.0, 40.0));
+    leaf(mut t, "acc1", fixedBox(40.0, 40.0));
+    leaf(mut t, "acc2", fixedBox(40.0, 40.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("column between: col 1 x", boxIn(t, "acc0").x, 0.0)?;
+    expect("column between: col 2 x", boxIn(t, "acc2").x, 160.0)?;
+    return Ok();
+}
+
+@test
+fn relayoutColumnEstimate() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("ra"), sized(SizingAxis.fit(), SizingAxis.fit()));
+    var c = column(SizingAxis.fit(), SizingAxis.fixed(100.0));
+    c.layout.childGap = 10.0;
+    c.layout.childGapCross = 20.0;
+    c.layout.wrap = true;
+    t.open(hashId("ra_col"), c);
+    leaf(mut t, "ra0", fixedBox(40.0, 40.0));
+    leaf(mut t, "ra1", fixedBox(40.0, 40.0));
+    leaf(mut t, "ra2", fixedBox(40.0, 40.0));
+    t.close();
+    leaf(mut t, "ra_next", fixedBox(30.0, 30.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("column width = 2 columns + gap", boxIn(t, "ra_col").w, 100.0)?;
+    expect("sibling placed after the columns", boxIn(t, "ra_next").x, 100.0)?;
+    expect("parent row fits both", boxIn(t, "ra").w, 130.0)?;
+    return Ok();
+}
+
+@test
+fn relayoutGrowColumn() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("rb"), fixedBox(400.0, 100.0));
+    var c = column(SizingAxis.fit(), SizingAxis.grow());
+    c.layout.childGap = 10.0;
+    c.layout.wrap = true;
+    t.open(hashId("rb_col"), c);
+    leaf(mut t, "rb0", fixedBox(40.0, 40.0));
+    leaf(mut t, "rb1", fixedBox(40.0, 40.0));
+    leaf(mut t, "rb2", fixedBox(40.0, 40.0));
+    t.close();
+    leaf(mut t, "rb_next", fixedBox(30.0, 30.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("grown column height", boxIn(t, "rb_col").h, 100.0)?;
+    expect("rb2 in column 2", boxIn(t, "rb2").x, 40.0)?;
+    expect("column widened to 2 columns", boxIn(t, "rb_col").w, 80.0)?;
+    expect("sibling after the widened column", boxIn(t, "rb_next").x, 80.0)?;
+    return Ok();
+}
+
+@test
+fn relayoutColumnCrossGrow() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var c = column(SizingAxis.fit(), SizingAxis.fixed(100.0));
+    c.layout.childGap = 10.0;
+    c.layout.wrap = true;
+    t.open(hashId("rc"), c);
+    leaf(mut t, "rc0", fixedBox(60.0, 40.0));
+    leaf(mut t, "rc1", sized(SizingAxis.grow(), SizingAxis.fixed(40.0)));
+    leaf(mut t, "rc2", fixedBox(90.0, 40.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("grow child = its column's width", boxIn(t, "rc1").w, 60.0)?;
+    expect("column 2 x", boxIn(t, "rc2").x, 60.0)?;
+    expect("container = both columns", boxIn(t, "rc").w, 150.0)?;
+    return Ok();
+}
+
+@test
+fn relayoutTextHeights() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("rt"), sized(SizingAxis.fit(), SizingAxis.fit()));
+    var c = column(SizingAxis.fit(), SizingAxis.fixed(100.0));
+    c.layout.childGap = 10.0;
+    c.layout.wrap = true;
+    t.open(hashId("rt_col"), c);
+    t.open(hashId("rt0"), sized(SizingAxis.fixed(20.0), SizingAxis.fit()));
+    text16(mut t, "aa aa aa aa");
+    t.close();
+    leaf(mut t, "rt1", fixedBox(20.0, 40.0));
+    t.close();
+    leaf(mut t, "rt_next", fixedBox(30.0, 30.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("wrapped text height", boxIn(t, "rt0").h, 64.0)?;
+    expect("rt1 moved to column 2", boxIn(t, "rt1").x, 20.0)?;
+    expect("rt1 at top of column 2", boxIn(t, "rt1").y, 0.0)?;
+    expect("column width = 2 columns", boxIn(t, "rt_col").w, 40.0)?;
+    expect("sibling after both columns", boxIn(t, "rt_next").x, 40.0)?;
+    return Ok();
+}
+
+@test
+fn relayoutAspect() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("rs"), fixedBox(400.0, 100.0));
+    var a = sized(SizingAxis.grow(), SizingAxis.grow());
+    a.aspectRatio = 1.0;
+    leaf(mut t, "rs_box", a);
+    leaf(mut t, "rs_next", sized(SizingAxis.grow(), SizingAxis.fixed(30.0)));
+    t.close();
+    finishTree(mut t)?;
+    expect("aspect box height (row height)", boxIn(t, "rs_box").h, 100.0)?;
+    expect("aspect box width = height", boxIn(t, "rs_box").w, 100.0)?;
+    expect("sibling right after the box", boxIn(t, "rs_next").x, 100.0)?;
+    expect("grow sibling takes the freed width", boxIn(t, "rs_next").w, 300.0)?;
+    return Ok();
+}
+
+@test
+fn basisAndShrink() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("bs"), fixedBox(200.0, 50.0));
+    var b0 = Decl.of();
+    b0.layout.basis = 200.0;
+    leaf(mut t, "bs0", b0);
+    var b1 = Decl.of();
+    b1.layout.basis = 100.0;
+    leaf(mut t, "bs1", b1);
+    t.close();
+    finishTree(mut t)?;
+    expect("weighted shrink (basis 200)", boxIn(t, "bs0").w, 133.3)?;
+    expect("weighted shrink (basis 100)", boxIn(t, "bs1").w, 66.7)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("bn"), fixedBox(200.0, 50.0));
+    var n0 = Decl.of();
+    n0.layout.basis = 150.0;
+    n0.layout.noShrink = true;
+    leaf(mut t, "bn0", n0);
+    var n1 = Decl.of();
+    n1.layout.basis = 150.0;
+    leaf(mut t, "bn1", n1);
+    t.close();
+    finishTree(mut t)?;
+    expect("shrink-0 keeps basis", boxIn(t, "bn0").w, 150.0)?;
+    expect("sibling absorbs overflow", boxIn(t, "bn1").w, 50.0)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("bg"), fixedBox(400.0, 50.0));
+    var g0 = Decl.of();
+    g0.layout.width = SizingAxis.grow();
+    g0.layout.basis = 100.0;
+    leaf(mut t, "bg0", g0);
+    var g1 = Decl.of();
+    g1.layout.width = SizingAxis.grow();
+    g1.layout.basis = 200.0;
+    leaf(mut t, "bg1", g1);
+    t.close();
+    finishTree(mut t)?;
+    expect("grow from basis 100", boxIn(t, "bg0").w, 150.0)?;
+    expect("grow from basis 200", boxIn(t, "bg1").w, 250.0)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("bc"), column(SizingAxis.fixed(100.0), SizingAxis.fit()));
+    var c0 = sized(SizingAxis.fixed(50.0), SizingAxis.fitBetween(0.0, 70.0));
+    c0.layout.basis = 120.0;
+    leaf(mut t, "bc0", c0);
+    leaf(mut t, "bc1", fixedBox(50.0, 10.0));
+    t.close();
+    finishTree(mut t)?;
+    expect("column basis (clamped to max-h)", boxIn(t, "bc0").h, 70.0)?;
+    expect("column sums basis", boxIn(t, "bc").h, 80.0)?;
+
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("bt"), sized(SizingAxis.fixed(100.0), SizingAxis.fit()));
+    var t0 = Decl.of();
+    t0.layout.noShrink = true;
+    t.open(hashId("bt0"), t0);
+    text16(mut t, "aa aa aa");
+    t.close();
+    t.open(hashId("bt1"), Decl.of());
+    text16(mut t, "bb bb bb");
+    t.close();
+    t.close();
+    finishTree(mut t)?;
+    expect("shrink-0 text keeps width", boxIn(t, "bt0").w, 80.0)?;
+    expect("other child compressed", boxIn(t, "bt1").w, 20.0)?;
+    return Ok();
+}
+
+@test
+fn insetAnchorsViaFloating() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("ip"), fixedBox(200.0, 100.0));
+    var br = fixedBox(20.0, 10.0);
+    br.floating.attachTo = AttachTo.Parent;
+    br.floating.offset = Vec2 { x: -5.0, y: -8.0 };
+    br.floating.element = AttachPoint.RightBottom;
+    br.floating.parent = AttachPoint.RightBottom;
+    leaf(mut t, "ibr", br);
+    var tr = fixedBox(20.0, 10.0);
+    tr.floating.attachTo = AttachTo.Parent;
+    tr.floating.offset = Vec2 { x: 0.0, y: 4.0 };
+    tr.floating.element = AttachPoint.RightTop;
+    tr.floating.parent = AttachPoint.RightTop;
+    leaf(mut t, "itr", tr);
+    t.close();
+    finishTree(mut t)?;
+    expect("bottom-right x (right-5)", boxIn(t, "ibr").x, 175.0)?;
+    expect("bottom-right y (bottom-8)", boxIn(t, "ibr").y, 82.0)?;
+    expect("top-right x (right-0)", boxIn(t, "itr").x, 180.0)?;
+    expect("top-right y (top-4)", boxIn(t, "itr").y, 4.0)?;
+    return Ok();
+}
+
+@test
+fn textSitsAtThePadding() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var p = Decl.of();
+    p.layout.padding = Sides { top: 4.0, right: 12.0, bottom: 4.0, left: 12.0 };
+    t.open(hashId("tp"), p);
+    var big = TextConfig.of(18.0);
+    big.letterSpacing = 1.0;
+    t.text("layout".bytes(), big);
+    t.close();
+    var c = column(SizingAxis.fit(), SizingAxis.fit());
+    c.layout.padding = Sides { top: 6.0, right: 8.0, bottom: 6.0, left: 8.0 };
+    c.layout.childGap = 2.0;
+    t.open(hashId("tc"), c);
+    var small = TextConfig.of(14.0);
+    small.fontId = 4;
+    small.letterSpacing = 2.0;
+    small.lineHeight = 20.0;
+    t.text("one".bytes(), small);
+    t.text("two".bytes(), small);
+    t.close();
+    finishTree(mut t)?;
+    var xs = [-1.0f32, -1.0, -1.0];
+    var ys = [-1.0f32, -1.0, -1.0];
+    var k: usize = 0;
+    for (i in 0..t.commandCount()) {
+        match (t.command(i)) {
+            Command.Text(area, _) => {
+                if (k < 3) {
+                    xs[k] = area.x;
+                    ys[k] = area.y;
+                    k += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let pb = boxIn(t, "tp");
+    let cb = boxIn(t, "tc");
+    expect("row box height = text + padding", pb.h, 24.0)?;
+    expect("row text x = padding.left", xs[0] - pb.x, 12.0)?;
+    expect("row text y = padding.top", ys[0] - pb.y, 4.0)?;
+    expect("column text 1 x = padding.left", xs[1] - cb.x, 8.0)?;
+    expect("column text 1 y = padding.top + 2", ys[1] - cb.y, 8.0)?;
+    expect("column text 2 y = line 1 + gap + 2", ys[2] - cb.y, 30.0)?;
+    return Ok();
+}
+
+@test
+fn lineClampEllipsizes() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("clampbox"), sized(SizingAxis.fixed(100.0), SizingAxis.fit()));
+    var config = TextConfig.of(16.0);
+    config.lineClamp = 2;
+    t.text("one two three four five six seven eight nine ten eleven twelve".bytes(), config);
+    t.close();
+    finishTree(mut t)?;
+    expect("clamped to 2 lines (height)", boxIn(t, "clampbox").h, 32.0)?;
+    var ellipsis = false;
+    for (i in 0..t.commandCount()) {
+        match (t.command(i)) {
+            Command.Text(_, run) => {
+                let s = t.textBytes(run);
+                if (s.length >= 3 && s[s.length - 1] == '.' && s[s.length - 2] == '.' && s[s.length - 3] == '.') {
+                    ellipsis = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    return Check.isTrue(ellipsis, "last clamped line ends in an ellipsis");
+}
+
+@test
+fn containerQueriesReadThePreviousFrame() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    Check.isTrue(t.boxOf(hashId("cq_never")) == null, "unknown container is not found")?;
+    t.begin(1000.0, 1000.0);
+    leaf(mut t, "cq", fixedBox(300.0, 120.0));
+    finishTree(mut t)?;
+    t.begin(1000.0, 1000.0);
+    let previous = boxIn(t, "cq");
+    leaf(mut t, "cq", fixedBox(300.0, 120.0));
+    finishTree(mut t)?;
+    expect("prev-frame width mid-build", previous.w, 300.0)?;
+    expect("prev-frame height mid-build", previous.h, 120.0)?;
+    return Ok();
+}
+
+@test
+fn itemsBaseline() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var row = fixedBox(400.0, 80.0);
+    row.layout.alignY = AxisAlign.Baseline;
+    row.layout.childGap = 10.0;
+    t.open(hashId("brow"), row);
+    var bigText = TextConfig.of(40.0);
+    bigText.lineHeight = 40.0;
+    var smallText = TextConfig.of(20.0);
+    smallText.lineHeight = 20.0;
+    t.open(hashId("bl-big"), Decl.of());
+    t.text("Big".bytes(), bigText);
+    t.close();
+    t.open(hashId("bl-small"), Decl.of());
+    t.text("small".bytes(), smallText);
+    t.close();
+    t.close();
+    finishTree(mut t)?;
+    let row1 = boxIn(t, "brow");
+    let big = boxIn(t, "bl-big");
+    let small = boxIn(t, "bl-small");
+    expect("big box height", big.h, 40.0)?;
+    expect("small box height", small.h, 20.0)?;
+    expect("big top at row top", big.y - row1.y, 0.0)?;
+    expect("small top dropped", small.y - row1.y, 16.0)?;
+    expect("baselines aligned", (big.y + 32.0) - (small.y + 16.0), 0.0)?;
+
+    // With a registered metric (0.75 x font size) the drop is 15, not the synthesized 16.
+    t.begin(1000.0, 1000.0);
+    var mrow = fixedBox(400.0, 80.0);
+    mrow.layout.alignY = AxisAlign.Baseline;
+    t.open(hashId("mrow"), mrow);
+    t.open(hashId("m-big"), Decl.of());
+    t.text("Big".bytes(), bigText);
+    t.close();
+    t.open(hashId("m-small"), Decl.of());
+    t.text("small".bytes(), smallText);
+    t.close();
+    t.close();
+    let metric = MetricMeasure { unused: 0 };
+    let ended = match (endLayout(mut t, metric)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    Check.isTrue(ended, "frame fits")?;
+    let row2 = boxIn(t, "mrow");
+    let mbig = boxIn(t, "m-big");
+    let msmall = boxIn(t, "m-small");
+    expect("metric: big at row top", mbig.y - row2.y, 0.0)?;
+    expect("metric: small dropped 15", msmall.y - row2.y, 15.0)?;
+    expect("metric: baselines aligned", (mbig.y + 30.0) - (msmall.y + 15.0), 0.0)?;
+    return Ok();
+}

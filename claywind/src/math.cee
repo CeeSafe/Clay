@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: MIT
+// Elementary functions CeeSafe does not provide yet (it has sqrt/floor/ceil/abs/min/max only): sin, cos, tan, atan,
+// atan2, exp, ln, log2, pow, plus the interpolation helpers layout and transitions use, and CSS cubic-bezier easing.
+//
+// Computed in f64 with range reduction and short polynomials; every function here is accurate to well under 1e-7
+// relative error on the ranges ClayWind uses (angles, gradient stops, easing, blur kernels), which is below f32's
+// resolution. The public API is f32, the type layout and rendering use; `Math64` exposes the f64 versions.
+
+public const PI: f32 = 3.14159265358979323846;
+public const TAU: f32 = 6.28318530717958647692;
+
+const PI64: f64 = 3.14159265358979323846;
+const HALF_PI64: f64 = 1.57079632679489661923;
+const QUARTER_PI64: f64 = 0.78539816339744830962;
+const TAU64: f64 = 6.28318530717958647692;
+const LN2_64: f64 = 0.69314718055994530942;
+const SQRT2_64: f64 = 1.41421356237309504880;
+/// tan(pi/8): below it the atan series converges fast.
+const TAN_PI_8: f64 = 0.41421356237309504880;
+
+/// The f64 implementations.
+public struct Math64 {
+    /// Reduces `x` to [-pi, pi].
+    public fn wrapAngle(x: f64) -> f64 {
+        if (x >= -PI64 && x <= PI64) {
+            return x;
+        }
+        let k = (x / TAU64 + 0.5).floor();
+        return x - k * TAU64;
+    }
+
+    /// Sine. Reduced to [-pi/2, pi/2], then the Taylor series to x^21.
+    public fn sin(x: f64) -> f64 {
+        if (x != x) {
+            return x; // NaN
+        }
+        var a = Math64.wrapAngle(x);
+        if (a > HALF_PI64) {
+            a = PI64 - a;
+        } else if (a < -HALF_PI64) {
+            a = -PI64 - a;
+        }
+        let a2 = a * a;
+        // Horner form of a - a^3/3! + a^5/5! - ... + a^21/21! (error < 1e-17 on [-pi/2, pi/2]).
+        var p: f64 = 1.0 / 51090942171709440000.0;
+        p = p * a2 - 1.0 / 121645100408832000.0;
+        p = p * a2 + 1.0 / 355687428096000.0;
+        p = p * a2 - 1.0 / 1307674368000.0;
+        p = p * a2 + 1.0 / 6227020800.0;
+        p = p * a2 - 1.0 / 39916800.0;
+        p = p * a2 + 1.0 / 362880.0;
+        p = p * a2 - 1.0 / 5040.0;
+        p = p * a2 + 1.0 / 120.0;
+        p = p * a2 - 1.0 / 6.0;
+        p = p * a2 + 1.0;
+        return a * p;
+    }
+
+    public fn cos(x: f64) -> f64 => Math64.sin(Math64.wrapAngle(x) + HALF_PI64);
+
+    public fn tan(x: f64) -> f64 => Math64.sin(x) / Math64.cos(x);
+
+    /// Arctangent in (-pi/2, pi/2): reduced by atan(x) = pi/2 - atan(1/x) and atan(x) = pi/4 + atan((x-1)/(x+1)),
+    /// then the series to x^21 on |x| <= tan(pi/8) (error < 1e-10).
+    public fn atan(x: f64) -> f64 {
+        if (x != x) {
+            return x;
+        }
+        let negative = x < 0.0;
+        var t = x.abs();
+        var offset: f64 = 0.0;
+        if (t > 1.0) {
+            t = 1.0 / t;
+            offset = HALF_PI64;
+        }
+        var inner: f64 = 0.0;
+        if (t > TAN_PI_8) {
+            inner = QUARTER_PI64;
+            t = (t - 1.0) / (t + 1.0);
+        }
+        let t2 = t * t;
+        var p: f64 = 1.0 / 21.0;
+        p = -p * t2 + 1.0 / 19.0;
+        p = -p * t2 + 1.0 / 17.0;
+        p = -p * t2 + 1.0 / 15.0;
+        p = -p * t2 + 1.0 / 13.0;
+        p = -p * t2 + 1.0 / 11.0;
+        p = -p * t2 + 1.0 / 9.0;
+        p = -p * t2 + 1.0 / 7.0;
+        p = -p * t2 + 1.0 / 5.0;
+        p = -p * t2 + 1.0 / 3.0;
+        p = -p * t2 + 1.0;
+        var r = inner + t * p;
+        if (offset != 0.0) {
+            r = offset - r;
+        }
+        return if (negative) -r else r;
+    }
+
+    /// The angle of (x, y) in [-pi, pi], as C's atan2.
+    public fn atan2(y: f64, x: f64) -> f64 {
+        if (x > 0.0) {
+            return Math64.atan(y / x);
+        }
+        if (x < 0.0) {
+            return if (y >= 0.0) Math64.atan(y / x) + PI64 else Math64.atan(y / x) - PI64;
+        }
+        if (y > 0.0) {
+            return HALF_PI64;
+        }
+        if (y < 0.0) {
+            return -HALF_PI64;
+        }
+        return 0.0;
+    }
+
+    /// 2^k for an integer k in [-1022, 1023], built from the exponent bits.
+    fn twoTo(k: i64) -> f64 {
+        let biased = k + 1023;
+        return f64.fromBits((truncate<u64>(biased)) << 52);
+    }
+
+    /// e^x: x = k ln2 + r with |r| <= ln2/2, then the series to r^13 (error < 1e-15) times 2^k.
+    public fn exp(x: f64) -> f64 {
+        if (x != x) {
+            return x;
+        }
+        if (x > 709.0) {
+            return f64.fromBits(0x7FF0000000000000); // +inf
+        }
+        if (x < -708.0) {
+            return 0.0;
+        }
+        let k = (x / LN2_64 + 0.5).floor();
+        let r = x - k * LN2_64;
+        var p: f64 = 1.0 / 6227020800.0;
+        p = p * r + 1.0 / 479001600.0;
+        p = p * r + 1.0 / 39916800.0;
+        p = p * r + 1.0 / 3628800.0;
+        p = p * r + 1.0 / 362880.0;
+        p = p * r + 1.0 / 40320.0;
+        p = p * r + 1.0 / 5040.0;
+        p = p * r + 1.0 / 720.0;
+        p = p * r + 1.0 / 120.0;
+        p = p * r + 1.0 / 24.0;
+        p = p * r + 1.0 / 6.0;
+        p = p * r + 0.5;
+        p = p * r + 1.0;
+        p = p * r + 1.0;
+        return p * Math64.twoTo(truncate<i64>(k));
+    }
+
+    /// Natural logarithm of x > 0 (NaN for x < 0, -inf for 0). x = m 2^e with m in [sqrt(1/2), sqrt(2)), then
+    /// ln m = 2 atanh(s), s = (m-1)/(m+1), |s| < 0.172, series to s^19 (error < 1e-15).
+    public fn ln(x: f64) -> f64 {
+        if (x != x || x < 0.0) {
+            return f64.fromBits(0x7FF8000000000000); // NaN
+        }
+        if (x == 0.0) {
+            return f64.fromBits(0xFFF0000000000000); // -inf
+        }
+        var value = x;
+        var e: i64 = 0;
+        if (value < 2.2250738585072014e-308) {
+            value = value * 18014398509481984.0; // 2^54: subnormals become normal
+            e = -54;
+        }
+        let bits = value.bits();
+        let rawExponent = truncate<i64>((bits >> 52) & 0x7FF);
+        if (rawExponent == 0x7FF) {
+            return x; // +inf
+        }
+        e += rawExponent - 1023;
+        var m = f64.fromBits((bits & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000); // [1, 2)
+        if (m > SQRT2_64) {
+            m = m / 2.0;
+            e += 1;
+        }
+        let s = (m - 1.0) / (m + 1.0);
+        let s2 = s * s;
+        var p: f64 = 1.0 / 19.0;
+        p = p * s2 + 1.0 / 17.0;
+        p = p * s2 + 1.0 / 15.0;
+        p = p * s2 + 1.0 / 13.0;
+        p = p * s2 + 1.0 / 11.0;
+        p = p * s2 + 1.0 / 9.0;
+        p = p * s2 + 1.0 / 7.0;
+        p = p * s2 + 1.0 / 5.0;
+        p = p * s2 + 1.0 / 3.0;
+        p = p * s2 + 1.0;
+        return 2.0 * s * p + round<f64>(e) * LN2_64;
+    }
+
+    public fn log2(x: f64) -> f64 => Math64.ln(x) / LN2_64;
+
+    /// x^y. Negative x is defined only for integral y; 0^y is 0 for y > 0 and 1 for y == 0.
+    public fn pow(x: f64, y: f64) -> f64 {
+        if (y == 0.0) {
+            return 1.0;
+        }
+        if (x == 0.0) {
+            return if (y > 0.0) 0.0 else f64.fromBits(0x7FF0000000000000);
+        }
+        if (x > 0.0) {
+            return Math64.exp(y * Math64.ln(x));
+        }
+        if (y.floor() != y) {
+            return f64.fromBits(0x7FF8000000000000);
+        }
+        let magnitude = Math64.exp(y * Math64.ln(-x));
+        let odd = (y / 2.0).floor() * 2.0 != y;
+        return if (odd) -magnitude else magnitude;
+    }
+}
+
+/// The f32 API.
+public struct Math {
+    public fn sin(x: f32) -> f32 => round<f32>(Math64.sin(x as f64));
+    public fn cos(x: f32) -> f32 => round<f32>(Math64.cos(x as f64));
+    public fn tan(x: f32) -> f32 => round<f32>(Math64.tan(x as f64));
+    public fn atan(x: f32) -> f32 => round<f32>(Math64.atan(x as f64));
+    public fn atan2(y: f32, x: f32) -> f32 => round<f32>(Math64.atan2(y as f64, x as f64));
+    public fn exp(x: f32) -> f32 => round<f32>(Math64.exp(x as f64));
+    public fn ln(x: f32) -> f32 => round<f32>(Math64.ln(x as f64));
+    public fn log2(x: f32) -> f32 => round<f32>(Math64.log2(x as f64));
+    public fn pow(x: f32, y: f32) -> f32 => round<f32>(Math64.pow(x as f64, y as f64));
+
+    public fn radians(degrees: f32) -> f32 => degrees * (PI / 180.0);
+    public fn degrees(radians: f32) -> f32 => radians * (180.0 / PI);
+    public fn hypot(x: f32, y: f32) -> f32 => (x * x + y * y).sqrt();
+    public fn clamp(x: f32, lo: f32, hi: f32) -> f32 => x.max(lo).min(hi);
+    public fn lerp(a: f32, b: f32, t: f32) -> f32 => a + (b - a) * t;
+    /// Hermite smoothstep of `x` between `edge0` and `edge1`.
+    public fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+        let t = Math.clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
+    }
+    /// Round half away from zero (f32 has floor/ceil only).
+    public fn round(x: f32) -> f32 => if (x >= 0.0) (x + 0.5).floor() else (x - 0.5).ceil();
+}
+
+/// A CSS `cubic-bezier(x1, y1, x2, y2)` timing function, as Tailwind's `ease-*` use.
+public struct CubicBezier {
+    public x1: f32;
+    public y1: f32;
+    public x2: f32;
+    public y2: f32;
+
+    public fn of(x1: f32, y1: f32, x2: f32, y2: f32) -> CubicBezier => CubicBezier { x1: x1, y1: y1, x2: x2, y2: y2 };
+    /// Tailwind `ease-linear`.
+    public fn linear() -> CubicBezier => CubicBezier.of(0.0, 0.0, 1.0, 1.0);
+    /// Tailwind `ease-in`: cubic-bezier(0.4, 0, 1, 1).
+    public fn easeIn() -> CubicBezier => CubicBezier.of(0.4, 0.0, 1.0, 1.0);
+    /// Tailwind `ease-out`: cubic-bezier(0, 0, 0.2, 1).
+    public fn easeOut() -> CubicBezier => CubicBezier.of(0.0, 0.0, 0.2, 1.0);
+    /// Tailwind `ease-in-out` (and the `transition` default): cubic-bezier(0.4, 0, 0.2, 1).
+    public fn easeInOut() -> CubicBezier => CubicBezier.of(0.4, 0.0, 0.2, 1.0);
+
+    /// One coordinate of the curve with control values `c1`, `c2` (end points 0 and 1) at parameter `t`.
+    fn curve(c1: f64, c2: f64, t: f64) -> f64 {
+        let u = 1.0 - t;
+        return 3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t;
+    }
+
+    fn slope(c1: f64, c2: f64, t: f64) -> f64 {
+        let u = 1.0 - t;
+        return 3.0 * u * u * c1 + 6.0 * u * t * (c2 - c1) + 3.0 * t * t * (1.0 - c2);
+    }
+
+    /// The eased progress for linear progress `x` in [0, 1]: solve x(t) = x (Newton, then bisection), return y(t).
+    public fn at(this, x: f32) -> f32 {
+        if (x <= 0.0) {
+            return 0.0;
+        }
+        if (x >= 1.0) {
+            return 1.0;
+        }
+        let px1 = this.x1 as f64;
+        let px2 = this.x2 as f64;
+        let target = x as f64;
+        var t = target;
+        var solved = false;
+        for (i in 0..8) {
+            let err = CubicBezier.curve(px1, px2, t) - target;
+            if (err.abs() < 1e-7) {
+                solved = true;
+                break;
+            }
+            let d = CubicBezier.slope(px1, px2, t);
+            if (d.abs() < 1e-6) {
+                break;
+            }
+            t = t - err / d;
+        }
+        if (!solved || t < 0.0 || t > 1.0) {
+            var lo: f64 = 0.0;
+            var hi: f64 = 1.0;
+            t = target;
+            for (i in 0..40) {
+                let v = CubicBezier.curve(px1, px2, t);
+                if ((v - target).abs() < 1e-7) {
+                    break;
+                }
+                if (v < target) {
+                    lo = t;
+                } else {
+                    hi = t;
+                }
+                t = (lo + hi) / 2.0;
+            }
+        }
+        return round<f32>(CubicBezier.curve(this.y1 as f64, this.y2 as f64, t));
+    }
+}

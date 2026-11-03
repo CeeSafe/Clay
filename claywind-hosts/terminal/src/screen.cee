@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: MIT
+// A truecolor terminal as a ClayWind backend: one layout unit is one character cell. Frames are drawn into a cell
+// grid and only the cells that changed since the last frame are written out.
+
+import claywind.Backend;
+import claywind.TextMetrics;
+import claywind.TextConfig;
+import claywind.Command;
+import claywind.Rect;
+import claywind.Dims;
+import claywind.Color;
+
+struct Cell {
+    ch: u8;
+    fg: Color;
+    bg: Color;
+}
+
+fn sameColor(a: Color, b: Color) -> bool => a.r == b.r && a.g == b.g && a.b == b.b;
+
+fn sameCell(a: Cell, b: Cell) -> bool => a.ch == b.ch && sameColor(a.fg, b.fg) && sameColor(a.bg, b.bg);
+
+/// The terminal's cell grid and its last-written state.
+public struct Screen {
+    cols: usize;
+    rows: usize;
+    cells: Vector<Cell>;
+    shown: Vector<Cell>;
+    clipX0: i32;
+    clipY0: i32;
+    clipX1: i32;
+    clipY1: i32;
+    out: Vector<u8>;
+    fresh: bool;
+
+    public fn create(cols: usize, rows: usize) -> Result<Screen, AllocError> {
+        var s = Screen {
+            cols: cols,
+            rows: rows,
+            cells: Vector<Cell>.create(),
+            shown: Vector<Cell>.create(),
+            clipX0: 0,
+            clipY0: 0,
+            clipX1: 0,
+            clipY1: 0,
+            out: Vector<u8>.create(),
+            fresh: true,
+        };
+        let blank = Cell { ch: ' ', fg: Color.rgb(255, 255, 255), bg: Color.rgb(0, 0, 0) };
+        for (i in 0..cols * rows) {
+            s.cells.push(blank)?;
+            s.shown.push(blank)?;
+        }
+        s.resetClip();
+        return Ok(s);
+    }
+
+    public fn size(borrow this) -> Dims => Dims { w: round<f32>(this.cols), h: round<f32>(this.rows) };
+
+    fn resetClip(borrow mut this) {
+        this.clipX0 = 0;
+        this.clipY0 = 0;
+        this.clipX1 = truncate<i32>(this.cols);
+        this.clipY1 = truncate<i32>(this.rows);
+    }
+
+    /// Writes the changed cells (all of them on the first frame) as one burst of escape sequences.
+    public fn present(borrow mut this) -> Result<void, AllocError> {
+        this.out.clear();
+        var lastFg = Color.rgb(1, 2, 3);
+        var lastBg = Color.rgb(1, 2, 3);
+        var haveColors = false;
+        var cursorAt: usize = this.cols * this.rows + 1; // where the terminal cursor is, as a cell index
+        for (i in 0..this.cells.length) {
+            let c = this.cells[i];
+            if (!this.fresh && sameCell(c, this.shown[i])) {
+                continue;
+            }
+            if (cursorAt != i) {
+                // ESC [ row ; col H, 1-based.
+                appendText(mut this.out, "\u{1b}[")?;
+                appendDecimal(mut this.out, (i / this.cols + 1) as u64)?;
+                this.out.push(';')?;
+                appendDecimal(mut this.out, (i % this.cols + 1) as u64)?;
+                this.out.push('H')?;
+            }
+            if (!haveColors || !sameColor(c.fg, lastFg) || !sameColor(c.bg, lastBg)) {
+                appendText(mut this.out, "\u{1b}[38;2;")?;
+                appendRgb(mut this.out, c.fg)?;
+                appendText(mut this.out, ";48;2;")?;
+                appendRgb(mut this.out, c.bg)?;
+                this.out.push('m')?;
+                lastFg = c.fg;
+                lastBg = c.bg;
+                haveColors = true;
+            }
+            this.out.push(c.ch)?;
+            this.shown[i] = c;
+            cursorAt = i + 1;
+        }
+        this.fresh = false;
+        Console.writeBytes(this.out.view());
+        return Ok();
+    }
+
+    /// The frame as plain characters, one line per row (for tests and `CLAYWIND_ONCE`).
+    public fn plain(borrow this) -> Result<Vector<u8>, AllocError> {
+        var text = Vector<u8>.create();
+        for (y in 0..this.rows) {
+            for (x in 0..this.cols) {
+                text.push(this.cells[y * this.cols + x].ch)?;
+            }
+            text.push('\n')?;
+        }
+        return Ok(text);
+    }
+
+    /// Blanks every cell (the next frame is drawn from scratch; `present` still sends only the changes).
+    public fn clear(borrow mut this) {
+        let blank = Cell { ch: ' ', fg: Color.rgb(255, 255, 255), bg: Color.rgb(0, 0, 0) };
+        for (i in 0..this.cells.length) {
+            this.cells[i] = blank;
+        }
+        this.resetClip();
+    }
+
+    fn fill(borrow mut this, area: Rect, color: Color) {
+        let xs = Screen.cellRange(area.x, area.x + area.w, this.clipX0, this.clipX1);
+        let ys = Screen.cellRange(area.y, area.y + area.h, this.clipY0, this.clipY1);
+        var y = ys.start;
+        while (y < ys.end) {
+            var x = xs.start;
+            while (x < xs.end) {
+                let i = (truncate<usize>(y)) * this.cols + (truncate<usize>(x));
+                this.cells[i].bg = color;
+                this.cells[i].ch = ' ';
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    fn write(borrow mut this, area: Rect, utf8: Slice<u8>, color: Color) {
+        let y = truncate<i32>(area.y.floor().max(-1.0).min(100000.0));
+        if (y < this.clipY0 || y >= this.clipY1) {
+            return;
+        }
+        var x = truncate<i32>(area.x.floor().max(-1.0).min(100000.0));
+        for (b in utf8) {
+            if (x >= this.clipX0 && x < this.clipX1) {
+                let i = (truncate<usize>(y)) * this.cols + (truncate<usize>(x));
+                // Non-ASCII bytes are shown as '?' until the cell grid stores code points.
+                this.cells[i].ch = if (b >= 32 && b < 127) b else '?';
+                this.cells[i].fg = color;
+            }
+            x += 1;
+        }
+    }
+
+    fn clipTo(borrow mut this, area: Rect) {
+        let xs = Screen.cellRange(area.x, area.x + area.w, 0, truncate<i32>(this.cols));
+        let ys = Screen.cellRange(area.y, area.y + area.h, 0, truncate<i32>(this.rows));
+        this.clipX0 = xs.start;
+        this.clipX1 = xs.end;
+        this.clipY0 = ys.start;
+        this.clipY1 = ys.end;
+    }
+
+    fn cellRange(lo: f32, hi: f32, min: i32, max: i32) -> Span {
+        let a = truncate<i32>(lo.floor().max(-1.0).min(100000.0));
+        let b = truncate<i32>(hi.floor().max(-1.0).min(100000.0));
+        return Span { start: if (a < min) min else a, end: if (b > max) max else b };
+    }
+}
+
+struct Span {
+    start: i32;
+    end: i32;
+}
+
+impl Backend for Screen {
+    fn draw(borrow mut this, command: Command, text: Slice<u8>) {
+        match (command) {
+            Command.Fill(area, color, _) => { this.fill(area, color); }
+            Command.Stroke(area, color, _, widths) => {
+                // A 1-cell border is the outermost ring of cells, coloured as the border.
+                if (widths.top > 0.0) {
+                    this.fill(Rect { x: area.x, y: area.y, w: area.w, h: widths.top }, color);
+                }
+                if (widths.bottom > 0.0) {
+                    this.fill(
+                        Rect { x: area.x, y: area.y + area.h - widths.bottom, w: area.w, h: widths.bottom },
+                        color,
+                    );
+                }
+                if (widths.left > 0.0) {
+                    this.fill(Rect { x: area.x, y: area.y, w: widths.left, h: area.h }, color);
+                }
+                if (widths.right > 0.0) {
+                    this.fill(Rect { x: area.x + area.w - widths.right, y: area.y, w: widths.right, h: area.h }, color);
+                }
+            }
+            Command.Text(area, run) => { this.write(area, text, run.color); }
+            Command.ClipStart(area, _, _, _) => { this.clipTo(area); }
+            Command.ClipEnd => { this.resetClip(); }
+            _ => {}
+        }
+    }
+}
+
+/// One cell per byte, one row high; baselines are synthesized.
+public struct CellMeasure {
+    public unused: u8;
+}
+
+impl TextMetrics for CellMeasure {
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims => Dims { w: round<f32>(utf8.length), h: 1.0 };
+    fn baseline(borrow this, config: TextConfig) -> f32 => -1.0;
+}
+
+fn appendText(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
+    for (b in text.bytes()) {
+        out.push(b)?;
+    }
+    return Ok();
+}
+
+fn appendDecimal(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n = value;
+    var count: usize = 0;
+    loop {
+        digits[count] = truncate<u8>(n % 10) + '0';
+        count += 1;
+        n /= 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    while (count > 0) {
+        count -= 1;
+        out.push(digits[count])?;
+    }
+    return Ok();
+}
+
+fn appendRgb(out: borrow mut Vector<u8>, c: Color) -> Result<void, AllocError> {
+    appendDecimal(mut out, c.r as u64)?;
+    out.push(';')?;
+    appendDecimal(mut out, c.g as u64)?;
+    out.push(';')?;
+    appendDecimal(mut out, c.b as u64)?;
+    return Ok();
+}

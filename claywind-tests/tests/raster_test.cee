@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: MIT
+// The software renderer against tests/thorvg_test.c (the C ThorVG backend's pixel tests): the same scene, the same
+// pixel checks and tolerances. Text checks move to the font phase.
+
+import claywind;
+
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color => Color.rgba(r, g, b, a);
+
+fn near(a: u8, b: i32, tol: i32) -> bool {
+    let d = (a as i32) - b;
+    return d >= -tol && d <= tol;
+}
+
+fn isRGB(c: Color, r: i32, g: i32, b: i32, tol: i32) -> bool => near(c.r, r, tol) && near(c.g, g, tol) && near(c.b, b, tol);
+
+fn checkRGB(ras: borrow Raster, x: usize, y: usize, r: i32, g: i32, b: i32, tol: i32, what: StringView) -> Result<void, TestFailure> {
+    let c = ras.pixelAt(x, y);
+    if (!isRGB(c, r, g, b, tol)) {
+        Console.write("  FAIL ");
+        Console.write(what);
+        Console.write(": got ");
+        Console.write(c.r);
+        Console.write(",");
+        Console.write(c.g);
+        Console.write(",");
+        Console.writeLine(c.b);
+        return Check.fail("pixel differs from the ThorVG reference");
+    }
+    return Ok();
+}
+
+fn box(x: f32, y: f32, w: f32, h: f32) -> Rect => Rect { x: x, y: y, w: w, h: h };
+
+fn heap(bytes: usize) -> Vector<u8> {
+    var v = Vector<u8>.withCapacity(bytes)!;
+    for (i in 0..bytes) {
+        v.push(0)!;
+    }
+    return v;
+}
+
+fn capacity() -> RasterCapacity {
+    var c = RasterCapacity.of(400, 300);
+    c.layerPixels = 400 * 300 * 3;
+    c.maskBytes = 400 * 300 * 2;
+    c.imagePixels = 64;
+    return c;
+}
+
+fn grad(from: Color, to: Color) -> Gradient {
+    var g = Gradient.none();
+    g.from = from;
+    g.to = to;
+    return g;
+}
+
+/// The thorvg_test.c frame.
+fn drawScene(ras: borrow mut Raster) {
+    let nothing = [0u8; 1];
+    let empty = nothing[0..0];
+    let sq = Corners.all(0.0);
+    ras.begin(rgba(240, 240, 240, 255));
+    // A. rounded rectangle
+    ras.draw(Command.Fill(box(20.0, 20.0, 100.0, 60.0), rgba(220, 30, 30, 255), Corners.all(16.0)), empty);
+    // B. 2px border, radius 8
+    ras.draw(Command.Stroke(box(140.0, 20.0, 100.0, 60.0), rgba(30, 60, 220, 255), Corners.all(8.0), BorderWidth.all(2.0)), empty);
+    // C. horizontal gradient red -> blue
+    ras.draw(Command.GradientFill(box(260.0, 20.0, 100.0, 60.0), grad(rgba(255, 0, 0, 255), rgba(0, 0, 255, 255)), sq), empty);
+    // D. shadow (blur 12, offset y 4) under a white rect
+    ras.draw(Command.DropShadow(box(20.0, 120.0, 100.0, 60.0), Shadow { color: rgba(0, 0, 0, 160), offsetX: 0.0, offsetY: 4.0, blur: 12.0, spread: 0.0 }, Corners.all(8.0)), empty);
+    ras.draw(Command.Fill(box(20.0, 120.0, 100.0, 60.0), rgba(255, 255, 255, 255), Corners.all(8.0)), empty);
+    // F. scissor clips a big green rect to a 40x40 window
+    ras.draw(Command.ClipStart(box(260.0, 120.0, 40.0, 40.0), sq, true, true), empty);
+    ras.draw(Command.Fill(box(240.0, 100.0, 100.0, 100.0), rgba(0, 170, 0, 255), sq), empty);
+    ras.draw(Command.ClipEnd, empty);
+    // J. ring (width 3, offset 2) around an orange square
+    ras.draw(Command.Fill(box(330.0, 120.0, 40.0, 40.0), rgba(255, 140, 0, 255), Corners.all(4.0)), empty);
+    ras.draw(Command.RingStroke(box(330.0, 120.0, 40.0, 40.0), Ring { color: rgba(0, 120, 255, 255), width: 3.0, offset: 2.0 }, Corners.all(4.0)), empty);
+    // G. 50% group opacity around a black rect
+    ras.draw(Command.OpacityStart(box(0.0, 0.0, 0.0, 0.0), 0.5), empty);
+    ras.draw(Command.Fill(box(20.0, 220.0, 60.0, 40.0), rgba(0, 0, 0, 255), sq), empty);
+    ras.draw(Command.OpacityEnd(0.5), empty);
+    // H. rotate a 60x20 magenta bar by 90 degrees about its center
+    ras.draw(Command.TransformStart(box(0.0, 0.0, 0.0, 0.0), TransformData { scale: 1.0, rotation: 90.0, skewX: 0.0, skewY: 0.0, pivot: Vec2 { x: 170.0, y: 230.0 } }), empty);
+    ras.draw(Command.Fill(box(140.0, 220.0, 60.0, 20.0), rgba(200, 0, 200, 255), sq), empty);
+    ras.draw(Command.TransformEnd, empty);
+    // I. blur filter around a blue rect
+    ras.draw(Command.FilterStart(box(0.0, 0.0, 0.0, 0.0), FilterMode.Blur, 6.0), empty);
+    ras.draw(Command.Fill(box(260.0, 220.0, 60.0, 40.0), rgba(0, 0, 255, 255), sq), empty);
+    ras.draw(Command.FilterEnd(FilterMode.Blur, 6.0), empty);
+    // K. brightness(1.5) on a black square
+    ras.draw(Command.FilterStart(box(0.0, 0.0, 0.0, 0.0), FilterMode.Brightness, 1.5), empty);
+    ras.draw(Command.Fill(box(330.0, 220.0, 40.0, 40.0), rgba(0, 0, 0, 255), sq), empty);
+    ras.draw(Command.FilterEnd(FilterMode.Brightness, 1.5), empty);
+    // L. icons: check + dot
+    ras.draw(Command.IconDraw(box(100.0, 220.0, 30.0, 30.0), Icon { id: ICON_CHECK, color: rgba(0, 0, 0, 255), stroke: 3.0 }), empty);
+    ras.draw(Command.IconDraw(box(100.0, 255.0, 30.0, 30.0), Icon { id: ICON_DOT, color: rgba(0, 0, 0, 255), stroke: 0.0 }), empty);
+    // M. image: 2x2 checker (red / green) scaled to 30x30
+    ras.draw(Command.Picture(box(210.0, 250.0, 30.0, 30.0), rgba(0, 0, 0, 0), sq, 9), empty);
+    // N. rounded clipping: a red fill clipped by a radius-12 rounded scissor
+    ras.draw(Command.ClipStart(box(20.0, 275.0, 40.0, 24.0), Corners.all(12.0), true, true), empty);
+    ras.draw(Command.Fill(box(10.0, 265.0, 60.0, 44.0), rgba(220, 30, 30, 255), sq), empty);
+    ras.draw(Command.ClipEnd, empty);
+    // O. screen blend: gray over the light background
+    ras.draw(Command.BlendStart(BlendMode.Screen), empty);
+    ras.draw(Command.Fill(box(140.0, 90.0, 40.0, 20.0), rgba(100, 100, 100, 255), sq), empty);
+    ras.draw(Command.BlendEnd, empty);
+    // P. 3-stop horizontal gradient red -> green -> blue
+    var p = Gradient.none();
+    p.useAngle = true;
+    p.angle = 90.0;
+    p.stopCount = 3;
+    p.stops[0] = GradientStop { color: rgba(255, 0, 0, 255), position: 0.0 };
+    p.stops[1] = GradientStop { color: rgba(0, 255, 0, 255), position: 0.5 };
+    p.stops[2] = GradientStop { color: rgba(0, 0, 255, 255), position: 1.0 };
+    ras.draw(Command.GradientFill(box(260.0, 275.0, 120.0, 20.0), p, sq), empty);
+    // Q. diagonal (to top-right) gradient
+    var q = grad(rgba(255, 0, 0, 255), rgba(0, 0, 255, 255));
+    q.useAngle = true;
+    q.angle = 45.0;
+    ras.draw(Command.GradientFill(box(200.0, 90.0, 40.0, 20.0), q, sq), empty);
+    // R. radial gradient
+    var rad = grad(rgba(255, 255, 0, 255), rgba(0, 0, 0, 255));
+    rad.kind = GradientKind.Radial;
+    ras.draw(Command.GradientFill(box(140.0, 265.0, 40.0, 30.0), rad, sq), empty);
+    ras.finish();
+}
+
+@test
+fn matchesTheThorvgPixelTests() -> Result<void, TestFailure> {
+    var storage = heap(12582912);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var ras = Raster.create(memory, capacity())!;
+    // The checker image: R,G,B,A bytes, red / green / green / red.
+    Check.isTrue(ras.addImage(9, 2, 2), "image fits")?;
+    ras.setImagePixel(9, 0, 0, 0xff0000ff);
+    ras.setImagePixel(9, 1, 0, 0xff00ff00);
+    ras.setImagePixel(9, 0, 1, 0xff00ff00);
+    ras.setImagePixel(9, 1, 1, 0xff0000ff);
+    drawScene(mut ras);
+    Check.isFalse(ras.overflowedThisFrame(), "everything fit")?;
+
+    checkRGB(ras, 5, 5, 240, 240, 240, 1, "background clear color")?;
+    // A
+    checkRGB(ras, 70, 50, 220, 30, 30, 2, "rect center red")?;
+    checkRGB(ras, 21, 21, 240, 240, 240, 2, "rounded corner stays background")?;
+    checkRGB(ras, 70, 22, 220, 30, 30, 2, "top edge mid is red")?;
+    // B
+    checkRGB(ras, 141, 50, 30, 60, 220, 2, "border left edge blue")?;
+    checkRGB(ras, 190, 50, 240, 240, 240, 1, "border interior is background")?;
+    checkRGB(ras, 190, 78, 30, 60, 220, 2, "border bottom edge blue")?;
+    // C
+    let c1 = ras.pixelAt(262, 50);
+    Check.isTrue(c1.r > 200 && c1.b < 60, "gradient left is red")?;
+    let c2 = ras.pixelAt(357, 50);
+    Check.isTrue(c2.b > 200 && c2.r < 60, "gradient right is blue")?;
+    let c3 = ras.pixelAt(310, 50);
+    Check.isTrue(near(c3.r, 128, 30) && near(c3.b, 128, 30), "gradient middle is purple")?;
+    // D
+    checkRGB(ras, 70, 150, 255, 255, 255, 1, "white rect over shadow")?;
+    let d1 = ras.pixelAt(70, 188);
+    Check.isTrue(d1.r < 225, "shadow darkens just below the rect")?;
+    Check.isTrue(d1.r > 60, "shadow is soft, not solid")?;
+    checkRGB(ras, 70, 212, 240, 240, 240, 2, "shadow fades out by y=212")?;
+    // F
+    checkRGB(ras, 280, 140, 0, 170, 0, 2, "inside scissor is green")?;
+    checkRGB(ras, 250, 110, 240, 240, 240, 1, "outside scissor is background")?;
+    checkRGB(ras, 305, 140, 240, 240, 240, 1, "right of scissor is background")?;
+    // J
+    checkRGB(ras, 350, 140, 255, 140, 0, 2, "orange square center")?;
+    checkRGB(ras, 326, 140, 0, 120, 255, 3, "ring 2px outside, 3px wide is blue")?;
+    checkRGB(ras, 329, 140, 240, 240, 240, 3, "ring offset gap is background")?;
+    // G
+    let g1 = ras.pixelAt(50, 240);
+    Check.isTrue(near(g1.r, 120, 8) && near(g1.g, 120, 8), "50% opacity black over 240 is ~120")?;
+    // H
+    checkRGB(ras, 170, 255, 200, 0, 200, 2, "rotated bar is vertical")?;
+    checkRGB(ras, 145, 230, 240, 240, 240, 2, "rotated bar vacated its old place")?;
+    // I
+    let i1 = ras.pixelAt(290, 240);
+    Check.isTrue(i1.b > 200 && i1.r < 80, "blurred rect center still blue")?;
+    let i2 = ras.pixelAt(325, 240);
+    Check.isTrue(i2.r < 235 && i2.r > 80, "blur bleeds past the edge")?;
+    // K
+    let k1 = ras.pixelAt(350, 240);
+    Check.isTrue(near(k1.r, 128, 20) && near(k1.b, 128, 20), "brightness(1.5) on black is ~128 gray")?;
+    // L
+    var ink: u32 = 0;
+    for (y in 220..250usize) {
+        for (x in 100..130usize) {
+            if (ras.pixelAt(x, y).r < 128) {
+                ink += 1;
+            }
+        }
+    }
+    Check.isTrue(ink > 40 && ink < 400, "check icon stroke has a plausible amount of ink")?;
+    checkRGB(ras, 115, 270, 0, 0, 0, 2, "dot icon center black")?;
+    // M
+    checkRGB(ras, 217, 257, 255, 0, 0, 12, "image top-left texel red")?;
+    checkRGB(ras, 232, 257, 0, 255, 0, 12, "image top-right texel green")?;
+    // N
+    checkRGB(ras, 40, 287, 220, 30, 30, 2, "rounded clip interior red")?;
+    checkRGB(ras, 21, 276, 240, 240, 240, 2, "rounded clip corner stays background")?;
+    checkRGB(ras, 40, 276, 220, 30, 30, 2, "rounded clip top edge mid is red")?;
+    checkRGB(ras, 15, 287, 240, 240, 240, 1, "outside rounded clip is background")?;
+    // O
+    let o1 = ras.pixelAt(160, 100);
+    Check.isTrue(near(o1.r, 246, 3) && near(o1.g, 246, 3), "screen blend brightens 240 to ~246")?;
+    // P
+    let p1 = ras.pixelAt(262, 285);
+    Check.isTrue(p1.r > 200 && p1.g < 60, "3-stop gradient starts red")?;
+    let p2 = ras.pixelAt(320, 285);
+    Check.isTrue(p2.g > 200 && p2.r < 60 && p2.b < 60, "3-stop gradient middle is green")?;
+    let p3 = ras.pixelAt(378, 285);
+    Check.isTrue(p3.b > 200 && p3.g < 60, "3-stop gradient ends blue")?;
+    // Q
+    let q1 = ras.pixelAt(202, 108);
+    Check.isTrue((q1.r as i32) > (q1.b as i32) + 100, "to-top-right: bottom-left is red")?;
+    let q2 = ras.pixelAt(238, 92);
+    Check.isTrue((q2.b as i32) > (q2.r as i32) + 100, "to-top-right: top-right is blue")?;
+    // R
+    let r1 = ras.pixelAt(160, 280);
+    Check.isTrue(r1.r > 200 && r1.g > 200, "radial center is yellow")?;
+    Check.isTrue(ras.pixelAt(141, 266).r < 90, "radial corner is dark")?;
+
+    // The second frame clears the first.
+    ras.begin(rgba(10, 20, 30, 255));
+    ras.finish();
+    return checkRGB(ras, 70, 50, 10, 20, 30, 1, "second frame clears the first");
+}
+
+@test
+fn blendModesMatchThorvgOperators() -> Result<void, TestFailure> {
+    var storage = heap(4194304);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = RasterCapacity.of(64, 8);
+    c.imagePixels = 4;
+    c.fontBytes = 16;
+    var ras = Raster.create(memory, c)!;
+    let nothing = [0u8; 1];
+    let empty = nothing[0..0];
+    // backdrop 200,100,50 ; source 100,150,250, each mode on its own 4x4 cell.
+    ras.begin(rgba(200, 100, 50, 255));
+    let modes = [1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    for (k in 0..modes.length) {
+        let mode = match (modes[k]) {
+            1 => BlendMode.Multiply,
+            4 => BlendMode.Screen,
+            5 => BlendMode.Overlay,
+            6 => BlendMode.Darken,
+            7 => BlendMode.Lighten,
+            8 => BlendMode.ColorDodge,
+            9 => BlendMode.ColorBurn,
+            10 => BlendMode.HardLight,
+            11 => BlendMode.SoftLight,
+            12 => BlendMode.Difference,
+            _ => BlendMode.Exclusion,
+        };
+        ras.draw(Command.BlendStart(mode), empty);
+        ras.draw(Command.Fill(box(round<f32>(k) * 4.0, 0.0, 4.0, 4.0), rgba(100, 150, 250, 255), Corners.all(0.0)), empty);
+        ras.draw(Command.BlendEnd, empty);
+    }
+    ras.finish();
+    // ThorVG's u8 operators (tvgSwBlendOp.cpp) followed by its INTERPOLATE(result, dst, 255) composite,
+    // computed independently in Python.
+    checkRGB(ras, 1, 1, 79, 59, 49, 1, "multiply")?;
+    checkRGB(ras, 5, 1, 220, 190, 250, 1, "screen")?;
+    checkRGB(ras, 9, 1, 187, 117, 97, 1, "overlay")?;
+    checkRGB(ras, 13, 1, 100, 100, 50, 1, "darken")?;
+    checkRGB(ras, 17, 1, 200, 149, 249, 1, "lighten")?;
+    checkRGB(ras, 21, 1, 254, 241, 254, 1, "color-dodge")?;
+    checkRGB(ras, 25, 1, 115, 0, 46, 1, "color-burn")?;
+    checkRGB(ras, 29, 1, 158, 126, 244, 1, "hard-light")?;
+    checkRGB(ras, 33, 1, 191, 109, 109, 1, "soft-light")?;
+    checkRGB(ras, 37, 1, 100, 50, 199, 1, "difference")?;
+    return checkRGB(ras, 41, 1, 142, 131, 201, 1, "exclusion");
+}
+
+// ---- regressions found by differential rendering against ThorVG (ClayWind/tests/diff_render.py) -----------------
+
+@test
+fn rotatedEdgesCrossingTheTopOfTheFrame() -> Result<void, TestFailure> {
+    // A rotated bordered bar that starts above the frame: its slanted edges must enter the first row at the right x.
+    var storage = heap(12582912);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = RasterCapacity.of(320, 200);
+    c.imagePixels = 4;
+    c.fontBytes = 16;
+    var ras = Raster.create(memory, c)!;
+    let nothing = [0u8; 1];
+    let empty = nothing[0..0];
+    ras.begin(rgba(240, 240, 240, 255));
+    ras.draw(Command.TransformStart(box(110.0, 0.0, 260.0, 8.0), TransformData { scale: 1.0, rotation: 45.0, skewX: 0.0, skewY: 0.0, pivot: Vec2 { x: 240.0, y: 4.0 } }), empty);
+    ras.draw(Command.Stroke(box(110.0, 0.0, 260.0, 8.0), rgba(2, 2, 2, 255), Corners.all(0.0),
+        BorderWidth { left: 1.0, right: 2.0, top: 1.0, bottom: 2.0, betweenChildren: 1.0 }), empty);
+    ras.draw(Command.TransformEnd, empty);
+    ras.finish();
+    var ink: u32 = 0;
+    var maxY: usize = 0;
+    for (y in 0..200usize) {
+        for (x in 0..320usize) {
+            if (ras.pixelAt(x, y).r < 200) {
+                ink += 1;
+                maxY = y;
+            }
+        }
+    }
+    // ThorVG: 591 ink pixels, the lowest at y = 89.
+    Check.isTrue(ink >= 585 && ink <= 597, "ink count matches ThorVG's 591")?;
+    return Check.equalU64(89, maxY as u64);
+}
+
+@test
+fn degenerateRingsAreSolid() -> Result<void, TestFailure> {
+    // A ring around a box thinner than the stroke has no hole (ThorVG strokes it solid).
+    var storage = heap(4194304);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = RasterCapacity.of(64, 32);
+    c.imagePixels = 4;
+    c.fontBytes = 16;
+    var ras = Raster.create(memory, c)!;
+    let nothing = [0u8; 1];
+    let empty = nothing[0..0];
+    ras.begin(rgba(240, 240, 240, 255));
+    ras.draw(Command.RingStroke(box(10.0, 16.0, 40.0, -3.33), Ring { color: rgba(3, 3, 3, 255), width: 2.0, offset: 1.0 }, Corners.all(0.0)), empty);
+    ras.finish();
+    return checkRGB(ras, 30, 14, 3, 3, 3, 2, "inside the thin ring is ink, not a hole");
+}
+
+@test
+fn shadowsUseThorvgsBoxBlur() -> Result<void, TestFailure> {
+    // Two box passes of radius 1 for blur 4 (sigma 2): ThorVG's measured edge profile is 28, 85, 170, 226.
+    var storage = heap(4194304);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = RasterCapacity.of(200, 100);
+    c.imagePixels = 4;
+    c.fontBytes = 16;
+    var ras = Raster.create(memory, c)!;
+    let nothing = [0u8; 1];
+    let empty = nothing[0..0];
+    ras.begin(rgba(255, 255, 255, 255));
+    ras.draw(Command.DropShadow(box(70.0, 30.0, 60.0, 40.0), Shadow { color: rgba(0, 0, 0, 255), offsetX: 0.0, offsetY: 0.0, blur: 4.0, spread: 0.0 }, Corners.all(0.0)), empty);
+    ras.finish();
+    let want = [28, 85, 170, 226];
+    for (k in 0..4usize) {
+        let ink = 255 - (ras.pixelAt(68 + k, 50).r as i32);
+        if (ink < want[k] - 1 || ink > want[k] + 1) {
+            Console.write("  edge pixel ");
+            Console.write(k);
+            Console.write(": got ");
+            Console.writeLine(ink);
+            return Check.fail("shadow edge differs from ThorVG");
+        }
+    }
+    // A shadow clipped away entirely is skipped, not a crash (an empty blur layer).
+    ras.draw(Command.ClipStart(box(150.0, 0.0, 0.0, 0.0), Corners.all(0.0), true, true), empty);
+    ras.draw(Command.DropShadow(box(10.0, 10.0, 20.0, 20.0), Shadow { color: rgba(0, 0, 0, 255), offsetX: 0.0, offsetY: 0.0, blur: 12.0, spread: 0.0 }, Corners.all(0.0)), empty);
+    ras.draw(Command.ClipEnd, empty);
+    ras.finish();
+    return Ok();
+}
+
+// ---- text (thorvg_test.c section E) ----------------------------------------------------------------------------
+
+fn arialPath() -> StringView => "/System/Library/Fonts/Supplemental/Arial.ttf";
+
+@test
+fn textMatchesTheThorvgTextChecks() -> Result<void, TestFailure> {
+    let font = readFile(arialPath());
+    if (font.length == 0) {
+        Console.writeLine("  (Arial not found: text checks skipped)");
+        return Ok();
+    }
+    var storage = heap(16777216);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = capacity();
+    c.fontBytes = 1048576;
+    var ras = Raster.create(memory, c)!;
+    Check.isTrue(ras.loadFont(0, font.view()), "Arial parses and loads")?;
+    let nothing = [0u8; 1];
+    let empty = nothing[0..0];
+    ras.begin(rgba(240, 240, 240, 255));
+    let h = "H";
+    let run = TextRun { start: 0, length: 1, color: rgba(0, 0, 0, 255), fontId: 0, fontSize: 40.0, letterSpacing: 0.0, lineHeight: 0.0 };
+    ras.draw(Command.Text(box(140.0, 120.0, 60.0, 40.0), run), h.bytes());
+    ras.finish();
+    var top: i32 = -1;
+    var bot: i32 = -1;
+    for (y in 115..175usize) {
+        for (x in 138..190usize) {
+            if (ras.pixelAt(x, y).r < 128) {
+                if (top < 0) {
+                    top = truncate<i32>(y);
+                }
+                bot = truncate<i32>(y);
+            }
+        }
+    }
+    Check.isTrue(top >= 0, "text 'H' produced ink")?;
+    // Arial: cap height 0.716 em, ascent 0.905 em, advance of H 0.722 em.
+    let capH = bot - top + 1;
+    Check.isTrue(capH >= 26 && capH <= 30, "cap height ~28.6 px for 40px text")?;
+    Check.isTrue(bot + 1 >= 154 && bot + 1 <= 158, "baseline at y + ascent (~156)")?;
+    let config = TextConfig.of(40.0);
+    let m = ras.measure(h.bytes(), config);
+    expect("MeasureText('H') ~ 0.722 em", m.w, 28.88)?;
+    expect("MeasureText height = fontSize", m.h, 40.0)?;
+    let base = ras.baseline(config);
+    Check.isTrue(base > 34.2 && base < 38.2, "MeasureBaseline ~ ascent 0.905 em")?;
+    var spaced = config;
+    spaced.letterSpacing = 3.0;
+    let hhh = "HHH";
+    let m3 = ras.measure(hhh.bytes(), spaced);
+    expect("letterSpacing adds n * spacing", m3.w, 3.0 * m.w + 9.0)?;
+    return Ok();
+}

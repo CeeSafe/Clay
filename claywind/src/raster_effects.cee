@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: MIT
+// Layer effects and blend modes: Gaussian blur, grayscale, brightness (as thorvg_backend.c builds them from ThorVG
+// effects), and every CSS mix-blend-mode by the W3C Compositing and Blending formulas.
+
+/// ThorVG's "Gaussian" blur (tvgSwPostEffect.cpp): Kovesi's fast almost-Gaussian, box sizes computed for three
+/// boxes but, at the quality 60 thorvg_backend.c asks for, run as two box passes per axis
+/// (level = int(3 * 0.59) + 1). Each pass is a sliding integer box over u8 premultiplied channels, truncating, with
+/// edges extended at the layer's bounds. `sigma2` is sigma squared, already scaled by the transform.
+fn gaussianBlur(r: borrow mut Raster, layer: Layer, sigma2: f32) {
+    if (sigma2 <= 0.0) {
+        return;
+    }
+    var wl = truncate<i32>((12.0 * sigma2 / 3.0 + 1.0).sqrt());
+    if (wl % 2 == 0) {
+        wl -= 1;
+    }
+    let wu = wl + 2;
+    let wlf = round<f32>(wl);
+    let mi = (12.0 * sigma2 - 3.0 * wlf * wlf - 12.0 * wlf - 9.0) / (-4.0 * wlf - 4.0);
+    let m = truncate<i32>((mi + 0.5).max(-1000.0).min(1000.0));
+    let k0 = ((if (0 < m) wl else wu) - 1) / 2;
+    let k1 = ((if (1 < m) wl else wu) - 1) / 2;
+    let w = idx(layer.x1 - layer.x0);
+    let h = idx(layer.y1 - layer.y0);
+    if (w == 0 || h == 0) {
+        return; // clipped away entirely
+    }
+    let longest = if (w > h) w else h;
+    if (longest > r.line.length) {
+        r.overflowed = true;
+        return;
+    }
+    for (axis in 0..2) {
+        for (level in 0..2) {
+            let d = if (level == 0) k0 else k1;
+            if (d <= 0) {
+                continue;
+            }
+            boxPass(mut r, layer, axis, d, w, h);
+        }
+    }
+}
+
+/// One sliding box pass of radius `d` along rows (axis 0) or columns (axis 1): _gaussianFilter. The source line is
+/// copied to a packed scratch line, so the pass can write the layer in place.
+fn boxPass(r: borrow mut Raster, layer: Layer, axis: i32, d: i32, w: usize, h: usize) {
+    let lines = if (axis == 0) h else w;
+    let length = if (axis == 0) w else h;
+    let end = truncate<i32>(length) - 1;
+    let iarr = 1.0 / round<f32>(d + d + 1);
+    for (line in 0..lines) {
+        for (i in 0..length) {
+            r.line[i] = r.pool[layer.offset + pixelIndex(axis, line, i, w)];
+        }
+        var a0: u32 = 0;
+        var a1: u32 = 0;
+        var a2: u32 = 0;
+        var a3: u32 = 0;
+        var lo = -(d + 1);
+        var hi = d;
+        var x = lo;
+        while (x < hi) {
+            let p = r.line[idx(extend(end, x))];
+            a0 += p & 0xFF;
+            a1 += (p >> 8) & 0xFF;
+            a2 += (p >> 16) & 0xFF;
+            a3 += p >> 24;
+            x += 1;
+        }
+        for (i in 0..length) {
+            let pr = r.line[idx(extend(end, hi))];
+            let pl = r.line[idx(extend(end, lo))];
+            a0 = a0 + (pr & 0xFF) - (pl & 0xFF);
+            a1 = a1 + ((pr >> 8) & 0xFF) - ((pl >> 8) & 0xFF);
+            a2 = a2 + ((pr >> 16) & 0xFF) - ((pl >> 16) & 0xFF);
+            a3 = a3 + (pr >> 24) - (pl >> 24);
+            // ThorVG truncates `acc * iarr` (no rounding).
+            let c0 = truncate<u32>(round<f32>(a0) * iarr);
+            let c1 = truncate<u32>(round<f32>(a1) * iarr);
+            let c2 = truncate<u32>(round<f32>(a2) * iarr);
+            let c3 = truncate<u32>(round<f32>(a3) * iarr);
+            r.pool[layer.offset + pixelIndex(axis, line, i, w)] = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+            hi += 1;
+            lo += 1;
+        }
+    }
+}
+
+/// _gaussianEdgeExtend.
+fn extend(end: i32, i: i32) -> i32 => if (i < 0) 0 else if (i > end) end else i;
+
+/// Element `i` of line `line`: a row (axis 0) or a column (axis 1) of a `w`-wide layer.
+fn pixelIndex(axis: i32, line: usize, i: usize, w: usize) -> usize => if (axis == 0) line * w + i else i * w + line;
+
+/// ThorVG's INTERPOLATE on one channel: d + (s - d) * a / 256.
+fn interpolate8(s: u32, d: u32, a: u32) -> u32 {
+    let delta = (truncate<i32>(s) - truncate<i32>(d)) * truncate<i32>(a);
+    // An arithmetic shift right by 8 is a floor division by 256.
+    let step = if (delta >= 0) delta / 256 else -((-delta + 255) / 256);
+    let v = truncate<i32>(d) + step;
+    return truncate<u32>(if (v < 0) 0 else if (v > 255) 255 else v);
+}
+
+/// ThorVG's tint effect at thorvg_backend.c's intensity 100 (of 255): luma of the premultiplied pixel
+/// ((54 R + 182 G + 19 B) >> 8) mapped onto black -> white, mixed 100/256 into the original, then scaled by the
+/// pixel's alpha (ALPHA_BLEND). This is grayscale, and the image tint with a color in place of white.
+fn tintPixel(p: u32, black: Color, white: Color) -> u32 {
+    let r = p & 0xFF;
+    let g = (p >> 8) & 0xFF;
+    let b = (p >> 16) & 0xFF;
+    let a = p >> 24;
+    let luma = (r * 54 + g * 182 + b * 19) >> 8;
+    let tr = interpolate8(white.r as u32, black.r as u32, luma);
+    let tg = interpolate8(white.g as u32, black.g as u32, luma);
+    let tb = interpolate8(white.b as u32, black.b as u32, luma);
+    // INTERPOLATE(val, src, 100), with val opaque.
+    let mr = interpolate8(tr, r, 100);
+    let mg = interpolate8(tg, g, 100);
+    let mb = interpolate8(tb, b, 100);
+    let ma = interpolate8(255, a, 100);
+    // ALPHA_BLEND(val, alpha): every channel times (alpha + 1) / 256.
+    let k = a + 1;
+    return ((mr * k) >> 8) | (((mg * k) >> 8) << 8) | (((mb * k) >> 8) << 16) | (((ma * k) >> 8) << 24);
+}
+
+/// grayscale (thorvg_backend.c: tint black -> white).
+fn grayscaleLayer(r: borrow mut Raster, layer: Layer) {
+    let size = idx(layer.x1 - layer.x0) * idx(layer.y1 - layer.y0);
+    let black = Color.rgb(0, 0, 0);
+    let white = Color.rgb(255, 255, 255);
+    for (i in 0..size) {
+        let p = r.pool[layer.offset + i];
+        if ((p >> 24) == 0) {
+            continue;
+        }
+        r.pool[layer.offset + i] = tintPixel(p, black, white);
+    }
+}
+
+/// brightness(k): a copy filled white (k > 1) or black (k < 1), alpha kept, composited over the subtree at opacity
+/// |k - 1| (thorvg_backend.c's tvgb_filterEnd).
+fn brightnessLayer(r: borrow mut Raster, layer: Layer, amount: f32) {
+    if (amount == 1.0) {
+        return;
+    }
+    let v: f32 = if (amount > 1.0) 1.0 else 0.0;
+    let k = quantize(if (amount > 1.0) amount - 1.0 else 1.0 - amount);
+    let size = idx(layer.x1 - layer.x0) * idx(layer.y1 - layer.y0);
+    for (i in 0..size) {
+        let p = r.pool[layer.offset + i];
+        let a = chan(p, 24);
+        if (a <= 0.0) {
+            continue;
+        }
+        r.pool[layer.offset + i] = over(p, v * a * k, v * a * k, v * a * k, a * k);
+    }
+}
+
+// ---- blend modes -----------------------------------------------------------------------------------------------
+// ThorVG's blend operators (tvgSwBlendOp.cpp), on u8 channels, because that is what ClayWind renders today. A blended
+// group is composited as ThorVG composites a blended scene image:
+//     dst = INTERPOLATE(B(unpremultiply(src), dst), dst, A(src) * opacity)
+// where B returns an opaque color: some modes work on the premultiplied backdrop as is (difference, exclusion, add,
+// screen, lighten), the rest unpremultiply it and mix the result with the source by the backdrop's alpha.
+
+fn c8(p: u32, shift: u32) -> u32 => (p >> shift) & 0xFF;
+
+/// MULTIPLY(a, b) = (a * b + 255) >> 8.
+fn mul8(a: u32, b: u32) -> u32 => (a * b + 0xFF) >> 8;
+
+/// ALPHA_BLEND on one channel: c * (a + 1) >> 8.
+fn alphaBlend8(c: u32, a: u32) -> u32 => (c * (a + 1)) >> 8;
+
+/// The per-channel separable function of a mode; s is the straight source, d the (possibly unpremultiplied) backdrop.
+fn blendChannel(mode: BlendMode, s: u32, d: u32) -> u32 {
+    match (mode) {
+        BlendMode.Difference => { return if (s > d) s - d else d - s; }
+        BlendMode.Subtract => { return if (s > d) s - d else d - s; }
+        BlendMode.Exclusion => {
+            let v = truncate<i32>(s + d) - truncate<i32>(2 * mul8(s, d));
+            return truncate<u32>(if (v < 0) 0 else if (v > 255) 255 else v);
+        }
+        BlendMode.Add => { return if (s + d > 255) 255 else s + d; }
+        BlendMode.Screen => { return s + d - mul8(s, d); }
+        BlendMode.Lighten => { return if (s > d) s else d; }
+        BlendMode.Multiply => { return mul8(s, d); }
+        BlendMode.Overlay => {
+            if (d < 128) {
+                let v = 2 * mul8(s, d);
+                return if (v > 255) 255 else v;
+            }
+            let v = 2 * mul8(255 - s, 255 - d);
+            return 255 - (if (v > 255) 255 else v);
+        }
+        BlendMode.Darken => { return if (s < d) s else d; }
+        BlendMode.ColorDodge => {
+            if (d == 0) {
+                return 0;
+            }
+            if (s == 255) {
+                return 255;
+            }
+            let v = d * 255 / (255 - s);
+            return if (v > 255) 255 else v;
+        }
+        BlendMode.ColorBurn => {
+            if (d == 255) {
+                return 255;
+            }
+            if (s == 0) {
+                return 0;
+            }
+            let v = (255 - d) * 255 / s;
+            return 255 - (if (v > 255) 255 else v);
+        }
+        BlendMode.HardLight => {
+            if (s < 128) {
+                let v = 2 * mul8(s, d);
+                return if (v > 255) 255 else v;
+            }
+            let v = 2 * mul8(255 - s, 255 - d);
+            return 255 - (if (v > 255) 255 else v);
+        }
+        BlendMode.SoftLight => {
+            let si = truncate<i32>(s);
+            let di = truncate<i32>(d);
+            if (s <= 127) {
+                return truncate<u32>(di - ((255 - 2 * si) * di * (255 - di)) / 65025);
+            }
+            let dd = if (d <= 64) 4 * di - (12 * di * di) / 255 + (16 * di * di * di) / 65025 else truncate<i32>(
+                sqrtLut(d),
+            );
+            let v = di + ((2 * si - 255) * (dd - di)) / 255;
+            return truncate<u32>(if (v < 0) 0 else if (v > 255) 255 else v);
+        }
+        _ => { return s; }
+    }
+}
+
+/// ThorVG's SQRT_LUT for soft-light: round(sqrt(d / 255) * 255) as its table has it.
+fn sqrtLut(d: u32) -> u32 {
+    let v = (round<f32>(d) / 255.0).sqrt() * 255.0;
+    return truncate<u32>(v);
+}
+
+/// _unpremultiply.
+fn unpremultiply8(p: u32) -> [u32; 4] {
+    let a = c8(p, 24);
+    var r = c8(p, 0);
+    var g = c8(p, 8);
+    var b = c8(p, 16);
+    if (a > 0 && a < 255) {
+        r = umin(r * 255 / a, 255);
+        g = umin(g * 255 / a, 255);
+        b = umin(b * 255 / a, 255);
+    }
+    return [r, g, b, a];
+}
+
+/// _premultiply(c1, c2, a): c1 where the backdrop is opaque, c2 where it is transparent, mixed by `a` between.
+fn premixed(c1: u32, c2: u32, a: u32) -> u32 {
+    if (a == 255) {
+        return c1;
+    }
+    if (a == 0) {
+        return c2;
+    }
+    return alphaBlend8(c1, a) + alphaBlend8(c2, 255 - a);
+}
+
+/// The surface luma ThorVG uses for hue/saturation/color/luminosity: (54 R + 182 G + 19 B) >> 8.
+fn luma8(r: u32, g: u32, b: u32) -> i32 => truncate<i32>((r * 54 + g * 182 + b * 19) >> 8);
+
+/// _saturate: the color's channels re-spread so max - min equals the saturation of (s1, s2, s3).
+fn saturate8(c: [u32; 3], s1: u32, s2: u32, s3: u32) -> [u32; 3] {
+    let s = umax(s1, umax(s2, s3)) - umin(s1, umin(s2, s3));
+    var v = c;
+    var lo: usize = 0;
+    var mid: usize = 1;
+    var hi: usize = 2;
+    if (v[lo] > v[mid]) {
+        let t = lo;
+        lo = mid;
+        mid = t;
+    }
+    if (v[mid] > v[hi]) {
+        let t = mid;
+        mid = hi;
+        hi = t;
+    }
+    if (v[lo] > v[mid]) {
+        let t = lo;
+        lo = mid;
+        mid = t;
+    }
+    let minv = v[lo];
+    let maxv = v[hi];
+    if (maxv > minv) {
+        v[mid] = truncate<u32>(truncate<u8>(((v[mid] - minv) * s) / (maxv - minv)));
+        v[hi] = s;
+    } else {
+        v[mid] = 0;
+        v[hi] = 0;
+    }
+    v[lo] = 0;
+    return v;
+}
+
+/// _luminance: shift the color to luma l (from cl), clipping into gamut.
+fn luminance8(c: [u32; 3], cl: i32, l: i32) -> [u32; 3] {
+    let d = l - cl;
+    var r = truncate<i32>(c[0]) + d;
+    var g = truncate<i32>(c[1]) + d;
+    var b = truncate<i32>(c[2]) + d;
+    let minv = imin(r, imin(g, b));
+    var maxv = imax(r, imax(g, b));
+    if (minv < 0 && l - minv != 0) {
+        r = l + ((r - l) * l) / (l - minv);
+        g = l + ((g - l) * l) / (l - minv);
+        b = l + ((b - l) * l) / (l - minv);
+        maxv = imax(r, imax(g, b));
+    }
+    if (maxv > 255 && maxv - l != 0) {
+        r = l + ((r - l) * (255 - l)) / (maxv - l);
+        g = l + ((g - l) * (255 - l)) / (maxv - l);
+        b = l + ((b - l) * (255 - l)) / (maxv - l);
+    }
+    return [truncate<u32>(truncate<u8>(r)), truncate<u32>(truncate<u8>(g)), truncate<u32>(truncate<u8>(b))];
+}
+
+/// B(src straight, dst premultiplied) -> (r, g, b, a). Opaque, except that _premultiply mixes in the straight
+/// source, alpha included, where the backdrop is not opaque (all of it where the backdrop is transparent).
+fn blendOp(mode: BlendMode, s: [u32; 4], dst: u32) -> [u32; 4] {
+    match (mode) {
+        BlendMode.Difference => {}
+        BlendMode.Subtract => {}
+        BlendMode.Exclusion => {}
+        BlendMode.Add => {}
+        BlendMode.Screen => {}
+        BlendMode.Lighten => {}
+        _ => {
+            let o = unpremultiply8(dst);
+            var c = [blendChannel(mode, s[0], o[0]), blendChannel(mode, s[1], o[1]), blendChannel(mode, s[2], o[2])];
+            match (mode) {
+                BlendMode.Hue => {
+                    c = saturate8([s[0], s[1], s[2]], o[0], o[1], o[2]);
+                    c = luminance8(c, luma8(c[0], c[1], c[2]), luma8(o[0], o[1], o[2]));
+                }
+                BlendMode.Saturation => {
+                    c = saturate8([o[0], o[1], o[2]], s[0], s[1], s[2]);
+                    c = luminance8(c, luma8(c[0], c[1], c[2]), luma8(o[0], o[1], o[2]));
+                }
+                BlendMode.Color => {
+                    c = luminance8([s[0], s[1], s[2]], luma8(s[0], s[1], s[2]), luma8(o[0], o[1], o[2]));
+                }
+                BlendMode.Luminosity => {
+                    c = luminance8([o[0], o[1], o[2]], luma8(o[0], o[1], o[2]), luma8(s[0], s[1], s[2]));
+                }
+                _ => {}
+            }
+            return [
+                premixed(c[0], s[0], o[3]),
+                premixed(c[1], s[1], o[3]),
+                premixed(c[2], s[2], o[3]),
+                premixed(255, s[3], o[3]),
+            ];
+        }
+    }
+    // The modes that use the premultiplied backdrop directly.
+    return [
+        blendChannel(mode, s[0], c8(dst, 0)),
+        blendChannel(mode, s[1], c8(dst, 8)),
+        blendChannel(mode, s[2], c8(dst, 16)),
+        255,
+    ];
+}
+
+/// Composites a blended layer pixel `src` (premultiplied, group opacity `alpha`) onto `dst`.
+fn blendLayerPixel(src: u32, dst: u32, alpha: f32, mode: BlendMode) -> u32 {
+    let sa = c8(src, 24);
+    if (sa == 0) {
+        return dst;
+    }
+    let s = unpremultiply8(src);
+    let res = blendOp(mode, s, dst);
+    let k = mul8(truncate<u32>(Math.clamp(alpha * 255.0 + 0.5, 0.0, 255.0)), sa);
+    return interpolate8(res[0], c8(dst, 0), k) | (interpolate8(res[1], c8(dst, 8), k) << 8) |
+        (interpolate8(res[2], c8(dst, 16), k) << 16) | (interpolate8(res[3], c8(dst, 24), k) << 24);
+}
+
+fn umin(a: u32, b: u32) -> u32 => if (a < b) a else b;
+fn umax(a: u32, b: u32) -> u32 => if (a > b) a else b;

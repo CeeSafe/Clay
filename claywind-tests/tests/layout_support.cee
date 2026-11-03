@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: MIT
+// Helpers for the layout-engine tests, mirroring tests/layout_test.c in the C ClayWind.
+
+import claywind;
+
+/// Every text measures 10px per byte, 16px tall (the C test's MeasureText); no baseline metric.
+struct ClayMeasure {
+    unused: u8;
+}
+
+impl TextMetrics for ClayMeasure {
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims => Dims { w: round<f32>(utf8.length) * 10.0, h: 16.0 };
+    fn baseline(borrow this, config: TextConfig) -> f32 => -1.0;
+}
+
+/// The same, with a registered baseline metric of 0.75 x font size (the C test's TestBaseline).
+struct MetricMeasure {
+    unused: u8;
+}
+
+impl TextMetrics for MetricMeasure {
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims => Dims { w: round<f32>(utf8.length) * 10.0, h: 16.0 };
+    fn baseline(borrow this, config: TextConfig) -> f32 => config.fontSize * 0.75;
+}
+
+/// Within 0.5px, as the C test's expectf.
+fn expect(what: StringView, got: f32, want: f32) -> Result<void, TestFailure> {
+    if ((got - want).abs() > 0.5) {
+        Console.write("  FAIL ");
+        Console.write(what);
+        Console.write(": got ");
+        Console.write(got);
+        Console.write(", want ");
+        Console.writeLine(want);
+        return Check.fail("geometry differs from the C ClayWind");
+    }
+    return Ok();
+}
+
+fn boxIn(t: borrow LayoutTree, name: StringView) -> Rect {
+    return match (t.boxOf(hashId(name))) {
+        Some(r) => r,
+        null => Rect { x: -9999.0, y: -9999.0, w: -9999.0, h: -9999.0 },
+    };
+}
+
+fn fixedBox(w: f32, h: f32) -> Decl => Decl.sized(w, h);
+
+fn sized(w: SizingAxis, h: SizingAxis) -> Decl {
+    var d = Decl.of();
+    d.layout.width = w;
+    d.layout.height = h;
+    return d;
+}
+
+fn column(w: SizingAxis, h: SizingAxis) -> Decl {
+    var d = sized(w, h);
+    d.layout.direction = Direction.Column;
+    return d;
+}
+
+fn leaf(t: borrow mut LayoutTree, name: StringView, decl: Decl) {
+    t.open(hashId(name), decl);
+    t.close();
+}
+
+fn text16(t: borrow mut LayoutTree, s: StringView) {
+    t.text(s.bytes(), TextConfig.of(16.0));
+}
+
+fn finishTree(t: borrow mut LayoutTree) -> Result<void, TestFailure> {
+    let measure = ClayMeasure { unused: 0 };
+    let ok = match (endLayout(mut t, measure)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    return Check.isTrue(ok, "frame fits the layout capacity");
+}
+
+/// The index of the first command matching `kind` (see `kindOf`) at or after `from`, or -1.
+fn findCommand(t: borrow LayoutTree, kind: u32, from: usize) -> i64 {
+    var i = from;
+    while (i < t.commandCount()) {
+        if (kindOf(t.command(i)) == kind) {
+            return truncate<i64>(i);
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+const K_FILL: u32 = 1;
+const K_TEXT: u32 = 2;
+const K_CLIP_START: u32 = 3;
+const K_TRANSFORM_START: u32 = 4;
+const K_TRANSFORM_END: u32 = 5;
+const K_SHADOW: u32 = 6;
+const K_GRADIENT: u32 = 7;
+const K_RING: u32 = 8;
+const K_BLEND_START: u32 = 9;
+const K_BLEND_END: u32 = 10;
+const K_OPACITY_START: u32 = 11;
+const K_OPACITY_END: u32 = 12;
+const K_FILTER_START: u32 = 13;
+const K_FILTER_END: u32 = 14;
+
+fn kindOf(c: Command) -> u32 => match (c) {
+    Command.Fill(_, _, _) => K_FILL,
+    Command.Text(_, _) => K_TEXT,
+    Command.ClipStart(_, _, _, _) => K_CLIP_START,
+    Command.TransformStart(_, _) => K_TRANSFORM_START,
+    Command.TransformEnd => K_TRANSFORM_END,
+    Command.DropShadow(_, _, _) => K_SHADOW,
+    Command.GradientFill(_, _, _) => K_GRADIENT,
+    Command.RingStroke(_, _, _) => K_RING,
+    Command.BlendStart(_) => K_BLEND_START,
+    Command.BlendEnd => K_BLEND_END,
+    Command.OpacityStart(_, _) => K_OPACITY_START,
+    Command.OpacityEnd(_) => K_OPACITY_END,
+    Command.FilterStart(_, _, _) => K_FILTER_START,
+    Command.FilterEnd(_, _) => K_FILTER_END,
+    _ => 0,
+};

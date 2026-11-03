@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: MIT
+// claywind math against an independent libm (reference.cee is generated from Python's math module).
+
+import claywind;
+
+@test
+fn sinMatchesLibm() -> Result<void, TestFailure> {
+    let xs = SIN_X;
+    let ys = SIN_Y;
+    for (i in 0..xs.length) {
+        near64("sin", i, f64.fromBits(ys[i]), Math64.sin(f64.fromBits(xs[i])), 1e-12)?;
+    }
+    return Ok();
+}
+
+@test
+fn cosMatchesLibm() -> Result<void, TestFailure> {
+    let xs = SIN_X;
+    let ys = COS_Y;
+    for (i in 0..xs.length) {
+        near64("cos", i, f64.fromBits(ys[i]), Math64.cos(f64.fromBits(xs[i])), 1e-12)?;
+    }
+    return Ok();
+}
+
+@test
+fn atanMatchesLibm() -> Result<void, TestFailure> {
+    let xs = ATAN_X;
+    let ys = ATAN_Y;
+    for (i in 0..xs.length) {
+        near64("atan", i, f64.fromBits(ys[i]), Math64.atan(f64.fromBits(xs[i])), 1e-10)?;
+    }
+    return Ok();
+}
+
+@test
+fn atan2CoversEveryQuadrant() -> Result<void, TestFailure> {
+    let ys = ATAN2_Y;
+    let xs = ATAN2_X;
+    let rs = ATAN2_R;
+    for (i in 0..ys.length) {
+        near64("atan2", i, f64.fromBits(rs[i]), Math64.atan2(f64.fromBits(ys[i]), f64.fromBits(xs[i])), 1e-10)?;
+    }
+    return Ok();
+}
+
+@test
+fn expMatchesLibm() -> Result<void, TestFailure> {
+    let xs = EXP_X;
+    let ys = EXP_Y;
+    for (i in 0..xs.length) {
+        near64("exp", i, f64.fromBits(ys[i]), Math64.exp(f64.fromBits(xs[i])), 1e-13)?;
+    }
+    return Ok();
+}
+
+@test
+fn lnMatchesLibm() -> Result<void, TestFailure> {
+    let xs = LN_X;
+    let ys = LN_Y;
+    for (i in 0..xs.length) {
+        near64("ln", i, f64.fromBits(ys[i]), Math64.ln(f64.fromBits(xs[i])), 1e-13)?;
+    }
+    return Ok();
+}
+
+@test
+fn powMatchesLibm() -> Result<void, TestFailure> {
+    let xs = POW_X;
+    let es = POW_E;
+    let ys = POW_Y;
+    for (i in 0..xs.length) {
+        near64("pow", i, f64.fromBits(ys[i]), Math64.pow(f64.fromBits(xs[i]), f64.fromBits(es[i])), 1e-11)?;
+    }
+    return Ok();
+}
+
+@test
+fn specialValues() -> Result<void, TestFailure> {
+    Check.isTrue(Math64.ln(0.0) < -1e308, "ln 0 is -inf")?;
+    let nan = Math64.ln(-1.0);
+    Check.isTrue(nan != nan, "ln of a negative is NaN")?;
+    Check.isTrue(Math64.exp(800.0) > 1e308, "exp overflows to +inf")?;
+    Check.isTrue(Math64.exp(-800.0) == 0.0, "exp underflows to 0")?;
+    Check.isTrue(Math64.pow(0.0, 2.0) == 0.0, "0^2")?;
+    Check.isTrue(Math64.pow(5.0, 0.0) == 1.0, "x^0")?;
+    return Ok();
+}
+
+@test
+fn f32ApiAndHelpers() -> Result<void, TestFailure> {
+    near32("sin 30deg", 0.5, Math.sin(Math.radians(30.0)), 1e-6)?;
+    near32("cos 60deg", 0.5, Math.cos(Math.radians(60.0)), 1e-6)?;
+    near32("degrees", 180.0, Math.degrees(PI), 1e-4)?;
+    near32("hypot", 5.0, Math.hypot(3.0, 4.0), 1e-6)?;
+    near32("lerp", 7.5, Math.lerp(5.0, 10.0, 0.5), 1e-6)?;
+    near32("clamp", 1.0, Math.clamp(3.0, 0.0, 1.0), 0.0)?;
+    near32("smoothstep mid", 0.5, Math.smoothstep(0.0, 2.0, 1.0), 1e-6)?;
+    near32("round half up", 3.0, Math.round(2.5), 0.0)?;
+    near32("round negative", -3.0, Math.round(-2.5), 0.0)?;
+    return Ok();
+}
+
+@test
+fn cssEasingCurves() -> Result<void, TestFailure> {
+    let xs = EASE_X;
+    let inOut = EASE_IN_OUT;
+    let out = EASE_OUT;
+    let a = CubicBezier.easeInOut();
+    let b = CubicBezier.easeOut();
+    for (i in 0..xs.length) {
+        let x = round<f32>(f64.fromBits(xs[i]));
+        near64("ease-in-out", i, f64.fromBits(inOut[i]), a.at(x) as f64, 1e-5)?;
+        near64("ease-out", i, f64.fromBits(out[i]), b.at(x) as f64, 1e-5)?;
+    }
+    near32("linear", 0.3, CubicBezier.linear().at(0.3), 1e-5)?;
+    near32("ends", 1.0, a.at(1.0), 0.0)?;
+    return Ok();
+}

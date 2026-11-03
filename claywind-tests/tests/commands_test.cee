@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MIT
+// Render-command order and payloads, ported from tests/layout_test.c (test_transform, test_effects, test_blend,
+// test_thorvg_era_fields, test_opacity, test_opacity_nested, test_filter).
+
+import claywind;
+
+@test
+fn transformBracketsTheSubtree() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    t.open(hashId("troot"), fixedBox(200.0, 200.0));
+    var c = fixedBox(100.0, 100.0);
+    c.layout.scale = 2.0;
+    c.layout.rotation = 45.0;
+    c.layout.skewX = 12.0;
+    c.background = Color.rgb(10, 20, 30);
+    leaf(mut t, "tchild", c);
+    t.close();
+    finishTree(mut t)?;
+    let start = findCommand(t, K_TRANSFORM_START, 0);
+    let end = findCommand(t, K_TRANSFORM_END, 0);
+    Check.isTrue(start >= 0 && end > start, "transform start precedes end")?;
+    match (t.command(truncate<usize>(start))) {
+        Command.TransformStart(_, d) => {
+            expect("scale", d.scale, 2.0)?;
+            expect("rotation", d.rotation, 45.0)?;
+            expect("pivot x (center)", d.pivot.x, 50.0)?;
+            expect("pivot y (center)", d.pivot.y, 50.0)?;
+            expect("skewX", d.skewX, 12.0)?;
+        }
+        _ => { return Check.fail("not a transform"); }
+    }
+    let fill = findCommand(t, K_FILL, truncate<usize>(start));
+    return Check.isTrue(fill > start && fill < end, "the rectangle is inside the transform");
+}
+
+@test
+fn effectsPaintInOrder() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var fx = fixedBox(100.0, 100.0);
+    fx.background = Color.rgb(10, 10, 10);
+    fx.shadow = Shadow { color: Color.rgba(0, 0, 0, 120), offsetX: 0.0, offsetY: 4.0, blur: 8.0, spread: 0.0 };
+    fx.ring = Ring { color: Color.rgb(255, 0, 0), width: 2.0, offset: 3.0 };
+    fx.gradient.from = Color.rgb(1, 2, 3);
+    fx.gradient.to = Color.rgb(4, 5, 6);
+    fx.gradient.vertical = true;
+    leaf(mut t, "fx", fx);
+    finishTree(mut t)?;
+    let shadow = findCommand(t, K_SHADOW, 0);
+    let rect = findCommand(t, K_FILL, 0);
+    let gradient = findCommand(t, K_GRADIENT, 0);
+    let ring = findCommand(t, K_RING, 0);
+    return Check.isTrue(shadow >= 0 && shadow < rect && rect < gradient && gradient < ring,
+        "shadow, background, gradient, ring");
+}
+
+@test
+fn blendNestsInsideTransform() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var b = fixedBox(80.0, 80.0);
+    b.layout.blend = BlendMode.Multiply;
+    b.layout.rotation = 10.0;
+    b.background = Color.rgb(200, 50, 50);
+    leaf(mut t, "bl", b);
+    finishTree(mut t)?;
+    let tS = findCommand(t, K_TRANSFORM_START, 0);
+    let bS = findCommand(t, K_BLEND_START, 0);
+    let bE = findCommand(t, K_BLEND_END, 0);
+    let tE = findCommand(t, K_TRANSFORM_END, 0);
+    Check.isTrue(tS >= 0 && bS > tS && bE > bS && tE > bE, "blend bracket inside the transform bracket")?;
+    let mode = match (t.command(truncate<usize>(bS))) {
+        Command.BlendStart(BlendMode.Multiply) => true,
+        _ => false,
+    };
+    return Check.isTrue(mode, "blend mode carried");
+}
+
+@test
+fn roundedClipGradientStopsAndBlendModes() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var rc = fixedBox(100.0, 60.0);
+    rc.layout.blend = BlendMode.Screen;
+    rc.cornerRadius = Corners { topLeft: 12.0, topRight: 12.0, bottomRight: 4.0, bottomLeft: 4.0 };
+    rc.clip = Clip { horizontal: true, vertical: true, childOffset: Vec2.zero() };
+    rc.gradient.useAngle = true;
+    rc.gradient.angle = 45.0;
+    rc.gradient.stopCount = 3;
+    rc.gradient.stops[0] = GradientStop { color: Color.rgb(255, 0, 0), position: 0.0 };
+    rc.gradient.stops[1] = GradientStop { color: Color.rgb(0, 255, 0), position: 0.5 };
+    rc.gradient.stops[2] = GradientStop { color: Color.rgb(0, 0, 255), position: 1.0 };
+    leaf(mut t, "rc", rc);
+    var rad = fixedBox(50.0, 50.0);
+    rad.gradient.kind = GradientKind.Radial;
+    rad.gradient.from = Color.rgb(1, 2, 3);
+    rad.gradient.to = Color.rgb(4, 5, 6);
+    leaf(mut t, "rad", rad);
+    finishTree(mut t)?;
+    var clipOk = false;
+    var gradOk = false;
+    var radialOk = false;
+    var blendOk = false;
+    for (i in 0..t.commandCount()) {
+        match (t.command(i)) {
+            Command.ClipStart(_, r, _, _) => {
+                clipOk = r.topLeft == 12.0 && r.topRight == 12.0 && r.bottomLeft == 4.0 && r.bottomRight == 4.0;
+            }
+            Command.GradientFill(_, g, r) => {
+                match (g.kind) {
+                    GradientKind.Radial => { radialOk = g.stopCount == 0 && g.from.r == 1 && g.to.b == 6; }
+                    GradientKind.Linear => {
+                        gradOk = g.useAngle && g.angle == 45.0 && g.stopCount == 3 && g.stops[1].color.g == 255
+                            && g.stops[1].position == 0.5 && g.stops[2].position == 1.0 && r.topLeft == 12.0;
+                    }
+                }
+            }
+            Command.BlendStart(BlendMode.Screen) => { blendOk = true; }
+            _ => {}
+        }
+    }
+    Check.isTrue(clipOk, "the clip command carries the corner radii")?;
+    Check.isTrue(gradOk, "the gradient keeps its angle and stops")?;
+    Check.isTrue(radialOk, "a radial gradient keeps from/to")?;
+    return Check.isTrue(blendOk, "screen blend carried");
+}
+
+@test
+fn opacityIsOutermost() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var o = fixedBox(80.0, 80.0);
+    o.layout.opacity = 0.5;
+    o.layout.rotation = 10.0;
+    o.background = Color.rgb(50, 120, 220);
+    leaf(mut t, "op", o);
+    finishTree(mut t)?;
+    let oS = findCommand(t, K_OPACITY_START, 0);
+    let tS = findCommand(t, K_TRANSFORM_START, 0);
+    let tE = findCommand(t, K_TRANSFORM_END, 0);
+    let oE = findCommand(t, K_OPACITY_END, 0);
+    Check.isTrue(oS >= 0 && tS > oS && tE > tS && oE > tE, "opacity wraps the transform")?;
+    match (t.command(truncate<usize>(oS))) {
+        Command.OpacityStart(_, alpha) => { expect("alpha carried", alpha, 0.5)?; }
+        _ => { return Check.fail("not an opacity bracket"); }
+    }
+    return Ok();
+}
+
+@test
+fn opacityBracketsNest() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var outer = fixedBox(100.0, 40.0);
+    outer.layout.opacity = 0.6;
+    t.open(hashId("op-outer"), outer);
+    var inner = fixedBox(40.0, 40.0);
+    inner.layout.opacity = 0.5;
+    inner.background = Color.rgb(80, 200, 150);
+    leaf(mut t, "op-inner", inner);
+    t.close();
+    finishTree(mut t)?;
+    let s1 = findCommand(t, K_OPACITY_START, 0);
+    let s2 = findCommand(t, K_OPACITY_START, truncate<usize>(s1) + 1);
+    let e1 = findCommand(t, K_OPACITY_END, 0);
+    let e2 = findCommand(t, K_OPACITY_END, truncate<usize>(e1) + 1);
+    Check.isTrue(s1 >= 0 && s2 > s1 && e1 > s2 && e2 > e1, "outer start, inner start, inner end, outer end")?;
+    match (t.command(truncate<usize>(s1))) {
+        Command.OpacityStart(_, a) => { expect("outer alpha", a, 0.6)?; }
+        _ => {}
+    }
+    match (t.command(truncate<usize>(s2))) {
+        Command.OpacityStart(_, a) => { expect("inner alpha", a, 0.5)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+@test
+fn filterBracketCarriesModeAndAmount() -> Result<void, TestFailure> {
+    var storage = [0u8; 262144];
+    let memory = FixedBufferAllocator.over(mut storage);
+    var t = LayoutTree.create(memory, LayoutCapacity.of(64))!;
+    t.begin(1000.0, 1000.0);
+    var f = fixedBox(90.0, 90.0);
+    f.layout.filter = FilterMode.Blur;
+    f.layout.filterAmount = 6.0;
+    f.background = Color.rgb(30, 160, 90);
+    leaf(mut t, "fl", f);
+    finishTree(mut t)?;
+    let fS = findCommand(t, K_FILTER_START, 0);
+    let fE = findCommand(t, K_FILTER_END, 0);
+    Check.isTrue(fS >= 0 && fE > fS, "filter bracket in order")?;
+    match (t.command(truncate<usize>(fS))) {
+        Command.FilterStart(_, FilterMode.Blur, amount) => { expect("blur amount", amount, 6.0)?; }
+        _ => { return Check.fail("filter mode not carried"); }
+    }
+    return Ok();
+}

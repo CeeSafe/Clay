@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: MIT
+// The terminal as a ClayWind platform: raw mode through `stty` (an OS program, run with `Process.run`, so this
+// package stays pure CeeSafe), and keys and SGR-1006 mouse reports decoded from standard input.
+
+import claywind.Platform;
+import claywind.Pointer;
+import claywind.Cursor;
+import claywind.Key;
+import claywind.Dims;
+import claywind.Vec2;
+import claywind.Math;
+import claywind.keyIndex;
+
+/// One decoded input event.
+public enum Event {
+    Press(Key),
+    /// Shift-Tab (terminals report it as its own sequence, not as Shift held with Tab).
+    BackTab,
+    SecondaryDown(i32, i32),
+    Typed(u8),
+    MouseDown(i32, i32),
+    MouseUp(i32, i32),
+    MouseMove(i32, i32),
+    Wheel(i32),
+    Quit,
+    Nothing,
+}
+
+/// The decoded event and how many bytes it used.
+public struct Decoded {
+    public event: Event;
+    public used: usize;
+}
+
+/// Decodes the event at the start of `bytes` (which is not empty).
+public fn decode(bytes: Slice<u8>) -> Decoded {
+    let b = bytes[0];
+    if (b == 3 || b == 'q') {
+        return Decoded { event: Event.Quit, used: 1 };
+    }
+    if (b == 9) {
+        return Decoded { event: Event.Press(Key.Tab), used: 1 };
+    }
+    if (b == 13 || b == 10) {
+        return Decoded { event: Event.Press(Key.Enter), used: 1 };
+    }
+    if (b == 127 || b == 8) {
+        return Decoded { event: Event.Press(Key.Backspace), used: 1 };
+    }
+    if (b != 0x1b) {
+        return Decoded { event: Event.Typed(b), used: 1 };
+    }
+    // ESC alone (or ESC followed by something we do not know) is Escape.
+    if (bytes.length < 3 || bytes[1] != '[') {
+        return Decoded { event: Event.Press(Key.Escape), used: 1 };
+    }
+    let c = bytes[2];
+    if (c == 'A') { return Decoded { event: Event.Press(Key.Up), used: 3 }; }
+    if (c == 'B') { return Decoded { event: Event.Press(Key.Down), used: 3 }; }
+    if (c == 'C') { return Decoded { event: Event.Press(Key.Right), used: 3 }; }
+    if (c == 'D') { return Decoded { event: Event.Press(Key.Left), used: 3 }; }
+    if (c == 'H') { return Decoded { event: Event.Press(Key.Home), used: 3 }; }
+    if (c == 'F') { return Decoded { event: Event.Press(Key.End), used: 3 }; }
+    if (c == 'Z') { return Decoded { event: Event.BackTab, used: 3 }; }
+    if (c == '<') {
+        return decodeMouse(bytes);
+    }
+    // ESC [ digits ~ : Delete is 3~; skip anything else up to its final byte.
+    var i: usize = 2;
+    var number: u32 = 0;
+    while (i < bytes.length && bytes[i] >= '0' && bytes[i] <= '9') {
+        number = number * 10 + ((bytes[i] - '0') as u32);
+        i += 1;
+    }
+    if (i < bytes.length && bytes[i] == '~') {
+        let event = if (number == 3) Event.Press(Key.Delete) else Event.Nothing;
+        return Decoded { event: event, used: i + 1 };
+    }
+    return Decoded { event: Event.Nothing, used: if (i < bytes.length) i + 1 else bytes.length };
+}
+
+/// ESC [ < button ; x ; y (M | m), x and y 1-based.
+fn decodeMouse(bytes: Slice<u8>) -> Decoded {
+    var fields = [0u32; 3];
+    var field: usize = 0;
+    var i: usize = 3;
+    while (i < bytes.length) {
+        let d = bytes[i];
+        if (d >= '0' && d <= '9') {
+            if (field < 3) {
+                fields[field] = fields[field] * 10 + ((d - '0') as u32);
+            }
+        } else if (d == ';') {
+            field += 1;
+        } else if (d == 'M' || d == 'm') {
+            let button = fields[0];
+            let x = truncate<i32>(fields[1]) - 1;
+            let y = truncate<i32>(fields[2]) - 1;
+            let used = i + 1;
+            if ((button & 64) != 0) {
+                // Button 64 is wheel-up, 65 wheel-down; up is a positive delta, as Clay expects.
+                return Decoded { event: Event.Wheel(if ((button & 1) != 0) -1 else 1), used: used };
+            }
+            if ((button & 32) != 0) {
+                return Decoded { event: Event.MouseMove(x, y), used: used };
+            }
+            if ((button & 3) == 2) {
+                return Decoded { event: if (d == 'M') Event.SecondaryDown(x, y) else Event.Nothing, used: used };
+            }
+            if ((button & 3) != 0) {
+                return Decoded { event: Event.Nothing, used: used }; // the middle button
+            }
+            return Decoded { event: if (d == 'M') Event.MouseDown(x, y) else Event.MouseUp(x, y), used: used };
+        } else {
+            return Decoded { event: Event.Nothing, used: i + 1 };
+        }
+        i += 1;
+    }
+    return Decoded { event: Event.Nothing, used: bytes.length };
+}
+
+/// The per-frame input state the UI reads.
+public struct Terminal {
+    public size: Dims;
+    pointerState: Pointer;
+    /// Keys pressed this frame, and keys held for this frame only (Shift for Shift-Tab), by `keyIndex`.
+    pressedKeys: u64;
+    heldKeys: u64;
+    /// Characters typed this frame.
+    typed: [u32; 32];
+    typedCount: usize;
+    typedRead: usize;
+    public cursor: Cursor;
+    dt: f32;
+    clock: f64;
+
+    public fn create(size: Dims) -> Terminal => Terminal {
+        size: size,
+        pointerState: Pointer.at(Vec2 { x: -1.0, y: -1.0 }),
+        pressedKeys: 0,
+        heldKeys: 0,
+        typed: [0u32; 32],
+        typedCount: 0,
+        typedRead: 0,
+        cursor: Cursor.Default,
+        dt: 0.0,
+        clock: 0.0,
+    };
+
+    /// Seconds since the previous frame, for transitions and the clock (the host measures it).
+    public fn setFrameTime(borrow mut this, seconds: f32) {
+        this.dt = Math.clamp(seconds, 0.0, 0.25);
+        this.clock += seconds as f64;
+    }
+
+    fn press(borrow mut this, k: Key) {
+        this.pressedKeys = this.pressedKeys | (1u64 << (keyIndex(k) as u64));
+    }
+
+    /// Folds one event into this frame's state.
+    public fn apply(borrow mut this, event: Event) {
+        match (event) {
+            Event.Press(k) => { this.press(k); }
+            Event.BackTab => {
+                this.press(Key.Tab);
+                this.heldKeys = this.heldKeys | (1u64 << (keyIndex(Key.LeftShift) as u64));
+            }
+            Event.Typed(b) => {
+                if (this.typedCount < 32) {
+                    this.typed[this.typedCount] = b as u32;
+                    this.typedCount += 1;
+                }
+            }
+            Event.MouseDown(x, y) => {
+                this.moveTo(x, y);
+                this.pointerState.down = true;
+                this.pointerState.pressed = true;
+            }
+            Event.SecondaryDown(x, y) => {
+                this.moveTo(x, y);
+                this.pointerState.secondaryPressed = true;
+            }
+            Event.MouseUp(x, y) => {
+                this.moveTo(x, y);
+                this.pointerState.down = false;
+                this.pointerState.released = true;
+            }
+            Event.MouseMove(x, y) => { this.moveTo(x, y); }
+            // Clay scrolls 10 units per wheel unit; a third of a unit is 3 rows per notch here.
+            Event.Wheel(d) => { this.pointerState.wheel.y = round<f32>(d) * 0.3; }
+            Event.Quit => {}
+            Event.Nothing => {}
+        }
+    }
+
+    /// Clears the one-frame edges (pressed/released/wheel/keys/typed) after a frame used them.
+    public fn endFrame(borrow mut this) {
+        this.pointerState.pressed = false;
+        this.pointerState.released = false;
+        this.pointerState.secondaryPressed = false;
+        this.pointerState.wheel = Vec2.zero();
+        this.pressedKeys = 0;
+        this.heldKeys = 0;
+        this.typedCount = 0;
+        this.typedRead = 0;
+    }
+
+    fn moveTo(borrow mut this, x: i32, y: i32) {
+        // Cell centres, so a cell's box contains the pointer.
+        this.pointerState.position = Vec2 { x: round<f32>(x) + 0.5, y: round<f32>(y) + 0.5 };
+    }
+}
+
+/// Terminals report key presses, not releases: a key is "down" only on the frame it arrives, and repeats arrive as
+/// presses.
+impl Platform for Terminal {
+    fn screenSize(borrow this) -> Dims => this.size;
+    fn frameTime(borrow this) -> f32 => this.dt;
+    fn time(borrow this) -> f64 => this.clock;
+    fn pointer(borrow this) -> Pointer => this.pointerState;
+    fn keyDown(borrow this, key: Key) -> bool =>
+        ((this.pressedKeys | this.heldKeys) >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyPressed(borrow this, key: Key) -> bool => (this.pressedKeys >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyRepeated(borrow this, key: Key) -> bool => false;
+    fn nextChar(borrow mut this) -> u32 {
+        if (this.typedRead >= this.typedCount) {
+            return 0;
+        }
+        let c = this.typed[this.typedRead];
+        this.typedRead += 1;
+        return c;
+    }
+    fn setCursor(borrow mut this, cursor: Cursor) {
+        this.cursor = cursor;
+    }
+}
+
+/// Puts the terminal in raw mode and turns on the alternate screen and mouse reporting; `drop` undoes it.
+public struct RawMode {
+    active: bool;
+
+    public fn enter() -> RawMode {
+        var args = Vector<StringView>.create();
+        args.push("raw")!;
+        args.push("-echo")!;
+        let ok = match (Process.run("stty", args)) {
+            Ok(status) => status == 0,
+            Err(_) => false,
+        };
+        // Alternate screen, hidden cursor, any-motion mouse tracking with SGR coordinates.
+        Console.write("\u{1b}[?1049h\u{1b}[?25l\u{1b}[?1003h\u{1b}[?1006h");
+        return RawMode { active: ok };
+    }
+
+    public fn isActive(borrow this) -> bool => this.active;
+
+    drop {
+        Console.write("\u{1b}[?1006l\u{1b}[?1003l\u{1b}[0m\u{1b}[?25h\u{1b}[?1049l");
+        if (this.active) {
+            var args = Vector<StringView>.create();
+            args.push("sane")!;
+            let ignored = Process.run("stty", args);
+        }
+    }
+}
+
+/// The terminal size from `stty size` ("rows cols"), or null. stty reads the terminal on its standard input, which
+/// `Process.capture` replaces, so it is pointed at /dev/tty explicitly (-f on BSD/macOS, -F on Linux).
+public fn terminalSize() -> Dims? {
+    let attempt1 = sizeWith("-f");
+    if (attempt1 != null) {
+        return attempt1;
+    }
+    return sizeWith("-F");
+}
+
+fn sizeWith(flag: StringView) -> Dims? {
+    var args = Vector<StringView>.create();
+    args.push(flag)!;
+    args.push("/dev/tty")!;
+    args.push("size")!;
+    let output = match (Process.capture("stty", args, null)) {
+        Ok(o) => o,
+        Err(_) => { return null; }
+    };
+    if (output.status != 0) {
+        return null;
+    }
+    var numbers = [0u32; 2];
+    var which: usize = 0;
+    var seen = false;
+    for (b in output.stdout) {
+        if (b >= '0' && b <= '9') {
+            if (which < 2) {
+                numbers[which] = numbers[which] * 10 + ((b - '0') as u32);
+            }
+            seen = true;
+        } else if (seen) {
+            which += 1;
+            seen = false;
+        }
+    }
+    if (numbers[0] == 0 || numbers[1] == 0) {
+        return null;
+    }
+    return Dims { w: round<f32>(numbers[1]), h: round<f32>(numbers[0]) };
+}

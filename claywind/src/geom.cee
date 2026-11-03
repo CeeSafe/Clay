@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: MIT
+// Geometry primitives shared by layout, rendering and hosts.
+
+/// A point or offset in layout units (logical pixels).
+public struct Vec2 {
+    public x: f32;
+    public y: f32;
+
+    public fn zero() -> Vec2 => Vec2 { x: 0.0, y: 0.0 };
+}
+
+/// A width and a height in layout units.
+public struct Dims {
+    public w: f32;
+    public h: f32;
+}
+
+/// An axis-aligned box in layout units.
+public struct Rect {
+    public x: f32;
+    public y: f32;
+    public w: f32;
+    public h: f32;
+
+    public fn zero() -> Rect => Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+
+    public fn contains(this, p: Vec2) -> bool => p.x >= this.x && p.y >= this.y && p.x < this.x + this.w &&
+        p.y < this.y + this.h;
+}
+
+/// Padding or margin on four sides.
+public struct Sides {
+    public top: f32;
+    public right: f32;
+    public bottom: f32;
+    public left: f32;
+
+    public fn all(v: f32) -> Sides => Sides { top: v, right: v, bottom: v, left: v };
+}
+
+/// Per-corner radii (Tailwind rounded-*), in layout units.
+public struct Corners {
+    public topLeft: f32;
+    public topRight: f32;
+    public bottomRight: f32;
+    public bottomLeft: f32;
+
+    public fn all(r: f32) -> Corners => Corners { topLeft: r, topRight: r, bottomRight: r, bottomLeft: r };
+    public fn isZero(this) -> bool => this.topLeft <= 0.0 && this.topRight <= 0.0 && this.bottomRight <= 0.0 &&
+        this.bottomLeft <= 0.0;
+
+    /// Scaled down uniformly so adjacent radii never overlap in a `w` x `h` box (the CSS rule).
+    public fn fitted(this, w: f32, h: f32) -> Corners {
+        var f: f32 = 1.0;
+        let top = this.topLeft + this.topRight;
+        let bottom = this.bottomLeft + this.bottomRight;
+        let left = this.topLeft + this.bottomLeft;
+        let right = this.topRight + this.bottomRight;
+        if (top > w) { f = f.min(w / top); }
+        if (bottom > w) { f = f.min(w / bottom); }
+        if (left > h) { f = f.min(h / left); }
+        if (right > h) { f = f.min(h / right); }
+        return Corners {
+            topLeft: this.topLeft * f,
+            topRight: this.topRight * f,
+            bottomRight: this.bottomRight * f,
+            bottomLeft: this.bottomLeft * f,
+        };
+    }
+}
+
+/// Rectangle operations used by clipping and damage tracking.
+public struct Rects {
+    /// The overlap of two boxes; zero-sized when they do not overlap.
+    public fn intersect(a: Rect, b: Rect) -> Rect {
+        let x0 = a.x.max(b.x);
+        let y0 = a.y.max(b.y);
+        let x1 = (a.x + a.w).min(b.x + b.w);
+        let y1 = (a.y + a.h).min(b.y + b.h);
+        return Rect { x: x0, y: y0, w: (x1 - x0).max(0.0), h: (y1 - y0).max(0.0) };
+    }
+
+    /// The smallest box holding both.
+    public fn union(a: Rect, b: Rect) -> Rect {
+        let x0 = a.x.min(b.x);
+        let y0 = a.y.min(b.y);
+        let x1 = (a.x + a.w).max(b.x + b.w);
+        let y1 = (a.y + a.h).max(b.y + b.h);
+        return Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
+
+    /// The box shrunk by `s` on each side (grown for negative values).
+    public fn inset(r: Rect, s: Sides) -> Rect => Rect {
+        x: r.x + s.left,
+        y: r.y + s.top,
+        w: (r.w - s.left - s.right).max(0.0),
+        h: (r.h - s.top - s.bottom).max(0.0),
+    };
+
+    public fn isEmpty(r: Rect) -> bool => r.w <= 0.0 || r.h <= 0.0;
+}
+
+/// A 2D affine transform: (x, y) -> (a x + c y + e, b x + d y + f), as CSS/SVG matrix(a, b, c, d, e, f).
+public struct Affine2 {
+    public a: f32;
+    public b: f32;
+    public c: f32;
+    public d: f32;
+    public e: f32;
+    public f: f32;
+
+    public fn identity() -> Affine2 => Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+    public fn translation(x: f32, y: f32) -> Affine2 => Affine2 { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y };
+    public fn scaling(sx: f32, sy: f32) -> Affine2 => Affine2 { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 };
+    /// Rotation by `degrees`, clockwise on screen (y down), as CSS rotate().
+    public fn rotation(degrees: f32) -> Affine2 {
+        let r = Math.radians(degrees);
+        let s = Math.sin(r);
+        let k = Math.cos(r);
+        return Affine2 { a: k, b: s, c: -s, d: k, e: 0.0, f: 0.0 };
+    }
+    /// CSS skew(xDegrees, yDegrees).
+    public fn skewing(xDegrees: f32, yDegrees: f32) -> Affine2 => Affine2 {
+        a: 1.0,
+        b: Math.tan(Math.radians(yDegrees)),
+        c: Math.tan(Math.radians(xDegrees)),
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    /// `this` applied after `first` (this * first).
+    public fn after(this, first: Affine2) -> Affine2 => Affine2 {
+        a: this.a * first.a + this.c * first.b,
+        b: this.b * first.a + this.d * first.b,
+        c: this.a * first.c + this.c * first.d,
+        d: this.b * first.c + this.d * first.d,
+        e: this.a * first.e + this.c * first.f + this.e,
+        f: this.b * first.e + this.d * first.f + this.f,
+    };
+
+    /// The transform about a pivot point (CSS transform-origin): translate(p) * this * translate(-p).
+    public fn about(this, px: f32, py: f32) -> Affine2 =>
+        Affine2.translation(px, py).after(this.after(Affine2.translation(-px, -py)));
+
+    public fn apply(this, p: Vec2) -> Vec2 => Vec2 {
+        x: this.a * p.x + this.c * p.y + this.e,
+        y: this.b * p.x + this.d * p.y + this.f,
+    };
+
+    public fn determinant(this) -> f32 => this.a * this.d - this.b * this.c;
+
+    /// The inverse, or null when the transform is singular (e.g. scale 0).
+    public fn inverse(this) -> Affine2? {
+        let det = this.determinant();
+        if (det.abs() < 1e-12) {
+            return null;
+        }
+        let inv = 1.0 / det;
+        return Affine2 {
+            a: this.d * inv,
+            b: -this.b * inv,
+            c: -this.c * inv,
+            d: this.a * inv,
+            e: (this.c * this.f - this.d * this.e) * inv,
+            f: (this.b * this.e - this.a * this.f) * inv,
+        };
+    }
+
+    /// The axis-aligned bounds of a transformed box.
+    public fn bounds(this, r: Rect) -> Rect {
+        let p0 = this.apply(Vec2 { x: r.x, y: r.y });
+        let p1 = this.apply(Vec2 { x: r.x + r.w, y: r.y });
+        let p2 = this.apply(Vec2 { x: r.x, y: r.y + r.h });
+        let p3 = this.apply(Vec2 { x: r.x + r.w, y: r.y + r.h });
+        let x0 = p0.x.min(p1.x).min(p2.x.min(p3.x));
+        let y0 = p0.y.min(p1.y).min(p2.y.min(p3.y));
+        let x1 = p0.x.max(p1.x).max(p2.x.max(p3.x));
+        let y1 = p0.y.max(p1.y).max(p2.y.max(p3.y));
+        return Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
+}

@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: MIT
+// The TrueType reader against Arial's tables, with reference values from an independent Python parse of the file.
+
+import claywind;
+
+@test
+fn parsesArialTables() -> Result<void, TestFailure> {
+    let font = readFile(arialPath());
+    if (font.length == 0) {
+        Console.writeLine("  (Arial not found: skipped)");
+        return Ok();
+    }
+    let d = font.view();
+    let info = parseFont(d)!;
+    expect("unitsPerEm", info.unitsPerEm, 2048.0)?;
+    expect("ascent", info.ascent, 1854.0)?;
+    expect("descent", info.descent, -434.0)?;
+    let h = glyphIndex(d, info, 'H');
+    Check.equalU64(43, h as u64)?;
+    expect("advance of H", glyphAdvance(d, info, h), 1479.0)?;
+    let a = glyphIndex(d, info, 'A');
+    let v = glyphIndex(d, info, 'V');
+    Check.equalU64(36, a as u64)?;
+    Check.equalU64(57, v as u64)?;
+    expect("kern A-V", kerning(d, info, a, v), -152.0)?;
+    expect("no kern V-V", kerning(d, info, v, v), 0.0)?;
+    Check.equalU64(200, glyphIndex(d, info, 0xC1) as u64)?; // Á, a composite glyph
+    Check.equalU64(188, glyphIndex(d, info, 0x20AC) as u64)?; // €
+    Check.equalU64(0, glyphIndex(d, info, 0xE000) as u64)?; // unmapped: .notdef
+    let junk = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    Check.isTrue(parseFont(junk[..]) == null, "non-fonts are rejected")?;
+    return Ok();
+}
+
+@test
+fn decodesUtf8() -> Result<void, TestFailure> {
+    let s = "aé€😀";
+    let b = s.bytes();
+    let c1 = decodeUtf8(b, 0);
+    Check.equalU64(0x61, c1[0] as u64)?;
+    let c2 = decodeUtf8(b, 1);
+    Check.equalU64(0xE9, c2[0] as u64)?;
+    Check.equalU64(2, c2[1] as u64)?;
+    let c3 = decodeUtf8(b, 3);
+    Check.equalU64(0x20AC, c3[0] as u64)?;
+    Check.equalU64(3, c3[1] as u64)?;
+    let c4 = decodeUtf8(b, 6);
+    Check.equalU64(0x1F600, c4[0] as u64)?;
+    return Check.equalU64(4, c4[1] as u64);
+}
+
+@test
+fn compositeAndAccentedGlyphsDraw() -> Result<void, TestFailure> {
+    let font = readFile(arialPath());
+    if (font.length == 0) {
+        return Ok();
+    }
+    var storage = heap(8388608);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = RasterCapacity.of(120, 60);
+    c.imagePixels = 4;
+    c.fontBytes = 1048576;
+    var ras = Raster.create(memory, c)!;
+    Check.isTrue(ras.loadFont(0, font.view()), "loads")?;
+    ras.begin(rgba(255, 255, 255, 255));
+    let text = "ÁÉ";
+    let run = TextRun { start: 0, length: 4, color: rgba(0, 0, 0, 255), fontId: 0, fontSize: 40.0, letterSpacing: 0.0, lineHeight: 0.0 };
+    ras.draw(Command.Text(box(10.0, 5.0, 100.0, 50.0), run), text.bytes());
+    ras.finish();
+    // The accent (a separate component above the cap height) produces ink in the top rows.
+    var accentInk: u32 = 0;
+    for (y in 5..14usize) {
+        for (x in 10..40usize) {
+            if (ras.pixelAt(x, y).r < 128) {
+                accentInk += 1;
+            }
+        }
+    }
+    return Check.isTrue(accentInk > 5, "the acute accent of the composite glyph is drawn");
+}
+
+struct StillPlatform {
+    size: Dims;
+}
+
+impl Platform for StillPlatform {
+    fn screenSize(borrow this) -> Dims => this.size;
+    fn frameTime(borrow this) -> f32 => 0.016;
+    fn time(borrow this) -> f64 => 0.0;
+    fn pointer(borrow this) -> Pointer => Pointer.at(Vec2 { x: -1.0, y: -1.0 });
+    fn keyDown(borrow this, key: Key) -> bool => false;
+    fn keyPressed(borrow this, key: Key) -> bool => false;
+    fn keyRepeated(borrow this, key: Key) -> bool => false;
+    fn nextChar(borrow mut this) -> u32 => 0;
+    fn setCursor(borrow mut this, cursor: Cursor) {}
+}
+
+@test
+fn uiLaysOutAndRendersWithTheRasterFonts() -> Result<void, TestFailure> {
+    let font = readFile(arialPath());
+    if (font.length == 0) {
+        return Ok();
+    }
+    var rasterStorage = heap(8388608);
+    let rasterMemory = FixedBufferAllocator.over(mut rasterStorage.viewMut());
+    var c = RasterCapacity.of(200, 60);
+    c.imagePixels = 4;
+    c.fontBytes = 1048576;
+    var ras = Raster.create(rasterMemory, c)!;
+    Check.isTrue(ras.loadFont(0, font.view()), "loads")?;
+    var uiStorage = [0u8; 524288];
+    let uiMemory = FixedBufferAllocator.over(mut uiStorage);
+    var ui = Ui.create(uiMemory, UiCapacity.of(32))!;
+    var platform = StillPlatform { size: Dims { w: 200.0, h: 60.0 } };
+    ui.begin(mut platform);
+    ui.open(Style.row().id("label").p(4.0).bg(SLATE_900));
+    ui.label("Hello", Text.of().size(20.0).color(WHITE));
+    ui.close();
+    let ok = match (endFrame(mut ui, mut platform, ras)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    Check.isTrue(ok, "frame fits")?;
+    // Arial "Hello" at 20px: H .722 + e .556 + l .222 + l .222 + o .556 em = 2.278 em = 45.56px, plus padding 8.
+    expect("label width from Arial advances", ui.boxOf("label")!.w, 53.56)?;
+    ras.begin(Color.rgb(240, 240, 240));
+    renderInto(ui, mut ras);
+    ras.finish();
+    var ink: u32 = 0;
+    for (y in 0..30usize) {
+        for (x in 0..60usize) {
+            if (ras.pixelAt(x, y).r > 200) {
+                ink += 1;
+            }
+        }
+    }
+    return Check.isTrue(ink > 40, "white glyph ink on the dark label");
+}

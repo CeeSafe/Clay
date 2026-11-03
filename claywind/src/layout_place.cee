@@ -1,0 +1,548 @@
+// SPDX-License-Identifier: MIT
+// Positioning and render commands: the second half of Clay__CalculateFinalLayout, plus Clay__ElementBaseline.
+// Commands are emitted in Clay's order: on the way down opacity, filter, transform, blend, image, custom, clip,
+// shadow, background, gradient, icon, ring; on the way up border (and between-children dividers), clip end,
+// blend end, transform end, filter end, opacity end.
+
+/// The fraction of a font's em above the baseline when no metric is registered (CLAY__TEXT_ASCENT_RATIO).
+const TEXT_ASCENT_RATIO: f32 = 0.8;
+
+/// Clay__ElementBaseline: distance from an element's top to its first text baseline.
+fn elementBaseline<M: TextMetrics>(l: borrow LayoutTree, index: usize, metrics: borrow M) -> f32 {
+    let node = l.nodes.items[index];
+    if (node.isText) {
+        let height = node.dims.h;
+        if (l.hasBaselineMetric) {
+            let baseline = metrics.baseline(node.text);
+            return if (baseline > height) height else baseline;
+        }
+        var fontSize = node.text.fontSize;
+        if (fontSize <= 0.0 || fontSize > height) {
+            fontSize = height;
+        }
+        let leadingTop = (height - fontSize) * 0.5;
+        return leadingTop + fontSize * TEXT_ASCENT_RATIO;
+    }
+    if (node.childCount > 0) {
+        return node.decl.layout.padding.top + elementBaseline(l, childOf(l, index, 0), metrics);
+    }
+    return node.dims.h;
+}
+
+fn isOffscreen(l: borrow LayoutTree, b: Rect) -> bool {
+    if (!l.cullingEnabled) {
+        return false;
+    }
+    return b.x > l.screen.w || b.y > l.screen.h || b.x + b.w < 0.0 || b.y + b.h < 0.0;
+}
+
+fn emit(l: borrow mut LayoutTree, command: Command) -> bool => l.commands.push(command);
+
+/// Where a floating root attaches (the attach-point arithmetic of Clay__CalculateFinalLayout).
+fn floatingPosition(l: borrow LayoutTree, root: TreeRoot) -> Vec2 {
+    let node = l.nodes.items[root.index];
+    let config = node.decl.floating;
+    let parentBox = match (root.parentIndex) {
+        Some(p) => l.nodes.items[p].area,
+        null => Rect.zero(),
+    };
+    let d = node.dims;
+    var x = match (config.parent) {
+        AttachPoint.LeftTop => parentBox.x,
+        AttachPoint.LeftCenter => parentBox.x,
+        AttachPoint.LeftBottom => parentBox.x,
+        AttachPoint.CenterTop => parentBox.x + parentBox.w / 2.0,
+        AttachPoint.CenterCenter => parentBox.x + parentBox.w / 2.0,
+        AttachPoint.CenterBottom => parentBox.x + parentBox.w / 2.0,
+        _ => parentBox.x + parentBox.w,
+    };
+    x -= match (config.element) {
+        AttachPoint.CenterTop => d.w / 2.0,
+        AttachPoint.CenterCenter => d.w / 2.0,
+        AttachPoint.CenterBottom => d.w / 2.0,
+        AttachPoint.RightTop => d.w,
+        AttachPoint.RightCenter => d.w,
+        AttachPoint.RightBottom => d.w,
+        _ => 0.0,
+    };
+    var y = match (config.parent) {
+        AttachPoint.LeftTop => parentBox.y,
+        AttachPoint.CenterTop => parentBox.y,
+        AttachPoint.RightTop => parentBox.y,
+        AttachPoint.LeftCenter => parentBox.y + parentBox.h / 2.0,
+        AttachPoint.CenterCenter => parentBox.y + parentBox.h / 2.0,
+        AttachPoint.RightCenter => parentBox.y + parentBox.h / 2.0,
+        _ => parentBox.y + parentBox.h,
+    };
+    y -= match (config.element) {
+        AttachPoint.LeftCenter => d.h / 2.0,
+        AttachPoint.CenterCenter => d.h / 2.0,
+        AttachPoint.RightCenter => d.h / 2.0,
+        AttachPoint.LeftBottom => d.h,
+        AttachPoint.CenterBottom => d.h,
+        AttachPoint.RightBottom => d.h,
+        _ => 0.0,
+    };
+    return Vec2 { x: x + config.offset.x, y: y + config.offset.y };
+}
+
+/// Positions one tree root and its subtree, bracketed by its clip region when it has one.
+fn placeRoot<M: TextMetrics>(l: borrow mut LayoutTree, root: TreeRoot, metrics: borrow M) -> bool {
+    var position = Vec2.zero();
+    if (l.nodes.items[root.index].decl.floating.isFloating()) {
+        position = floatingPosition(l, root);
+    }
+    var clipped = false;
+    match (root.clipIndex) {
+        Some(c) => {
+            let clipNode = l.nodes.items[c];
+            if (!isOffscreen(l, clipNode.area)) {
+                if (!emit(mut l, Command.ClipStart(
+                    clipNode.area, clipNode.decl.cornerRadius, clipNode.decl.clip.horizontal,
+                    clipNode.decl.clip.vertical,
+                ))) {
+                    return false;
+                }
+                clipped = true;
+            }
+        }
+        null => {}
+    }
+    if (!placeElement(mut l, root.index, position, metrics)) {
+        return false;
+    }
+    if (clipped && !emit(mut l, Command.ClipEnd)) {
+        return false;
+    }
+    return true;
+}
+
+/// Places a text element: one Text command per wrapped line.
+fn placeText(l: borrow mut LayoutTree, index: usize, area: Rect) -> bool {
+    let node = l.nodes.items[index];
+    l.nodes.items[index].area = area;
+    l.nodes.items[index].placed = true;
+    if (isOffscreen(l, area)) {
+        return true;
+    }
+    let config = node.text;
+    let natural = node.preferred.h;
+    let lineHeight = if (config.lineHeight > 0.0) config.lineHeight else natural;
+    var y = (lineHeight - natural) / 2.0;
+    for (k in 0..node.linesCount) {
+        let line = l.lines.items[node.linesStart + k];
+        if (line.length == 0) {
+            y += lineHeight;
+            continue;
+        }
+        let offset = match (config.align) {
+            TextAlign.Left => 0.0,
+            TextAlign.Center => (area.w - line.width) / 2.0,
+            TextAlign.Right => area.w - line.width,
+        };
+        let run = TextRun {
+            start: line.start,
+            length: line.length,
+            color: config.color,
+            fontId: config.fontId,
+            fontSize: config.fontSize,
+            letterSpacing: config.letterSpacing,
+            lineHeight: config.lineHeight,
+        };
+        if (!emit(
+            mut l,
+            Command.Text(Rect { x: area.x + offset, y: area.y + y, w: line.width, h: line.height }, run),
+        )) {
+            return false;
+        }
+        y += lineHeight;
+        if (l.cullingEnabled && area.y + y > l.screen.h) {
+            break;
+        }
+    }
+    return true;
+}
+
+/// Places one element and (recursively) its children; emits its commands.
+fn placeElement<M: TextMetrics>(l: borrow mut LayoutTree, index: usize, position: Vec2, metrics: borrow M) -> bool {
+    let dims = l.nodes.items[index].dims;
+    var area = Rect { x: position.x, y: position.y, w: dims.w, h: dims.h };
+    if (l.nodes.items[index].isText) {
+        return placeText(mut l, index, area);
+    }
+    // Clamp the corner radii the CSS way so adjacent pairs fit their side (rounded-full may be any large value).
+    l.nodes.items[index].decl.cornerRadius = l.nodes.items[index].decl.cornerRadius.fitted(area.w, area.h);
+    let decl = l.nodes.items[index].decl;
+    let layout = decl.layout;
+    if (decl.floating.isFloating()) {
+        area.x -= decl.floating.expand.w;
+        area.w += decl.floating.expand.w * 2.0;
+        area.y -= decl.floating.expand.h;
+        area.h += decl.floating.expand.h * 2.0;
+    }
+    let scroll = if (decl.clip.any()) decl.clip.childOffset else Vec2.zero();
+    let offscreen = isOffscreen(l, area);
+    let radius = decl.cornerRadius;
+
+    if (!offscreen) {
+        var ok = true;
+        if (layout.hasOpacity()) {
+            ok = ok && emit(mut l, Command.OpacityStart(area, layout.opacity));
+        }
+        if (layout.hasFilter()) {
+            ok = ok && emit(mut l, Command.FilterStart(area, layout.filter, layout.filterAmount));
+        }
+        if (layout.hasTransform()) {
+            ok = ok && emit(mut l, Command.TransformStart(area, TransformData {
+                scale: if (layout.scale == 0.0) 1.0 else layout.scale,
+                rotation: layout.rotation,
+                skewX: layout.skewX,
+                skewY: layout.skewY,
+                pivot: Vec2 { x: area.x + area.w / 2.0, y: area.y + area.h / 2.0 },
+            }));
+        }
+        if (layout.hasBlend()) {
+            ok = ok && emit(mut l, Command.BlendStart(layout.blend));
+        }
+        if (decl.image != 0) {
+            ok = ok && emit(mut l, Command.Picture(area, decl.background, radius, decl.image));
+        }
+        if (decl.custom != 0) {
+            ok = ok && emit(mut l, Command.CustomDraw(area, decl.background, radius, decl.custom));
+        }
+        if (decl.clip.any()) {
+            ok = ok && emit(mut l, Command.ClipStart(area, radius, decl.clip.horizontal, decl.clip.vertical));
+        }
+        if (decl.shadow.color.a > 0) {
+            ok = ok && emit(mut l, Command.DropShadow(area, decl.shadow, radius));
+        }
+        if (decl.background.a > 0) {
+            ok = ok && emit(mut l, Command.Fill(area, decl.background, radius));
+        }
+        if (decl.gradient.present()) {
+            var g = decl.gradient;
+            if (g.stopCount > GRADIENT_MAX_STOPS) {
+                g.stopCount = GRADIENT_MAX_STOPS;
+            }
+            ok = ok && emit(mut l, Command.GradientFill(area, g, radius));
+        }
+        if (decl.icon.id != 0) {
+            ok = ok && emit(mut l, Command.IconDraw(area, decl.icon));
+        }
+        if (decl.ring.color.a > 0 && decl.ring.width > 0.0) {
+            ok = ok && emit(mut l, Command.RingStroke(area, decl.ring, radius));
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    l.nodes.items[index].area = area;
+    l.nodes.items[index].placed = true;
+
+    if (!positionChildren(mut l, index, area, scroll, metrics)) {
+        return false;
+    }
+
+    // On the way back up.
+    if (!offscreen) {
+        var ok = true;
+        if (decl.border.width.any()) {
+            ok = ok && emit(mut l, Command.Stroke(area, decl.border.color, radius, decl.border.width));
+            if (decl.border.width.betweenChildren > 0.0 && decl.border.color.a > 0) {
+                ok = ok && emitDividers(mut l, index, area, scroll);
+            }
+        }
+        if (decl.clip.any()) {
+            ok = ok && emit(mut l, Command.ClipEnd);
+        }
+        if (layout.hasBlend()) {
+            ok = ok && emit(mut l, Command.BlendEnd);
+        }
+        if (layout.hasTransform()) {
+            ok = ok && emit(mut l, Command.TransformEnd);
+        }
+        if (layout.hasFilter()) {
+            ok = ok && emit(mut l, Command.FilterEnd(layout.filter, layout.filterAmount));
+        }
+        if (layout.hasOpacity()) {
+            ok = ok && emit(mut l, Command.OpacityEnd(layout.opacity));
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Border `betweenChildren` dividers, centred in the gaps (Clay emits these as rectangles).
+fn emitDividers(l: borrow mut LayoutTree, index: usize, area: Rect, scroll: Vec2) -> bool {
+    let node = l.nodes.items[index];
+    let layout = node.decl.layout;
+    let width = node.decl.border.width.betweenChildren;
+    let color = node.decl.border.color;
+    // Clay halves these as uint16_t, i.e. with integer division; floor to match it exactly.
+    let halfGap = (layout.childGap / 2.0).floor();
+    let halfWidth = (width / 2.0).floor();
+    var offsetX = layout.padding.left - halfGap;
+    var offsetY = layout.padding.top - halfGap;
+    let none = Corners.all(0.0);
+    for (k in 0..node.childCount) {
+        let child = childOf(l, index, k);
+        let cd = l.nodes.items[child].dims;
+        if (layout.isRow()) {
+            if (k > 0 && !emit(mut l, Command.Fill(Rect {
+                x: area.x + offsetX + scroll.x - halfWidth, y: area.y + scroll.y,
+                w: width, h: node.dims.h,
+            }, color, none))) {
+                return false;
+            }
+            offsetX += cd.w + layout.childGap;
+        } else {
+            if (k > 0 && !emit(mut l, Command.Fill(Rect {
+                x: area.x + scroll.x, y: area.y + offsetY + scroll.y - halfWidth,
+                w: node.dims.w, h: width,
+            }, color, none))) {
+                return false;
+            }
+            offsetY += cd.h + layout.childGap;
+        }
+    }
+    return true;
+}
+
+/// Lays out and recursively places the children of `index` (the child-positioning part of the DFS).
+fn positionChildren<M: TextMetrics>(
+    l: borrow mut LayoutTree,
+    index: usize,
+    area: Rect,
+    scroll: Vec2,
+    metrics: borrow M,
+) -> bool {
+    let node = l.nodes.items[index];
+    let layout = node.decl.layout;
+    let count = node.childCount;
+    let pad = layout.padding;
+    if (count == 0) {
+        l.nodes.items[index].contentSize = Dims { w: pad.left + pad.right, h: pad.top + pad.bottom };
+        return true;
+    }
+    let row = layout.isRow();
+    var betweenSpace: f32 = 0.0;
+    var maxBaseline: f32 = 0.0;
+    let crossAlign = if (row) layout.alignY else layout.alignX;
+    let mainAlign = if (row) layout.alignX else layout.alignY;
+    let baselineAlign = match (crossAlign) {
+        AxisAlign.Baseline => true,
+        _ => false,
+    };
+    if (baselineAlign) {
+        for (k in 0..count) {
+            maxBaseline = maxBaseline.max(elementBaseline(l, childOf(l, index, k), metrics));
+        }
+    }
+
+    if (layout.wrap) {
+        let lines = measureWrapLines(l, index, false);
+        let cw = if (row) lines.longestLine else lines.linesCross;
+        let ch = if (row) lines.linesCross else lines.longestLine;
+        l.nodes.items[index].contentSize = Dims { w: cw + pad.left + pad.right, h: ch + pad.top + pad.bottom };
+        return placeWrapped(mut l, index, area, scroll, metrics);
+    }
+
+    // On-axis alignment.
+    var mainUsed: f32 = 0.0;
+    var crossUsed: f32 = 0.0;
+    for (k in 0..count) {
+        let child = childOf(l, index, k);
+        let m = marginOf(l, child);
+        let cd = l.nodes.items[child].dims;
+        mainUsed += if (row) cd.w + m.left + m.right else cd.h + m.top + m.bottom;
+        crossUsed = crossUsed.max(if (row) cd.h + m.top + m.bottom else cd.w + m.left + m.right);
+    }
+    mainUsed += usizeF(count - 1) * layout.childGap;
+    let cw = if (row) mainUsed else crossUsed;
+    let ch = if (row) crossUsed else mainUsed;
+    l.nodes.items[index].contentSize = Dims { w: cw + pad.left + pad.right, h: ch + pad.top + pad.bottom };
+    let inner =
+        if (row) node.dims.w -
+            layout.padding.left - layout.padding.right else node.dims.h - layout.padding.top - layout.padding.bottom;
+    var extra = (inner - mainUsed).max(0.0);
+    let n = usizeF(count);
+    match (mainAlign) {
+        AxisAlign.Start => { extra = 0.0; }
+        AxisAlign.Center => { extra /= 2.0; }
+        AxisAlign.End => {}
+        AxisAlign.Between => {
+            betweenSpace = if (count > 1) extra / (n - 1.0) else 0.0;
+            extra = 0.0;
+        }
+        AxisAlign.Around => {
+            betweenSpace = extra / n;
+            extra = betweenSpace / 2.0;
+        }
+        AxisAlign.Evenly => {
+            betweenSpace = extra / (n + 1.0);
+            extra = betweenSpace;
+        }
+        AxisAlign.Baseline => { extra = 0.0; }
+    }
+    var nextX = layout.padding.left;
+    var nextY = layout.padding.top;
+    if (row) {
+        nextX += extra;
+    } else {
+        nextY += extra;
+    }
+
+    for (j in 0..count) {
+        let k = if (layout.reverse) count - 1 - j else j;
+        let child = childOf(l, index, k);
+        let m = marginOf(l, child);
+        let cd = l.nodes.items[child].dims;
+        if (row) {
+            nextY = layout.padding.top + m.top;
+            let whiteSpace = node.dims.h - layout.padding.top - layout.padding.bottom - m.top - m.bottom - cd.h;
+            match (layout.alignY) {
+                AxisAlign.Center => { nextY += whiteSpace / 2.0; }
+                AxisAlign.End => { nextY += whiteSpace; }
+                AxisAlign.Baseline => { nextY += maxBaseline - elementBaseline(l, child, metrics); }
+                _ => {}
+            }
+            nextX += m.left;
+        } else {
+            nextX = layout.padding.left + m.left;
+            let whiteSpace = node.dims.w - layout.padding.left - layout.padding.right - m.left - m.right - cd.w;
+            match (layout.alignX) {
+                AxisAlign.Center => { nextX += whiteSpace / 2.0; }
+                AxisAlign.End => { nextX += whiteSpace; }
+                AxisAlign.Baseline => { nextX += maxBaseline - elementBaseline(l, child, metrics); }
+                _ => {}
+            }
+            nextY += m.top;
+        }
+        let t = translateOf(l, child);
+        let position = Vec2 { x: area.x + nextX + scroll.x + t.x, y: area.y + nextY + scroll.y + t.y };
+        if (!placeElement(mut l, child, position, metrics)) {
+            return false;
+        }
+        if (row) {
+            nextX += cd.w + m.right + layout.childGap + betweenSpace;
+        } else {
+            nextY += cd.h + m.bottom + layout.childGap + betweenSpace;
+        }
+    }
+    return true;
+}
+
+/// Line-by-line placement of a wrapping container (flex-wrap). Children are placed (and so painted) in
+/// declaration order; `reverse` flips their positions within each line.
+fn placeWrapped<M: TextMetrics>(
+    l: borrow mut LayoutTree,
+    index: usize,
+    area: Rect,
+    scroll: Vec2,
+    metrics: borrow M,
+) -> bool {
+    let node = l.nodes.items[index];
+    let layout = node.decl.layout;
+    let row = layout.isRow();
+    var lines = measureWrapLines(l, index, false);
+    let stretched = match (layout.alignContent) {
+        AlignContent.Stretch => true,
+        _ => false,
+    };
+    if (stretched) {
+        // Sizing already stretched the lines; re-measuring would count it twice.
+        lines.stretch = node.wrapLineStretch;
+    }
+    let innerMain =
+        if (row) node.dims.w -
+            layout.padding.left - layout.padding.right else node.dims.h - layout.padding.top - layout.padding.bottom;
+    let mainAlign = if (row) layout.alignX else layout.alignY;
+    let crossAlign = if (row) layout.alignY else layout.alignX;
+    var crossCursor = (if (row) layout.padding.top else layout.padding.left) + lines.lead;
+    var start: usize = 0;
+    let count = node.childCount;
+    // First compute every child's position (placement order may differ from declaration order), then place
+    // the children in declaration order, as Clay's DFS does for wrapped containers.
+    while (start < count) {
+        let line = nextWrapLine(l, index, start, false);
+        let lineCross = if (stretched) stretchedLineCross(
+            l,
+            index,
+            start,
+            line.end,
+            lines.stretch,
+        ) else line.crossSize + lines.stretch;
+        let free = (innerMain - line.mainSize).max(0.0);
+        var lead: f32 = 0.0;
+        var between: f32 = 0.0;
+        let lc = usizeF(line.count);
+        match (mainAlign) {
+            AxisAlign.End => { lead = free; }
+            AxisAlign.Center => { lead = free / 2.0; }
+            AxisAlign.Between => { between = if (line.count > 1) free / (lc - 1.0) else 0.0; }
+            AxisAlign.Around => {
+                between = if (line.count > 0) free / lc else 0.0;
+                lead = between / 2.0;
+            }
+            AxisAlign.Evenly => {
+                between = free / (lc + 1.0);
+                lead = between;
+            }
+            _ => {}
+        }
+        var lineBaseline: f32 = 0.0;
+        let baselineAlign = match (crossAlign) {
+            AxisAlign.Baseline => true,
+            _ => false,
+        };
+        if (row && baselineAlign) {
+            for (i in start..line.end) {
+                lineBaseline = lineBaseline.max(elementBaseline(l, childOf(l, index, i), metrics));
+            }
+        }
+        var mainCursor = (if (row) layout.padding.left else layout.padding.top) + lead;
+        for (k in start..line.end) {
+            let i = if (layout.reverse) line.end - 1 - (k - start) else k;
+            let child = childOf(l, index, i);
+            let m = marginOf(l, child);
+            let cd = l.nodes.items[child].dims;
+            let mainBefore = if (row) m.left else m.top;
+            let mainAfter = if (row) m.right else m.bottom;
+            let crossBefore = if (row) m.top else m.left;
+            let crossAfter = if (row) m.bottom else m.right;
+            let childMain = if (row) cd.w else cd.h;
+            let childCross = if (row) cd.h else cd.w;
+            let crossFree = lineCross - crossBefore - crossAfter - childCross;
+            var crossOffset = crossBefore;
+            match (crossAlign) {
+                AxisAlign.End => { crossOffset += crossFree; }
+                AxisAlign.Center => { crossOffset += crossFree / 2.0; }
+                AxisAlign.Baseline => {
+                    if (row) {
+                        crossOffset += lineBaseline - elementBaseline(l, child, metrics);
+                    }
+                }
+                _ => {}
+            }
+            let mainPos = mainCursor + mainBefore;
+            let crossPos = crossCursor + crossOffset;
+            let t = translateOf(l, child);
+            // Park the position in the child's box until it is placed below.
+            l.nodes.items[child].area.x = area.x + (if (row) mainPos else crossPos) + scroll.x + t.x;
+            l.nodes.items[child].area.y = area.y + (if (row) crossPos else mainPos) + scroll.y + t.y;
+            mainCursor += mainBefore + childMain + mainAfter + layout.childGap + between;
+        }
+        crossCursor += lineCross + layout.childGapCross + lines.between;
+        start = line.end;
+    }
+    for (i in 0..count) {
+        let child = childOf(l, index, i);
+        let position = Vec2 { x: l.nodes.items[child].area.x, y: l.nodes.items[child].area.y };
+        if (!placeElement(mut l, child, position, metrics)) {
+            return false;
+        }
+    }
+    return true;
+}

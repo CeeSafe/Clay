@@ -1,0 +1,551 @@
+// SPDX-License-Identifier: MIT
+// The software renderer (replaces ThorVG): surfaces, the layer/clip/transform stacks, and compositing.
+//
+// Pixels are premultiplied RGBA8 packed in a u32 as bytes R, G, B, A (r | g << 8 | b << 16 | a << 24), the
+// layout of ThorVG's RGBX target. Everything lives in one pixel pool carved from a caller's FixedBufferAllocator:
+// the frame is layer 0 at offset 0, and each opacity/blend/filter bracket or shadow pushes a layer sized to the
+// current clip region on top of it (layers nest strictly, so the pool is a stack). Layers are addressed by
+// offset, never by sub-slice, so no two mutable views of the pool exist at once.
+
+/// How much a `Raster` holds.
+public struct RasterCapacity {
+    public width: usize;
+    public height: usize;
+    /// Pixels for nested layers beyond the frame (default: 4 full-screen layers).
+    public layerPixels: usize;
+    /// Bytes for rounded/transformed clip masks (default: 4 full-screen masks).
+    public maskBytes: usize;
+    /// Points for one flattened path.
+    public pathPoints: usize;
+    /// Pixels for all registered images.
+    public imagePixels: usize;
+    public images: usize;
+    /// Bytes for loaded fonts (default 4 MB: about five Latin TrueType faces).
+    public fontBytes: usize;
+
+    public fn of(width: usize, height: usize) -> RasterCapacity => RasterCapacity {
+        width: width,
+        height: height,
+        layerPixels: width * height * 4,
+        maskBytes: width * height * 4,
+        pathPoints: 8192,
+        imagePixels: 262144,
+        images: 32,
+        fontBytes: 4194304,
+    };
+}
+
+/// What a layer does when it is popped.
+enum LayerKind {
+    Opacity(f32),
+    BlendWith(BlendMode),
+    Filtered(FilterMode, f32),
+    /// A shadow: blurred (sigma squared, transform-scaled), then composited normally.
+    Blurred(f32),
+}
+
+/// An offscreen layer: pixels [offset, offset + w*h) of the pool, covering device [x0, x1) x [y0, y1).
+struct Layer {
+    offset: usize;
+    x0: i32;
+    y0: i32;
+    x1: i32;
+    y1: i32;
+    kind: LayerKind;
+    /// The squared scale of the transform when the layer was pushed (ThorVG scales blur sigma by it).
+    scale2: f32;
+}
+
+/// A clip region: device rectangle [x0, x1) x [y0, y1), optionally with a coverage mask over that rectangle
+/// (masks[maskOffset + (y - y0) * (x1 - x0) + (x - x0)]).
+struct ClipState {
+    x0: i32;
+    y0: i32;
+    x1: i32;
+    y1: i32;
+    hasMask: bool;
+    maskOffset: usize;
+    maskTop: usize;
+}
+
+/// A registered image: pixels [offset, offset + w*h) of the image pool, straight RGBA8 (bytes R, G, B, A).
+struct ImageRecord {
+    handle: u32;
+    offset: usize;
+    w: usize;
+    h: usize;
+}
+
+/// A loaded font: bytes [offset, offset + size) of the font pool, parsed.
+struct FontSlot {
+    id: u32;
+    offset: usize;
+    size: usize;
+    info: FontInfo;
+}
+
+/// One path point in device space.
+struct Pt {
+    x: f32;
+    y: f32;
+}
+
+public struct Raster<region r> {
+    pool: SliceMut<r, u32>;
+    poolTop: usize;
+    acc: SliceMut<r, f32>;
+    line: SliceMut<r, u32>;
+    masks: SliceMut<r, u8>;
+    maskTop: usize;
+    points: SliceMut<r, Pt>;
+    pointCount: usize;
+    contourStarts: SliceMut<r, usize>;
+    contourCount: usize;
+    overflowed: bool;
+    layers: FixedList<r, Layer>;
+    clips: FixedList<r, ClipState>;
+    transforms: FixedList<r, Affine2>;
+    images: FixedList<r, ImageRecord>;
+    imagePool: SliceMut<r, u32>;
+    imageTop: usize;
+    fontPool: SliceMut<r, u8>;
+    fontTop: usize;
+    fonts: FixedList<r, FontSlot>;
+    width: i32;
+    height: i32;
+
+    public fn create(
+        memory: borrow(r) FixedBufferAllocator,
+        capacity: RasterCapacity,
+    ) -> Result<Raster<r>, AllocError> {
+        let frame = capacity.width * capacity.height;
+        let pool = memory.allocArray(frame + capacity.layerPixels, 0u32)?;
+        let acc = memory.allocArray((capacity.width + 3) * (capacity.height + 1), 0.0f32)?;
+        let line = memory.allocArray(if (capacity.width > capacity.height) capacity.width else capacity.height, 0u32)?;
+        let masks = memory.allocArray(capacity.maskBytes, 0u8)?;
+        let points = memory.allocArray(capacity.pathPoints, Pt { x: 0.0, y: 0.0 })?;
+        let contours = memory.allocArray(capacity.pathPoints / 2 + 1, 0usize)?;
+        let layer = Layer { offset: 0, x0: 0, y0: 0, x1: 0, y1: 0, kind: LayerKind.Opacity(1.0), scale2: 1.0 };
+        let layers = memory.allocArray(32, layer)?;
+        let clip = ClipState { x0: 0, y0: 0, x1: 0, y1: 0, hasMask: false, maskOffset: 0, maskTop: 0 };
+        let clips = memory.allocArray(64, clip)?;
+        let transforms = memory.allocArray(64, Affine2.identity())?;
+        let images = memory.allocArray(capacity.images, ImageRecord { handle: 0, offset: 0, w: 0, h: 0 })?;
+        let imagePool = memory.allocArray(capacity.imagePixels, 0u32)?;
+        let fontPool = memory.allocArray(capacity.fontBytes, 0u8)?;
+        let noFont = FontInfo {
+            unitsPerEm: 1.0,
+            ascent: 0.0,
+            descent: 0.0,
+            lineGap: 0.0,
+            locaFormat: 0,
+            numHmtx: 0,
+            cmap: 0,
+            hmtx: 0,
+            loca: 0,
+            glyf: 0,
+            kern: 0,
+            maxp: 0,
+        };
+        let fonts = memory.allocArray(16, FontSlot { id: 0, offset: 0, size: 0, info: noFont })?;
+        return Ok(Raster {
+            pool: pool,
+            poolTop: frame,
+            acc: acc,
+            line: line,
+            masks: masks,
+            maskTop: 0,
+            points: points,
+            pointCount: 0,
+            contourStarts: contours,
+            contourCount: 0,
+            overflowed: false,
+            layers: FixedList<Layer>.over(layers),
+            clips: FixedList<ClipState>.over(clips),
+            transforms: FixedList<Affine2>.over(transforms),
+            images: FixedList<ImageRecord>.over(images),
+            imagePool: imagePool,
+            imageTop: 0,
+            fontPool: fontPool,
+            fontTop: 0,
+            fonts: FixedList<FontSlot>.over(fonts),
+            width: truncate<i32>(capacity.width),
+            height: truncate<i32>(capacity.height),
+        });
+    }
+
+    /// Starts a frame: clears to `clear` (straight RGBA) and resets the stacks.
+    public fn begin(borrow mut this, clear: Color) {
+        let c = premultiply(clear);
+        let frame = (idx(this.width)) * (idx(this.height));
+        for (i in 0..frame) {
+            this.pool[i] = c;
+        }
+        this.poolTop = frame;
+        this.maskTop = 0;
+        this.overflowed = false;
+        this.layers.clear();
+        this.layers.push(
+            Layer {
+                offset: 0,
+                x0: 0,
+                y0: 0,
+                x1: this.width,
+                y1: this.height,
+                kind: LayerKind.Opacity(1.0),
+                scale2: 1.0,
+            },
+        );
+        this.clips.clear();
+        this.clips.push(
+            ClipState { x0: 0, y0: 0, x1: this.width, y1: this.height, hasMask: false, maskOffset: 0, maskTop: 0 },
+        );
+        this.transforms.clear();
+        this.transforms.push(Affine2.identity());
+    }
+
+    /// Closes any brackets left open (an unbalanced command stream) so the frame is complete.
+    public fn finish(borrow mut this) {
+        while (this.layers.length() > 1) {
+            this.popLayer();
+        }
+    }
+
+    public fn frameWidth(borrow this) -> usize => idx(this.width);
+    public fn frameHeight(borrow this) -> usize => idx(this.height);
+
+    /// The frame's pixels, premultiplied RGBA8 packed as bytes R, G, B, A; row-major, `frameWidth()` per row.
+    public fn pixels(borrow this) -> Slice<u32> => this.pool[0..(idx(this.width)) * (idx(this.height))];
+
+    /// The pixel at (x, y) as a straight-alpha color (for tests and screenshots).
+    public fn pixelAt(borrow this, x: usize, y: usize) -> Color => unpremultiply(this.pool[y * (idx(this.width)) + x]);
+
+    /// Whether some path or layer did not fit the capacity this frame (and was skipped).
+    public fn overflowedThisFrame(borrow this) -> bool => this.overflowed;
+
+    // ---- images ----------------------------------------------------------------------------------------------------
+
+    /// Registers a `w` x `h` image under `handle` (the value `Style.image(handle)` carries) and returns whether
+    /// it fit. Fill its pixels (straight RGBA8, bytes R, G, B, A) with `setImagePixel`.
+    public fn addImage(borrow mut this, handle: u32, w: usize, h: usize) -> bool {
+        if (handle == 0 || this.imageTop + w * h > this.imagePool.length) {
+            return false;
+        }
+        if (!this.images.push(ImageRecord { handle: handle, offset: this.imageTop, w: w, h: h })) {
+            return false;
+        }
+        this.imageTop += w * h;
+        return true;
+    }
+
+    /// The pixels of image `handle` (row-major, 0xAABBGGRR, straight alpha), to fill in place.
+    public fn imagePixelsMut(borrow mut this, handle: u32) -> SliceMut<u32>? {
+        match (this.imageIndex(handle)) {
+            Some(k) => {
+                let rec = this.images.get(k);
+                return borrow mut this.imagePool[rec.offset..rec.offset + rec.w * rec.h];
+            }
+            null => { return null; }
+        }
+    }
+
+    public fn setImagePixel(borrow mut this, handle: u32, x: usize, y: usize, rgba: u32) {
+        match (this.imageIndex(handle)) {
+            Some(k) => {
+                let rec = this.images.get(k);
+                if (x < rec.w && y < rec.h) {
+                    this.imagePool[rec.offset + y * rec.w + x] = rgba;
+                }
+            }
+            null => {}
+        }
+    }
+
+    // ---- fonts -----------------------------------------------------------------------------------------------------
+
+    /// Loads a TrueType font under `id` (FONT_* ids; renderer.h's FONT_18..FONT_MONO), copying its bytes into the
+    /// font pool. False when it does not parse or does not fit. A font id with nothing loaded uses font 0.
+    public fn loadFont(borrow mut this, id: u32, bytes: Slice<u8>) -> bool {
+        let info = match (parseFont(bytes)) {
+            Some(i) => i,
+            null => { return false; }
+        };
+        if (this.fontTop + bytes.length > this.fontPool.length || this.fonts.length() >= this.fonts.items.length) {
+            return false;
+        }
+        let offset = this.fontTop;
+        for (i in 0..bytes.length) {
+            this.fontPool[offset + i] = bytes[i];
+        }
+        this.fontTop += bytes.length;
+        this.fonts.push(FontSlot { id: id, offset: offset, size: bytes.length, info: info });
+        return true;
+    }
+
+    /// The slot for font `id`, falling back to font 0 (thorvg_backend.c's cw_fontFor).
+    fn fontSlot(borrow this, id: u32) -> FontSlot? {
+        var fallback: FontSlot? = null;
+        for (k in 0..this.fonts.length()) {
+            let slot = this.fonts.get(k);
+            if (slot.id == id) {
+                return slot;
+            }
+            if (slot.id == 0) {
+                fallback = slot;
+            }
+        }
+        return fallback;
+    }
+
+    /// The width of `utf8` in `config`'s font at its size (ClayWind_Thorvg_MeasureText): advances without kerning,
+    /// plus letter spacing after every glyph; a newline starts a new line; without a font, half an em per byte.
+    fn measureWidth(borrow this, utf8: Slice<u8>, fontId: u32, fontSize: f32, letterSpacing: f32) -> f32 {
+        let size = if (fontSize > 0.0) fontSize else 16.0;
+        let slot = match (this.fontSlot(fontId)) {
+            Some(s) => s,
+            null => { return 0.5 * size * round<f32>(utf8.length); }
+        };
+        let d = this.fontPool[slot.offset..slot.offset + slot.size];
+        let scale = size / slot.info.unitsPerEm;
+        var line: f32 = 0.0;
+        var widest: f32 = 0.0;
+        var i: usize = 0;
+        while (i < utf8.length) {
+            if (utf8[i] == '\n') {
+                widest = widest.max(line);
+                line = 0.0;
+                i += 1;
+                continue;
+            }
+            let cp = decodeUtf8(utf8, i);
+            let glyph = glyphIndex(d, slot.info, cp[0]);
+            if (glyph == INVALID_GLYPH) {
+                line += 0.5 * size;
+                i += 1;
+            } else {
+                line += glyphAdvance(d, slot.info, glyph) * scale;
+                i += cp[1] as usize;
+            }
+            line += letterSpacing;
+        }
+        return widest.max(line);
+    }
+
+    fn imageIndex(borrow this, handle: u32) -> usize? {
+        for (k in 0..this.images.length()) {
+            if (this.images.get(k).handle == handle) {
+                return k;
+            }
+        }
+        return null;
+    }
+
+    // ---- stacks ----------------------------------------------------------------------------------------------------
+
+    fn currentTransform(borrow this) -> Affine2 => this.transforms.last();
+
+    fn currentClip(borrow this) -> ClipState => this.clips.last();
+
+    fn currentLayer(borrow this) -> Layer => this.layers.last();
+
+    fn pushTransform(borrow mut this, m: Affine2) {
+        let composed = this.currentTransform().after(m);
+        if (!this.transforms.push(composed)) {
+            this.overflowed = true;
+        }
+    }
+
+    fn popTransform(borrow mut this) {
+        if (this.transforms.length() > 1) {
+            this.transforms.pop();
+        }
+    }
+
+    /// Pushes a layer over the current clip region, cleared to transparent.
+    fn pushLayer(borrow mut this, kind: LayerKind) {
+        let c = this.currentClip();
+        this.pushLayerOver(kind, c.x0, c.y0, c.x1, c.y1);
+    }
+
+    fn pushLayerOver(borrow mut this, kind: LayerKind, ax0: i32, ay0: i32, ax1: i32, ay1: i32) {
+        let x0 = imax(ax0, 0);
+        let y0 = imax(ay0, 0);
+        let x1 = imax(imin(ax1, this.width), x0);
+        let y1 = imax(imin(ay1, this.height), y0);
+        let size = (idx(x1 - x0)) * (idx(y1 - y0));
+        if (this.poolTop + size > this.pool.length || this.layers.length() >= this.layers.items.length) {
+            // No room: draw straight into the parent instead (the bracket's effect is lost, not the content).
+            this.overflowed = true;
+            let parent = this.currentLayer();
+            this.layers.push(Layer {
+                offset: parent.offset, x0: parent.x0, y0: parent.y0, x1: parent.x1, y1: parent.y1,
+                kind: LayerKind.Opacity(-1.0), scale2: 1.0,
+            });
+            return;
+        }
+        let offset = this.poolTop;
+        for (i in 0..size) {
+            this.pool[offset + i] = 0;
+        }
+        this.poolTop += size;
+        let m = this.currentTransform();
+        this.layers.push(
+            Layer { offset: offset, x0: x0, y0: y0, x1: x1, y1: y1, kind: kind, scale2: m.a * m.a + m.c * m.c },
+        );
+    }
+
+    /// Pops the top layer, applies its effect, and composites it into the layer below.
+    fn popLayer(borrow mut this) {
+        if (this.layers.length() <= 1) {
+            return;
+        }
+        let top = this.layers.last();
+        this.layers.pop();
+        match (top.kind) {
+            LayerKind.Opacity(a) => {
+                if (a < 0.0) {
+                    return; // the overflow stand-in: nothing to composite
+                }
+            }
+            _ => {}
+        }
+        let parent = this.currentLayer();
+        let w = idx(top.x1 - top.x0);
+        let h = idx(top.y1 - top.y0);
+        match (top.kind) {
+            LayerKind.Filtered(FilterMode.Blur, amount) => {
+                gaussianBlur(mut this, top, amount * amount * top.scale2);
+            }
+            LayerKind.Filtered(FilterMode.Grayscale, _) => { grayscaleLayer(mut this, top); }
+            LayerKind.Filtered(FilterMode.Brightness, amount) => { brightnessLayer(mut this, top, amount); }
+            LayerKind.Blurred(sigma2) => { gaussianBlur(mut this, top, sigma2 * top.scale2); }
+            _ => {}
+        }
+        let alpha = match (top.kind) {
+            LayerKind.Opacity(a) => quantize(a),
+            _ => 1.0,
+        };
+        var mode = match (top.kind) {
+            LayerKind.BlendWith(m) => m,
+            _ => BlendMode.None,
+        };
+        // ThorVG ignores the blend mode of a scene composited straight into an effect (filter) scene: it composites
+        // normally there. A blend nested deeper (inside another group) still blends against that group.
+        match (parent.kind) {
+            LayerKind.Filtered(_, _) => { mode = BlendMode.None; }
+            _ => {}
+        }
+        for (y in 0..h) {
+            let dy = top.y0 + truncate<i32>(y);
+            if (dy < parent.y0 || dy >= parent.y1) {
+                continue;
+            }
+            for (x in 0..w) {
+                let dx = top.x0 + truncate<i32>(x);
+                if (dx < parent.x0 || dx >= parent.x1) {
+                    continue;
+                }
+                let src = this.pool[top.offset + y * w + x];
+                if (src == 0) {
+                    continue;
+                }
+                let di = parent.offset + (idx(dy - parent.y0)) * (idx(parent.x1 - parent.x0)) + (idx(dx - parent.x0));
+                let dst = this.pool[di];
+                this.pool[di] = compositeLayerPixel(src, dst, alpha, mode);
+            }
+        }
+        this.poolTop = top.offset;
+    }
+
+    /// Clip coverage at device pixel (x, y), 0..1, for the current clip (assumed inside its rectangle).
+    fn clipCoverage(borrow this, c: ClipState, x: i32, y: i32) -> f32 {
+        if (!c.hasMask) {
+            return 1.0;
+        }
+        let w = idx(c.x1 - c.x0);
+        let i = c.maskOffset + (idx(y - c.y0)) * w + (idx(x - c.x0));
+        return round<f32>(this.masks[i] as u32) / 255.0;
+    }
+
+    fn popClip(borrow mut this) {
+        if (this.clips.length() > 1) {
+            let c = this.clips.last();
+            this.clips.pop();
+            this.maskTop = c.maskTop;
+        }
+    }
+}
+
+// ---- pixel arithmetic ------------------------------------------------------------------------------------------
+
+fn pack(r: f32, g: f32, b: f32, a: f32) -> u32 {
+    let ri = truncate<u32>(Math.clamp(r * 255.0 + 0.5, 0.0, 255.0));
+    let gi = truncate<u32>(Math.clamp(g * 255.0 + 0.5, 0.0, 255.0));
+    let bi = truncate<u32>(Math.clamp(b * 255.0 + 0.5, 0.0, 255.0));
+    let ai = truncate<u32>(Math.clamp(a * 255.0 + 0.5, 0.0, 255.0));
+    return ri | (gi << 8) | (bi << 16) | (ai << 24);
+}
+
+fn chan(p: u32, shift: u32) -> f32 => round<f32>((p >> shift) & 0xFF) / 255.0;
+
+/// A straight-alpha color as a premultiplied pixel.
+fn premultiply(c: Color) -> u32 {
+    let a = round<f32>(c.a as u32) / 255.0;
+    return pack(
+        round<f32>(c.r as u32) / 255.0 * a,
+        round<f32>(c.g as u32) / 255.0 * a,
+        round<f32>(c.b as u32) / 255.0 * a,
+        a,
+    );
+}
+
+fn unpremultiply(p: u32) -> Color {
+    let a = (p >> 24) & 0xFF;
+    if (a == 0) {
+        return Color.rgba(0, 0, 0, 0);
+    }
+    let r = ((p & 0xFF) * 255 + a / 2) / a;
+    let g = (((p >> 8) & 0xFF) * 255 + a / 2) / a;
+    let b = (((p >> 16) & 0xFF) * 255 + a / 2) / a;
+    return Color.rgba(
+        truncate<u8>(if (r > 255) 255 else r),
+        truncate<u8>(if (g > 255) 255 else g),
+        truncate<u8>(if (b > 255) 255 else b),
+        truncate<u8>(a),
+    );
+}
+
+/// Opacity as ThorVG stores it: in 1/255 steps.
+fn quantize(a: f32) -> f32 => round<f32>(truncate<u32>(Math.clamp(a * 255.0, 0.0, 255.0))) / 255.0;
+
+/// Source-over of a premultiplied (r, g, b, a) onto `dst`.
+fn over(dst: u32, r: f32, g: f32, b: f32, a: f32) -> u32 {
+    if (a >= 0.999 && dst == 0) {
+        return pack(r, g, b, a);
+    }
+    let k = 1.0 - a;
+    return pack(r + chan(dst, 0) * k, g + chan(dst, 8) * k, b + chan(dst, 16) * k, a + chan(dst, 24) * k);
+}
+
+/// Composites a layer pixel onto the parent's with group opacity and a blend mode.
+fn compositeLayerPixel(src: u32, dst: u32, alpha: f32, mode: BlendMode) -> u32 {
+    let sr = chan(src, 0) * alpha;
+    let sg = chan(src, 8) * alpha;
+    let sb = chan(src, 16) * alpha;
+    let sa = chan(src, 24) * alpha;
+    return match (mode) {
+        BlendMode.None => over(dst, sr, sg, sb, sa),
+        _ => blendLayerPixel(src, dst, alpha, mode),
+    };
+}
+
+fn imin(a: i32, b: i32) -> i32 => if (a < b) a else b;
+fn imax(a: i32, b: i32) -> i32 => if (a > b) a else b;
+/// A non-negative i32 as an index (negative values stop the program, like any out-of-range index would).
+fn idx(v: i32) -> usize {
+    if (v < 0) {
+        let none = [0usize; 1];
+        return none[1];
+    }
+    return truncate<usize>(v);
+}

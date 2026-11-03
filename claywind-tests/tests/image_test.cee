@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MIT
+// The BMP and PNG decoders against the fixtures from fixtures/make_images.py (every PNG color type and bit depth,
+// Adam7, stored/fixed/dynamic deflate, split IDATs, tRNS; BMP palettes, 16/24/32-bit, bit fields, top-down, core
+// header), whose expected pixels Pillow confirms.
+
+import claywind;
+
+fn fixturesDir() -> StringView => "fixtures/images/";
+
+/// `dir + name` as bytes in `buffer`, then read.
+fn readFixture(name: Slice<u8>, suffix: StringView) -> Vector<u8> {
+    var buffer = [0u8; 256];
+    var w = TextWriter.create(mut buffer[..]);
+    w.text(fixturesDir());
+    w.bytes(name);
+    w.text(suffix);
+    let path = StringView.fromUtf8(w.written())!;
+    return readFile(path);
+}
+
+fn u32s(n: usize) -> Vector<u32> {
+    var v = Vector<u32>.withCapacity(n)!;
+    for (i in 0..n) {
+        v.push(0)!;
+    }
+    return v;
+}
+
+@test
+fn decodesEveryFixtureLikePillow() -> Result<void, TestFailure> {
+    let manifest = readFile("fixtures/images/manifest.txt");
+    Check.isTrue(manifest.length > 0, "the fixtures exist (run fixtures/make_images.py fixtures/images)")?;
+    let m = manifest.view();
+    var start: usize = 0;
+    var decoded: u64 = 0;
+    for (k in 0..m.length) {
+        if (m[k] != '\n') {
+            continue;
+        }
+        let file = m[start..k];
+        start = k + 1;
+        if (file.length < 5) {
+            continue;
+        }
+        let stem = file[0..file.length - 4];
+        let bytes = readFixture(file, "");
+        let expected = readFixture(stem, ".rgba");
+        let info = match (imageInfo(bytes.view())) {
+            Ok(i) => i,
+            Err(_) => {
+                Console.write("  cannot read ");
+                Console.writeLine(StringView.fromUtf8(file)!);
+                return Check.fail("imageInfo failed");
+            }
+        };
+        var pixels = u32s(info.w * info.h);
+        var scratch = heap(info.scratchBytes + 1);
+        let ok = match (decodeImage(bytes.view(), mut pixels.viewMut(), mut scratch.viewMut())) {
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        if (!ok) {
+            Console.write("  decode failed: ");
+            Console.writeLine(StringView.fromUtf8(file)!);
+            return Check.fail("decodeImage failed");
+        }
+        Check.equalU64((info.w * info.h * 4) as u64, expected.length as u64)?;
+        let e = expected.view();
+        let p = pixels.view();
+        for (i in 0..info.w * info.h) {
+            let want = (e[4 * i] as u32) | ((e[4 * i + 1] as u32) << 8) | ((e[4 * i + 2] as u32) << 16)
+                | ((e[4 * i + 3] as u32) << 24);
+            if (p[i] != want) {
+                Console.write("  pixel mismatch in ");
+                Console.writeLine(StringView.fromUtf8(file)!);
+                Check.equalU64(want as u64, p[i] as u64)?;
+            }
+        }
+        decoded += 1;
+    }
+    Check.equalU64(44, decoded)?;
+    return Ok();
+}
+
+fn errorIs(r: Result<ImageInfo, ImageError>, want: ImageError) -> bool => match (r) {
+    Ok(_) => false,
+    Err(e) => match (e) {
+        ImageError.NotAnImage => match (want) {
+            ImageError.NotAnImage => true,
+            _ => false,
+        },
+        ImageError.Truncated => match (want) {
+            ImageError.Truncated => true,
+            _ => false,
+        },
+        ImageError.Corrupt => match (want) {
+            ImageError.Corrupt => true,
+            _ => false,
+        },
+        ImageError.TooSmall => match (want) {
+            ImageError.TooSmall => true,
+            _ => false,
+        },
+        ImageError.Unsupported => match (want) {
+            ImageError.Unsupported => true,
+            _ => false,
+        },
+    },
+};
+
+@test
+fn badInputIsReportedNotCrashed() -> Result<void, TestFailure> {
+    var pixels = u32s(13 * 11);
+    var scratch = heap(4096);
+    let junk = "GIF89a not an image";
+    Check.isTrue(errorIs(decodeImage(junk.bytes(), mut pixels.viewMut(), mut scratch.viewMut()), ImageError.NotAnImage),
+        "unknown formats are NotAnImage")?;
+    // Every prefix of a PNG and a BMP fails cleanly (no panic), and a too-small pixel buffer is TooSmall.
+    let names = "best.png|bgr24.bmp|pal4_i.png";
+    for (n in 0..itemCount(names)) {
+        let file = itemAt(names, n);
+        let whole = readFixture(file.bytes(), "");
+        let all = whole.view();
+        var cut: usize = 0;
+        while (cut < all.length) {
+            let r = decodeImage(all[0..cut], mut pixels.viewMut(), mut scratch.viewMut());
+            let failed = match (r) {
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            // Cut inside the pixel data it must fail; cut after it (a PNG missing only IEND) it may still decode.
+            Check.isTrue(failed || cut > all.length / 2, "a cut-off file is an error")?;
+            cut += 7;
+        }
+        var few = [0u32; 10];
+        Check.isTrue(errorIs(decodeImage(all, mut few[..], mut scratch.viewMut()), ImageError.TooSmall),
+            "a short pixel buffer is TooSmall")?;
+    }
+    // Every byte flipped in turn, in files using each deflate block type and both formats: an error or wrong
+    // pixels, never a panic (overflow, out-of-bounds) or a hang.
+    let mutated = "stored.png|fixed.png|best.png|pal4_i.png|rgba16_i.png|bgra32_v4.bmp|core8.bmp|bmp_pal1.bmp";
+    for (n in 0..itemCount(mutated)) {
+        let original = readFixture(itemAt(mutated, n).bytes(), "");
+        var corrupt = heap(original.length);
+        corrupt.viewMut().copyFrom(original.view());
+        for (k in 0..corrupt.length) {
+            for (flip in 0..3) {
+                let mask: u8 = if (flip == 0) 0xFF else if (flip == 1) 0x01 else 0x80;
+                let bytes = corrupt.viewMut();
+                let v = bytes[k];
+                bytes[k] = v ^ mask;
+                let r = decodeImage(corrupt.view(), mut pixels.viewMut(), mut scratch.viewMut());
+                match (r) {
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+                let again = corrupt.viewMut();
+                again[k] = v;
+            }
+        }
+    }
+    return Ok();
+}
+
+@test
+fn loadedImagesDrawThroughTheRaster() -> Result<void, TestFailure> {
+    let bytes = readFixture("bgr24.bmp".bytes(), "");
+    var storage = heap(4194304);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var c = RasterCapacity.of(13, 11);
+    c.fontBytes = 16;
+    var ras = Raster.create(memory, c)!;
+    var scratch = heap(16);
+    let info = match (loadImage(mut ras, 7, bytes.view(), mut scratch.viewMut())) {
+        Ok(i) => i,
+        Err(_) => { return Check.fail("loadImage failed"); }
+    };
+    Check.equalU64(13, info.w as u64)?;
+    // Draw it 1:1 over the whole frame; pixel (5, 3) is the fixture's (5*17, 3*21, (5+3)*9).
+    var t = LayoutTree.create(memory, LayoutCapacity.of(8))!;
+    t.begin(13.0, 11.0);
+    var d = fixedBox(13.0, 11.0);
+    d.image = 7;
+    leaf(mut t, "img", d);
+    finishTree(mut t)?;
+    ras.begin(Color.rgb(0, 0, 0));
+    renderTree(t, mut ras);
+    ras.finish();
+    let px = ras.pixelAt(5, 3);
+    Check.equalU64(85, px.r as u64)?;
+    Check.equalU64(63, px.g as u64)?;
+    return Check.equalU64(72, px.b as u64);
+}

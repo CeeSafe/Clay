@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MIT
+// The host/input seam: claywind_platform.h's ClayWind_Platform vtable as an interface. Everything ClayWind needs from
+// the OS or windowing layer: screen size, frame clock, pointer, keys, typed characters and the cursor shape.
+
+/// Non-printable keys (claywind_platform.h's CW_KEY_*); printable keys arrive as typed characters (`nextChar`).
+public enum Key {
+    Escape,
+    Enter,
+    Tab,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    LeftShift,
+    RightShift,
+    LeftControl,
+    RightControl,
+    LeftAlt,
+    RightAlt,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+/// How many `Key` values there are.
+public const KEY_COUNT: u32 = 31;
+
+/// A key's bit index (0..KEY_COUNT).
+public fn keyIndex(k: Key) -> u32 => match (k) {
+    Key.Escape => 0,
+    Key.Enter => 1,
+    Key.Tab => 2,
+    Key.Backspace => 3,
+    Key.Delete => 4,
+    Key.Left => 5,
+    Key.Right => 6,
+    Key.Up => 7,
+    Key.Down => 8,
+    Key.Home => 9,
+    Key.End => 10,
+    Key.PageUp => 11,
+    Key.PageDown => 12,
+    Key.LeftShift => 13,
+    Key.RightShift => 14,
+    Key.LeftControl => 15,
+    Key.RightControl => 16,
+    Key.LeftAlt => 17,
+    Key.RightAlt => 18,
+    Key.F1 => 19,
+    Key.F2 => 20,
+    Key.F3 => 21,
+    Key.F4 => 22,
+    Key.F5 => 23,
+    Key.F6 => 24,
+    Key.F7 => 25,
+    Key.F8 => 26,
+    Key.F9 => 27,
+    Key.F10 => 28,
+    Key.F11 => 29,
+    Key.F12 => 30,
+};
+
+/// The key with bit index `i`.
+public fn keyAt(i: u32) -> Key => match (i) {
+    0 => Key.Escape,
+    1 => Key.Enter,
+    2 => Key.Tab,
+    3 => Key.Backspace,
+    4 => Key.Delete,
+    5 => Key.Left,
+    6 => Key.Right,
+    7 => Key.Up,
+    8 => Key.Down,
+    9 => Key.Home,
+    10 => Key.End,
+    11 => Key.PageUp,
+    12 => Key.PageDown,
+    13 => Key.LeftShift,
+    14 => Key.RightShift,
+    15 => Key.LeftControl,
+    16 => Key.RightControl,
+    17 => Key.LeftAlt,
+    18 => Key.RightAlt,
+    19 => Key.F1,
+    20 => Key.F2,
+    21 => Key.F3,
+    22 => Key.F4,
+    23 => Key.F5,
+    24 => Key.F6,
+    25 => Key.F7,
+    26 => Key.F8,
+    27 => Key.F9,
+    28 => Key.F10,
+    29 => Key.F11,
+    _ => Key.F12,
+};
+
+/// Pointer state for one frame: the primary (left) button, the secondary (right) button and the wheel.
+public struct Pointer {
+    public position: Vec2;
+    public down: bool;
+    /// Went down this frame.
+    public pressed: bool;
+    /// Went up this frame.
+    public released: bool;
+    public wheel: Vec2;
+    public secondaryDown: bool;
+    public secondaryPressed: bool;
+
+    /// No buttons, no wheel, at `position`.
+    public fn at(position: Vec2) -> Pointer => Pointer {
+        position: position,
+        down: false,
+        pressed: false,
+        released: false,
+        wheel: Vec2.zero(),
+        secondaryDown: false,
+        secondaryPressed: false,
+    };
+}
+
+/// Cursor shapes a host may show (CW_CURSOR_*).
+public enum Cursor {
+    Default,
+    Pointer,
+    Text,
+}
+
+/// What the host supplies each frame.
+public interface Platform {
+    /// Layout units (logical pixels).
+    fn screenSize(borrow this) -> Dims;
+    /// Seconds since the previous frame.
+    fn frameTime(borrow this) -> f32;
+    /// Seconds since start (caret blink and the like).
+    fn time(borrow this) -> f64;
+    fn pointer(borrow this) -> Pointer;
+    fn keyDown(borrow this, key: Key) -> bool;
+    /// Went down this frame.
+    fn keyPressed(borrow this, key: Key) -> bool;
+    /// The OS's key repeat fired this frame.
+    fn keyRepeated(borrow this, key: Key) -> bool;
+    /// The next typed Unicode code point queued this frame, or 0 when the queue is empty.
+    fn nextChar(borrow mut this) -> u32;
+    fn setCursor(borrow mut this, cursor: Cursor);
+}

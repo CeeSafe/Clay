@@ -1,0 +1,580 @@
+// SPDX-License-Identifier: MIT
+// Hosted test package for the freestanding `claywind` library (its own package cannot use lib/std's `Check`).
+// `ceesafec test` runs the unit tests. The program itself is the CeeSafe half of the differential layout test:
+// it reads a layout spec on standard input, builds it with `LayoutTree`, and prints every named element's box and
+// every render command, in the same format as the C oracle that builds the spec with the original clay.h.
+//
+// Spec lines:  screen W H | open NAME|- key=value... | close | text SIZE LINEHEIGHT SPACING WRAP ALIGN CLAMP word_word
+// (`_` is a space and `|` a newline inside text). Keys: see `configure`.
+
+import claywind;
+
+struct Span {
+    start: usize;
+    length: usize;
+}
+
+/// The 10px-per-byte, 16px-tall metric shared with the oracle.
+struct DiffMeasure {
+    unused: u8;
+}
+
+impl TextMetrics for DiffMeasure {
+    fn measure(borrow this, utf8: Slice<u8>, config: TextConfig) -> Dims =>
+        Dims { w: round<f32>(utf8.length) * 10.0, h: 16.0 };
+    fn baseline(borrow this, config: TextConfig) -> f32 => -1.0;
+}
+
+/// A decimal number (optional sign, digits, optional fraction) at the start of `s`.
+fn parseNumber(s: Slice<u8>) -> f32 {
+    var i: usize = 0;
+    var negative = false;
+    if (i < s.length && s[i] == '-') {
+        negative = true;
+        i += 1;
+    }
+    var value: f64 = 0.0;
+    while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+        value = value * 10.0 + round<f64>((s[i] - '0') as u32);
+        i += 1;
+    }
+    if (i < s.length && s[i] == '.') {
+        i += 1;
+        var scale: f64 = 0.1;
+        while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+            value += round<f64>((s[i] - '0') as u32) * scale;
+            scale /= 10.0;
+            i += 1;
+        }
+    }
+    let v = round<f32>(value);
+    return if (negative) -v else v;
+}
+
+/// The `n`-th comma/colon-separated number of `s`.
+fn field(s: Slice<u8>, n: usize) -> f32 {
+    var k: usize = 0;
+    var start: usize = 0;
+    for (i in 0..s.length) {
+        if (s[i] == ',' || s[i] == ':') {
+            if (k == n) {
+                return parseNumber(s[start..i]);
+            }
+            k += 1;
+            start = i + 1;
+        }
+    }
+    return if (k == n) parseNumber(s[start..s.length]) else 0.0;
+}
+
+fn axisOf(v: Slice<u8>) -> SizingAxis {
+    if (v.length == 0) {
+        return SizingAxis.fit();
+    }
+    let rest = if (v.length > 2) v[2..v.length] else v[0..0];
+    let a = field(rest, 0);
+    let b = field(rest, 1);
+    return match (v[0]) {
+        'g' => SizingAxis.growBetween(a, b),
+        'x' => SizingAxis.fixed(a),
+        'p' => SizingAxis.percentOf(a),
+        _ => SizingAxis.fitBetween(a, b),
+    };
+}
+
+fn alignOf(c: u8) -> AxisAlign => match (c) {
+    's' => AxisAlign.Start,
+    'e' => AxisAlign.End,
+    'c' => AxisAlign.Center,
+    'b' => AxisAlign.Between,
+    'a' => AxisAlign.Around,
+    'v' => AxisAlign.Evenly,
+    _ => AxisAlign.Baseline,
+};
+
+fn contentOf(n: f32) -> AlignContent {
+    let k = truncate<i32>(n);
+    return match (k) {
+        1 => AlignContent.Center,
+        2 => AlignContent.End,
+        3 => AlignContent.Between,
+        4 => AlignContent.Around,
+        5 => AlignContent.Evenly,
+        6 => AlignContent.Stretch,
+        _ => AlignContent.Start,
+    };
+}
+
+fn pointOf(n: f32) -> AttachPoint {
+    let k = truncate<i32>(n);
+    return match (k) {
+        1 => AttachPoint.LeftCenter,
+        2 => AttachPoint.LeftBottom,
+        3 => AttachPoint.CenterTop,
+        4 => AttachPoint.CenterCenter,
+        5 => AttachPoint.CenterBottom,
+        6 => AttachPoint.RightTop,
+        7 => AttachPoint.RightCenter,
+        8 => AttachPoint.RightBottom,
+        _ => AttachPoint.LeftTop,
+    };
+}
+
+fn blendOf(n: f32) -> BlendMode {
+    let k = truncate<i32>(n);
+    return match (k) {
+        1 => BlendMode.Multiply,
+        2 => BlendMode.Add,
+        3 => BlendMode.Subtract,
+        4 => BlendMode.Screen,
+        _ => BlendMode.None,
+    };
+}
+
+fn same(a: Slice<u8>, b: StringView) -> bool {
+    let bb = b.bytes();
+    if (a.length != bb.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != bb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn configure(d: borrow mut Decl, key: Slice<u8>, v: Slice<u8>) {
+    if (same(key, "w")) {
+        d.layout.width = axisOf(v);
+    } else if (same(key, "h")) {
+        d.layout.height = axisOf(v);
+    } else if (same(key, "dir")) {
+        d.layout.direction = if (parseNumber(v) != 0.0) Direction.Column else Direction.Row;
+    } else if (same(key, "pad")) {
+        d.layout.padding = Sides { left: field(v, 0), right: field(v, 1), top: field(v, 2), bottom: field(v, 3) };
+    } else if (same(key, "gap")) {
+        d.layout.childGap = parseNumber(v);
+    } else if (same(key, "ax")) {
+        d.layout.alignX = alignOf(v[0]);
+    } else if (same(key, "ay")) {
+        d.layout.alignY = alignOf(v[0]);
+    } else if (same(key, "rev")) {
+        d.layout.reverse = true;
+    } else if (same(key, "st")) {
+        d.layout.stretch = true;
+    } else if (same(key, "m")) {
+        d.layout.margin = Sides { left: field(v, 0), right: field(v, 1), top: field(v, 2), bottom: field(v, 3) };
+    } else if (same(key, "tr")) {
+        d.layout.translate = Vec2 { x: field(v, 0), y: field(v, 1) };
+    } else if (same(key, "wrap")) {
+        d.layout.wrap = true;
+    } else if (same(key, "gc")) {
+        d.layout.childGapCross = parseNumber(v);
+    } else if (same(key, "basis")) {
+        d.layout.basis = parseNumber(v);
+    } else if (same(key, "ns")) {
+        d.layout.noShrink = true;
+    } else if (same(key, "ac")) {
+        d.layout.alignContent = contentOf(parseNumber(v));
+    } else if (same(key, "ar")) {
+        d.aspectRatio = parseNumber(v);
+    } else if (same(key, "bg")) {
+        d.background = if (v.length > 0) Color.rgba(
+            truncate<u8>(truncate<u32>(field(v, 0))), truncate<u8>(truncate<u32>(field(v, 1))),
+            truncate<u8>(truncate<u32>(field(v, 2))), truncate<u8>(truncate<u32>(field(v, 3))),
+        ) else Color.rgb(1, 1, 1);
+    } else if (same(key, "bd")) {
+        d.border = Border {
+            color: Color.rgb(2, 2, 2),
+            width: BorderWidth {
+                left: field(v, 0),
+                right: field(v, 1),
+                top: field(v, 2),
+                bottom: field(v, 3),
+                betweenChildren: field(v, 4),
+            },
+        };
+    } else if (same(key, "clip")) {
+        d.clip = Clip {
+            horizontal: field(v, 0) != 0.0,
+            vertical: field(v, 1) != 0.0,
+            childOffset: Vec2 { x: field(v, 2), y: field(v, 3) },
+        };
+    } else if (same(key, "fl")) {
+        d.floating.attachTo = if (field(v, 0) == 3.0) AttachTo.Root else AttachTo.Parent;
+        d.floating.parent = pointOf(field(v, 1));
+        d.floating.element = pointOf(field(v, 2));
+        d.floating.offset = Vec2 { x: field(v, 3), y: field(v, 4) };
+        d.floating.zIndex = truncate<i32>(field(v, 5));
+    } else if (same(key, "cr")) {
+        d.cornerRadius = Corners {
+            topLeft: field(v, 0),
+            topRight: field(v, 1),
+            bottomRight: field(v, 2),
+            bottomLeft: field(v, 3),
+        };
+    } else if (same(key, "sh")) {
+        d.shadow = Shadow { color: Color.rgba(0, 0, 0, 100), offsetX: 0.0, offsetY: 2.0, blur: 4.0, spread: 0.0 };
+    } else if (same(key, "ring")) {
+        d.ring = Ring { color: Color.rgb(3, 3, 3), width: 2.0, offset: 1.0 };
+    } else if (same(key, "op")) {
+        d.layout.opacity = parseNumber(v);
+    } else if (same(key, "rot")) {
+        d.layout.rotation = parseNumber(v);
+    } else if (same(key, "blend")) {
+        d.layout.blend = blendOf(parseNumber(v));
+    } else if (same(key, "filt")) {
+        d.layout.filter = FilterMode.Blur;
+        d.layout.filterAmount = parseNumber(v);
+    }
+}
+
+/// Splits `line` at spaces into `parts`.
+fn split(line: Slice<u8>, parts: borrow mut Vector<Span>) -> Result<void, AllocError> {
+    parts.clear();
+    var start: usize = 0;
+    for (i in 0..line.length + 1) {
+        if (i == line.length || line[i] == ' ') {
+            if (i > start) {
+                parts.push(Span { start: start, length: i - start })?;
+            }
+            start = i + 1;
+        }
+    }
+    return Ok();
+}
+
+fn writeBox(out: borrow mut TextWriter, area: Rect) {
+    out.byte(' ');
+    Format.fixed(mut out, area.x, 3);
+    out.byte(' ');
+    Format.fixed(mut out, area.y, 3);
+    out.byte(' ');
+    Format.fixed(mut out, area.w, 3);
+    out.byte(' ');
+    Format.fixed(mut out, area.h, 3);
+}
+
+fn readFile(path: StringView) -> Vector<u8> {
+    var bytes = Vector<u8>.create();
+    match (File.open(path)) {
+        Ok(f) => {
+            var file = f;
+            var chunk = [0u8; 65536];
+            loop {
+                let n = match (file.read(mut chunk[..])) {
+                    Ok(k) => k,
+                    Err(_) => 0,
+                };
+                if (n == 0) {
+                    break;
+                }
+                for (i in 0..n) {
+                    bytes.push(chunk[i])!;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    return bytes;
+}
+
+fn printLine(buffer: Slice<u8>) {
+    Console.writeBytes(buffer);
+    Console.writeLine();
+}
+
+/// Declares the spec's elements into `t` (one frame's build); records named elements' spans in `names`.
+fn build(
+    t: borrow mut LayoutTree, bytes: Slice<u8>, names: borrow mut Vector<Span>, parts: borrow mut Vector<Span>,
+    textBuffer: borrow mut Vector<u8>,
+    renderTo: borrow mut Span,
+) -> Vec2? {
+    var pointer: Vec2? = null;
+    renderTo = Span { start: 0, length: 0 };
+    var lineStart: usize = 0;
+    for (i in 0..bytes.length + 1) {
+        if (i < bytes.length && bytes[i] != '\n') {
+            continue;
+        }
+        let line = bytes[lineStart..i];
+        let base = lineStart;
+        lineStart = i + 1;
+        split(line, mut parts)!;
+        if (parts.length == 0) {
+            continue;
+        }
+        let head = line[parts[0].start..parts[0].start + parts[0].length];
+        if (same(head, "screen")) {
+            let w = parseNumber(line[parts[1].start..parts[1].start + parts[1].length]);
+            let h = parseNumber(line[parts[2].start..parts[2].start + parts[2].length]);
+            t.begin(w, h);
+        } else if (same(head, "open")) {
+            let name = line[parts[1].start..parts[1].start + parts[1].length];
+            var id: u32 = 0;
+            if (!same(name, "-")) {
+                names.push(Span { start: base + parts[1].start, length: parts[1].length })!;
+                id = hashBytes(name);
+            }
+            var d = Decl.of();
+            for (k in 2..parts.length) {
+                let kv = line[parts[k].start..parts[k].start + parts[k].length];
+                var eq = kv.length;
+                for (j in 0..kv.length) {
+                    if (kv[j] == '=' && eq == kv.length) {
+                        eq = j;
+                    }
+                }
+                let key = kv[0..eq];
+                let value = if (eq < kv.length) kv[eq + 1..kv.length] else kv[0..0];
+                configure(mut d, key, value);
+            }
+            t.open(id, d);
+        } else if (same(head, "render")) {
+            renderTo = Span { start: base + parts[1].start, length: parts[1].length };
+        } else if (same(head, "pointer")) {
+            pointer = Vec2 {
+                x: parseNumber(line[parts[1].start..parts[1].start + parts[1].length]),
+                y: parseNumber(line[parts[2].start..parts[2].start + parts[2].length]),
+            };
+        } else if (same(head, "close")) {
+            t.close();
+        } else if (same(head, "text")) {
+            var config = TextConfig.of(parseNumber(line[parts[1].start..parts[1].start + parts[1].length]));
+            config.color = Color.rgb(230, 230, 230);
+            config.lineHeight = parseNumber(line[parts[2].start..parts[2].start + parts[2].length]);
+            config.letterSpacing = parseNumber(line[parts[3].start..parts[3].start + parts[3].length]);
+            let wrap = parseNumber(line[parts[4].start..parts[4].start + parts[4].length]);
+            config.wrap = if (wrap == 1.0) TextWrap.Newlines else if (wrap == 2.0) TextWrap.None else TextWrap.Words;
+            let align = parseNumber(line[parts[5].start..parts[5].start + parts[5].length]);
+            config.align =
+                if (align == 1.0) TextAlign.Center else if (align == 2.0) TextAlign.Right else TextAlign.Left;
+            config.lineClamp = truncate<usize>(parseNumber(line[parts[6].start..parts[6].start + parts[6].length]));
+            textBuffer.clear();
+            let words = line[parts[7].start..line.length];
+            for (b in words) {
+                textBuffer.push(if (b == '_') ' ' else if (b == '|') '\n' else b)!;
+            }
+            t.text(textBuffer.view(), config);
+        }
+    }
+    return pointer;
+}
+
+fn main() -> i32 {
+    // Read the whole spec.
+    var input = Vector<u8>.create();
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (Console.read(mut chunk[..])) {
+            Ok(k) => k,
+            Err(_) => 0,
+        };
+        if (n == 0) {
+            break;
+        }
+        for (i in 0..n) {
+            input.push(chunk[i])!;
+        }
+    }
+    if (input.length == 0) {
+        Console.writeLine("claywind tests: run `ceesafec test` (or pipe a layout spec in for the differential test)");
+        return 0;
+    }
+
+    // Room for 8192 elements, Clay's default maximum, in one heap block the layout carves up.
+    var storage = Vector<u8>.withCapacity(33554432)!;
+    for (k in 0..33554432usize) {
+        storage.push(0)!;
+    }
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var t = LayoutTree.create(memory, LayoutCapacity.of(8192))!;
+    var names = Vector<Span>.create();
+    var parts = Vector<Span>.create();
+    var textBuffer = Vector<u8>.create();
+    let bytes = input.view();
+    var renderTo = Span { start: 0, length: 0 };
+    // CLAYWIND_BENCH=N: build and lay out the frame N times and report the time per frame (no other output).
+    match (Environment.variable("CLAYWIND_BENCH")) {
+        Some(n) => {
+            let frames = truncate<u32>(parseNumber(n.bytes()));
+            let measure = DiffMeasure { unused: 0 };
+            let started = Timer.now();
+            for (f in 0..frames) {
+                names.clear();
+                let ignored = build(mut t, bytes, mut names, mut parts, mut textBuffer, mut renderTo);
+                endLayout(mut t, measure)!;
+            }
+            let elapsed = Timer.now() - started;
+            Console.write("frames ");
+            Console.write(frames);
+            Console.write(" elements ");
+            Console.write(t.elementCount());
+            Console.write(" total-ms ");
+            Console.writeLine(elapsed);
+            return 0;
+        }
+        null => {}
+    }
+    // Pre-scan for the screen size, fonts and a render: with `font ID PATH` lines the software renderer's font
+    // engine measures text for layout (as ThorVG does on the C side), so the raster exists before layout.
+    var screenW: usize = 1;
+    var screenH: usize = 1;
+    var wantsRaster = false;
+    var fontLines = Vector<Span>.create();
+    var scanStart: usize = 0;
+    for (i in 0..bytes.length + 1) {
+        if (i < bytes.length && bytes[i] != '\n') {
+            continue;
+        }
+        let line = bytes[scanStart..i];
+        let base = scanStart;
+        scanStart = i + 1;
+        split(line, mut parts)!;
+        if (parts.length == 0) {
+            continue;
+        }
+        let head = line[parts[0].start..parts[0].start + parts[0].length];
+        if (same(head, "screen") && parts.length >= 3) {
+            screenW = truncate<usize>(parseNumber(line[parts[1].start..parts[1].start + parts[1].length]));
+            screenH = truncate<usize>(parseNumber(line[parts[2].start..parts[2].start + parts[2].length]));
+        } else if (same(head, "font") && parts.length >= 3) {
+            fontLines.push(Span { start: base, length: line.length })!;
+            wantsRaster = true;
+        } else if (same(head, "render")) {
+            wantsRaster = true;
+        }
+    }
+    let rasterBytes = if (wantsRaster) screenW * screenH * 48 + 4194304 + 2097152 else 1048576;
+    var rasterMemory = Vector<u8>.withCapacity(rasterBytes)!;
+    for (k in 0..rasterBytes) {
+        rasterMemory.push(0)!;
+    }
+    let rm = FixedBufferAllocator.over(mut rasterMemory.viewMut());
+    var cap = RasterCapacity.of(if (wantsRaster) screenW else 1, if (wantsRaster) screenH else 1);
+    cap.imagePixels = 16;
+    cap.fontBytes = if (wantsRaster) 4194304 else 16;
+    var raster = Raster.create(rm, cap)!;
+    for (k in 0..fontLines.length) {
+        let line = bytes[fontLines[k].start..fontLines[k].start + fontLines[k].length];
+        split(line, mut parts)!;
+        let id = truncate<u32>(parseNumber(line[parts[1].start..parts[1].start + parts[1].length]));
+        let path = StringView.fromUtf8(line[parts[2].start..line.length])!;
+        let font = readFile(path);
+        if (!raster.loadFont(id, font.view())) {
+            Console.writeErrorLine("font did not load");
+        }
+    }
+
+    let pointer = build(mut t, bytes, mut names, mut parts, mut textBuffer, mut renderTo);
+    let measure = DiffMeasure { unused: 0 };
+    let laidOut = if (fontLines.length > 0) endLayout(mut t, raster) else endLayout(mut t, measure);
+    match (laidOut) {
+        Ok() => {}
+        Err(_) => {
+            Console.writeLine("ERROR capacity");
+            return 1;
+        }
+    }
+
+    var out = [0u8; 8192];
+    for (k in 0..names.length) {
+        let name = bytes[names[k].start..names[k].start + names[k].length];
+        match (t.boxOf(hashBytes(name))) {
+            Some(area) => {
+                var w = TextWriter.create(mut out[..]);
+                w.text("E ");
+                w.bytes(name);
+                writeBox(mut w, area);
+                printLine(w.written());
+            }
+            null => {}
+        }
+    }
+    for (i in 0..t.commandCount()) {
+        var w = TextWriter.create(mut out[..]);
+        match (t.command(i)) {
+            Command.Fill(a, _, _) => { w.text("C rect"); writeBox(mut w, a); }
+            Command.Stroke(a, _, _, _) => { w.text("C border"); writeBox(mut w, a); }
+            Command.Text(a, run) => {
+                w.text("C text");
+                writeBox(mut w, a);
+                w.byte(' ');
+                w.bytes(t.textBytes(run));
+            }
+            Command.ClipStart(a, _, _, _) => { w.text("C clip"); writeBox(mut w, a); }
+            Command.ClipEnd => { w.text("C clipend"); }
+            Command.TransformStart(a, _) => { w.text("C tstart"); writeBox(mut w, a); }
+            Command.TransformEnd => { w.text("C tend"); }
+            Command.DropShadow(a, _, _) => { w.text("C shadow"); writeBox(mut w, a); }
+            Command.RingStroke(a, _, _) => { w.text("C ring"); writeBox(mut w, a); }
+            Command.GradientFill(a, _, _) => { w.text("C grad"); writeBox(mut w, a); }
+            Command.BlendStart(_) => { w.text("C bstart"); }
+            Command.BlendEnd => { w.text("C bend"); }
+            Command.OpacityStart(a, _) => { w.text("C ostart"); writeBox(mut w, a); }
+            Command.OpacityEnd(_) => { w.text("C oend"); }
+            Command.FilterStart(a, _, _) => { w.text("C fstart"); writeBox(mut w, a); }
+            Command.FilterEnd(_, _) => { w.text("C fend"); }
+            _ => { w.text("C other"); }
+        }
+        printLine(w.written());
+    }
+    // `render PATH`: draw the frame with the software renderer and write its RGBA bytes (vs. ThorVG's).
+    if (renderTo.length > 0) {
+        let path = StringView.fromUtf8(bytes[renderTo.start..renderTo.start + renderTo.length])!;
+        let w = screenW;
+        let h = screenH;
+        // CLAYWIND_RENDER_BENCH=N: rasterize the frame N times and report the time (rendering only).
+        let repeats = match (Environment.variable("CLAYWIND_RENDER_BENCH")) {
+            Some(n) => truncate<u32>(parseNumber(n.bytes())),
+            null => 1,
+        };
+        let started = Timer.now();
+        for (k in 0..repeats) {
+            raster.begin(Color.rgb(240, 240, 240));
+            renderTree(t, mut raster);
+            raster.finish();
+        }
+        if (repeats > 1) {
+            Console.write("raster frames ");
+            Console.write(repeats);
+            Console.write(" total-ms ");
+            Console.writeLine(Timer.now() - started);
+        }
+        var raw = Vector<u8>.withCapacity(w * h * 4)!;
+        for (p in raster.pixels()) {
+            raw.push(truncate<u8>(p))!;
+            raw.push(truncate<u8>(p >> 8))!;
+            raw.push(truncate<u8>(p >> 16))!;
+            raw.push(truncate<u8>(p >> 24))!;
+        }
+        match (File.create(path)) {
+            Ok(f) => {
+                var file = f;
+                let written = file.write(raw.view());
+            }
+            Err(_) => {}
+        }
+    }
+    // Hit-testing (Clay_SetPointerState): the named elements under the pointer, in Clay's order.
+    match (pointer) {
+        Some(p) => {
+            t.hitTest(p);
+            for (i in 0..t.pointerOverCount()) {
+                let id = t.pointerOverAt(i);
+                for (k in 0..names.length) {
+                    let name = bytes[names[k].start..names[k].start + names[k].length];
+                    if (hashBytes(name) == id) {
+                        var w = TextWriter.create(mut out[..]);
+                        w.text("P ");
+                        w.bytes(name);
+                        printLine(w.written());
+                    }
+                }
+            }
+        }
+        null => {}
+    }
+    return 0;
+}
