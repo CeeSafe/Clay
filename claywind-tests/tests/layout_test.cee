@@ -806,7 +806,7 @@ fn itemsBaseline() -> Result<void, TestFailure> {
     t.close();
     t.close();
     let metric = MetricMeasure { unused: 0 };
-    let ended = match (endLayout(mut t, metric)) {
+    let ended = match (t.endLayout(metric)) {
         Ok() => true,
         Err(_) => false,
     };

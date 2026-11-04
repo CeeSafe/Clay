@@ -10,11 +10,9 @@
 
 import claywind;
 
-/// The script platform. It keeps its own copy of the script (up to 4 KB), since a platform used as a `dyn
-/// Platform` cannot hold a loan.
-public struct ScriptPlatform {
-    script: [u8; 4096];
-    scriptLength: usize;
+/// The script platform. It borrows its script, so the script must outlive it.
+public struct ScriptPlatform<region r> {
+    script: Slice<r, u8>;
     size: Dims;
     frame: u32;
     pointerState: Pointer;
@@ -25,10 +23,9 @@ public struct ScriptPlatform {
     typedRead: usize;
     public cursor: Cursor;
 
-    public fn create(script: Slice<u8>, size: Dims) -> ScriptPlatform {
-        var p = ScriptPlatform {
-            script: [0u8; 4096],
-            scriptLength: if (script.length < 4096) script.length else 4096,
+    public fn create(script: Slice<r, u8>, size: Dims) -> ScriptPlatform<r> {
+        return ScriptPlatform {
+            script: script,
             size: size,
             frame: 0,
             pointerState: Pointer.at(Vec2 { x: -100.0, y: -100.0 }),
@@ -39,10 +36,6 @@ public struct ScriptPlatform {
             typedRead: 0,
             cursor: Cursor.Default,
         };
-        for (i in 0..p.scriptLength) {
-            p.script[i] = script[i];
-        }
-        return p;
     }
 
     /// The frame about to run (0-based).
@@ -64,8 +57,7 @@ public struct ScriptPlatform {
             this.pointerState.secondaryDown = false;
         }
         this.releaseNext = 0;
-        let script = this.script;
-        let s = script[0..this.scriptLength];
+        let s = this.script;
         var start: usize = 0;
         for (k in 0..s.length + 1) {
             if (k == s.length || s[k] == ';') {
@@ -136,7 +128,7 @@ public struct ScriptPlatform {
     }
 }
 
-impl Platform for ScriptPlatform {
+impl<region r> Platform for ScriptPlatform<r> {
     fn screenSize(borrow this) -> Dims => this.size;
     fn frameTime(borrow this) -> f32 => 1.0 / 60.0;
     fn time(borrow this) -> f64 => round<f64>(this.frame) / 60.0;

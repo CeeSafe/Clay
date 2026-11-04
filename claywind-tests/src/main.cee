@@ -410,7 +410,7 @@ fn main() -> i32 {
             for (f in 0..frames) {
                 names.clear();
                 let ignored = build(mut t, bytes, mut names, mut parts, mut textBuffer, mut renderTo);
-                endLayout(mut t, measure)!;
+                t.endLayout(measure)!;
             }
             let elapsed = Timer.now() - started;
             Console.write("frames ");
@@ -475,7 +475,7 @@ fn main() -> i32 {
 
     let pointer = build(mut t, bytes, mut names, mut parts, mut textBuffer, mut renderTo);
     let measure = DiffMeasure { unused: 0 };
-    let laidOut = if (fontLines.length > 0) endLayout(mut t, raster) else endLayout(mut t, measure);
+    let laidOut = if (fontLines.length > 0) t.endLayout(raster) else t.endLayout(measure);
     match (laidOut) {
         Ok() => {}
         Err(_) => {
@@ -539,7 +539,7 @@ fn main() -> i32 {
         let started = Timer.now();
         for (k in 0..repeats) {
             raster.begin(Color.rgb(240, 240, 240));
-            renderTree(t, mut raster);
+            t.renderInto(mut raster);
             raster.finish();
         }
         if (repeats > 1) {

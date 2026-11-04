@@ -861,41 +861,70 @@ fn hitTestNode(l: borrow mut LayoutTree, index: usize, point: Vec2) -> bool {
     return found;
 }
 
-/// Ends the frame: measures, sizes and positions everything and builds the render commands
-/// (Clay_EndLayout + Clay__CalculateFinalLayout). Err when the frame outgrew the capacity.
-public fn endLayout<M: TextMetrics>(l: borrow mut LayoutTree, metrics: borrow M) -> Result<void, AllocError> {
-    if (l.failed) {
-        return Err(AllocError.OutOfMemory);
-    }
-    // Close the root.
-    while (l.openStack.length() > 1) {
-        l.close();
-    }
-    let rootCount = l.nodes.items[0].childCount;
-    let bufferEnd = l.childBuffer.length();
-    l.nodes.items[0].childrenStart = l.children.length();
-    for (k in 0..rootCount) {
-        if (!l.children.push(l.childBuffer.get(bufferEnd - rootCount + k))) {
+/// Ending the frame and rendering it, generic over the text metrics and the backend.
+impl<region r> LayoutTree<r> {
+    /// Ends the frame: measures, sizes and positions everything and builds the render commands
+    /// (Clay_EndLayout + Clay__CalculateFinalLayout). Err when the frame outgrew the capacity.
+    public fn endLayout<M: TextMetrics>(borrow mut this, metrics: borrow M) -> Result<void, AllocError> {
+        if (this.failed) {
             return Err(AllocError.OutOfMemory);
         }
-    }
-    l.childBuffer.clear();
+        // Close the root.
+        while (this.openStack.length() > 1) {
+            this.close();
+        }
+        let rootCount = this.nodes.items[0].childCount;
+        let bufferEnd = this.childBuffer.length();
+        this.nodes.items[0].childrenStart = this.children.length();
+        for (k in 0..rootCount) {
+            if (!this.children.push(this.childBuffer.get(bufferEnd - rootCount + k))) {
+                return Err(AllocError.OutOfMemory);
+            }
+        }
+        this.childBuffer.clear();
 
-    l.hasBaselineMetric = metrics.baseline(TextConfig.of(16.0)) >= 0.0;
-    if (!measureAllText(mut l, metrics)) {
-        return Err(AllocError.OutOfMemory);
+        this.hasBaselineMetric = metrics.baseline(TextConfig.of(16.0)) >= 0.0;
+        if (!measureAllText(mut this, metrics)) {
+            return Err(AllocError.OutOfMemory);
+        }
+        // FIT sizes children-first: reverse declaration order is Clay's close order.
+        var i = this.nodes.length();
+        while (i > 0) {
+            i -= 1;
+            if (!this.nodes.items[i].isText) {
+                computeIntrinsicSize(mut this, i);
+            }
+        }
+        if (!calculateFinalLayout(mut this, metrics)) {
+            return Err(AllocError.OutOfMemory);
+        }
+        this.remember();
+        return Ok();
     }
-    // FIT sizes children-first: reverse declaration order is Clay's close order.
-    var i = l.nodes.length();
-    while (i > 0) {
-        i -= 1;
-        if (!l.nodes.items[i].isText) {
-            computeIntrinsicSize(mut l, i);
+
+    /// Sends the commands to any backend (for code that drives the engine without a `Ui`).
+    public fn renderInto<B: Backend>(borrow this, backend: borrow mut B) {
+        for (i in 0..this.commandCount()) {
+            let command = this.command(i);
+            match (command) {
+                Command.Text(_, run) => { backend.draw(command, this.textBytes(run)); }
+                _ => {
+                    backend.draw(
+                        command,
+                        this.textBytes(
+                            TextRun {
+                                start: 0,
+                                length: 0,
+                                color: Color.hex(0),
+                                fontId: 0,
+                                fontSize: 0.0,
+                                letterSpacing: 0.0,
+                                lineHeight: 0.0,
+                            },
+                        ),
+                    );
+                }
+            }
         }
     }
-    if (!calculateFinalLayout(mut l, metrics)) {
-        return Err(AllocError.OutOfMemory);
-    }
-    l.remember();
-    return Ok();
 }

@@ -19,7 +19,7 @@ fn runDemo(tab: usize, script: StringView, frames: u32, app: borrow mut DemoApp)
         platform.beginFrame();
         ui.begin(mut platform);
         demoFrame(mut ui, mut app, metrics);
-        let ok = match (endFrame(mut ui, mut platform, metrics)) {
+        let ok = match (ui.endFrame(mut platform, metrics)) {
             Ok() => true,
             Err(_) => false,
         };

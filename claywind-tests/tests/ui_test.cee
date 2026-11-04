@@ -56,7 +56,7 @@ fn platformAt(w: f32, h: f32, x: f32, y: f32) -> FakePlatform => FakePlatform {
 
 fn finish(ui: borrow mut Ui, platform: borrow mut FakePlatform) -> Result<void, TestFailure> {
     let measure = ClayMeasure { unused: 0 };
-    let ok = match (endFrame(mut ui, mut platform, measure)) {
+    let ok = match (ui.endFrame(mut platform, measure)) {
         Ok() => true,
         Err(_) => false,
     };
@@ -435,7 +435,7 @@ fn runningOutOfRoomIsReported() -> Result<void, TestFailure> {
         ui.close();
     }
     let measure = ClayMeasure { unused: 0 };
-    let failed = match (endFrame(mut ui, mut platform, measure)) {
+    let failed = match (ui.endFrame(mut platform, measure)) {
         Ok() => false,
         Err(_) => true,
     };

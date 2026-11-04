@@ -619,85 +619,61 @@ public struct Ui<region r> {
     }
 }
 
-/// Sends `ui`'s commands to any backend, by bound rather than `dyn`: backends with region parameters (such as the
-/// software `Raster`, which borrows its memory) cannot become `dyn` values (ADR 0054), but implement the interface.
-public fn renderInto<B: Backend>(ui: borrow Ui, backend: borrow mut B) {
-    for (i in 0..ui.commandCount()) {
-        let command = ui.commandAt(i);
-        backend.draw(command, ui.textOf(command));
+/// Ending the frame and rendering it, generic over the text metrics and the backend.
+impl<region r> Ui<r> {
+    /// Sends the frame's commands to any backend.
+    public fn renderInto<B: Backend>(borrow this, backend: borrow mut B) {
+        for (i in 0..this.commandCount()) {
+            let command = this.commandAt(i);
+            backend.draw(command, this.textOf(command));
+        }
     }
-}
 
-/// Sends a `LayoutTree`'s commands to any backend (for code that drives the engine without a `Ui`).
-public fn renderTree<B: Backend>(tree: borrow LayoutTree, backend: borrow mut B) {
-    for (i in 0..tree.commandCount()) {
-        let command = tree.command(i);
-        match (command) {
-            Command.Text(_, run) => { backend.draw(command, tree.textBytes(run)); }
-            _ => {
-                backend.draw(
-                    command,
-                    tree.textBytes(
-                        TextRun {
-                            start: 0,
-                            length: 0,
-                            color: Color.hex(0),
-                            fontId: 0,
-                            fontSize: 0.0,
-                            letterSpacing: 0.0,
-                            lineHeight: 0.0,
-                        },
-                    ),
-                );
+    /// Ends the frame: lays out, keeps what scrolling needs, and shows the cursor the hovered elements asked for.
+    public fn endFrame<M: TextMetrics>(
+        borrow mut this,
+        platform: borrow mut dyn Platform,
+        metrics: borrow M,
+    ) -> Result<void, AllocError> {
+        let result = this.tree.endLayout(metrics);
+        // Scroll containers that were declared this frame record their size and content; the rest go away.
+        var k: usize = 0;
+        while (k < this.scrolls.length()) {
+            let state = this.scrolls.items[k];
+            if (!state.openThisFrame) {
+                let last = this.scrolls.length() - 1;
+                this.scrolls.items[k] = this.scrolls.items[last];
+                this.scrolls.pop();
+                continue;
             }
-        }
-    }
-}
-
-/// Ends the frame: lays out, keeps what scrolling needs, and shows the cursor the hovered elements asked for.
-public fn endFrame<M: TextMetrics>(
-    ui: borrow mut Ui,
-    platform: borrow mut dyn Platform,
-    metrics: borrow M,
-) -> Result<void, AllocError> {
-    let result = endLayout(mut ui.tree, metrics);
-    // Scroll containers that were declared this frame record their size and content; the rest go away.
-    var k: usize = 0;
-    while (k < ui.scrolls.length()) {
-        let state = ui.scrolls.items[k];
-        if (!state.openThisFrame) {
-            let last = ui.scrolls.length() - 1;
-            ui.scrolls.items[k] = ui.scrolls.items[last];
-            ui.scrolls.pop();
-            continue;
-        }
-        match (ui.tree.scrollExtent(state.id)) {
-            Some(e) => {
-                ui.scrolls.items[k].size = e.size;
-                ui.scrolls.items[k].content = e.content;
-                ui.scrolls.items[k].area = e.area;
+            match (this.tree.scrollExtent(state.id)) {
+                Some(e) => {
+                    this.scrolls.items[k].size = e.size;
+                    this.scrolls.items[k].content = e.content;
+                    this.scrolls.items[k].area = e.area;
+                }
+                null => {}
             }
-            null => {}
+            k += 1;
         }
-        k += 1;
-    }
-    platform.setCursor(ui.cursorWanted);
-    // ClayWind_EndControls: Tab / Shift-Tab move focus through the controls registered this frame.
-    let count = ui.focusables.length();
-    if (ui.keyPressed(Key.Tab) && count > 0) {
-        var index: usize? = null;
-        for (i in 0..count) {
-            if (ui.focusables.get(i) == ui.focusedId) {
-                index = i;
-                break;
+        platform.setCursor(this.cursorWanted);
+        // ClayWind_EndControls: Tab / Shift-Tab move focus through the controls registered this frame.
+        let count = this.focusables.length();
+        if (this.keyPressed(Key.Tab) && count > 0) {
+            var index: usize? = null;
+            for (i in 0..count) {
+                if (this.focusables.get(i) == this.focusedId) {
+                    index = i;
+                    break;
+                }
             }
+            let back = this.shiftDown();
+            let next = match (index) {
+                Some(i) => if (back) (i + count - 1) % count else (i + 1) % count,
+                null => if (back) count - 1 else 0,
+            };
+            this.focusedId = this.focusables.get(next);
         }
-        let back = ui.shiftDown();
-        let next = match (index) {
-            Some(i) => if (back) (i + count - 1) % count else (i + 1) % count,
-            null => if (back) count - 1 else 0,
-        };
-        ui.focusedId = ui.focusables.get(next);
+        return result;
     }
-    return result;
 }

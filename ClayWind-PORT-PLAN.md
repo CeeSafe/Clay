@@ -646,3 +646,26 @@ keeps the output identical.
   Raster sized for the largest window.
 - The terminal host still runs its own small demo, not `claywind-demo`, which is laid out for 1024×640 pixels, not
   character cells.
+
+## 17. Cleanup with ceesafec 0.11.0 (2026-11-04)
+
+The workarounds listed in CEESAFE-FINDINGS.md §D are gone, now that 0.11.0 has generic methods, `dyn` reborrows,
+scoped values behind `borrow dyn`, and arrays of views. The packages now need ceesafec 0.11.0 or later.
+
+**API changes (public):**
+- `ui.endFrame(mut platform, metrics)` and `ui.renderInto(mut backend)` replace the free functions.
+- `tree.endLayout(metrics)` and `tree.renderInto(mut backend)` replace `endLayout(...)` and `renderTree(...)`.
+- `Controls.textInputEx(...)` replaces the free `textInputEx`.
+- The controls take item lists as `Slice<StringView>` (C: `const char **` and a count). `itemCount` and `itemAt`
+  are gone.
+- `ScriptPlatform<region r>` borrows its script.
+
+**Inside:**
+- The demo's item lists and the browser page are `const [StringView; N]` tables.
+- `Rig` is gone from the controls test.
+
+**Verified:**
+- 72 tests pass compiled.
+- The 14 demo_compare scenes, rendered by the headless host, hash identically before and after.
+- The browser host serves a byte-identical page, and `test_client.py` passes.
+

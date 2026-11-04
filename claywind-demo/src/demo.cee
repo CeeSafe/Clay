@@ -5,7 +5,7 @@
 //
 //     ui.begin(mut platform);
 //     demoFrame(mut ui, mut app, metrics);
-//     endFrame(mut ui, mut platform, metrics)?;
+//     ui.endFrame(mut platform, metrics)?;
 //     // then render with a backend over app.pageBg(ui)
 //
 // The layout, styles and texts follow main.c line for line, so a frame matches the C build's.
@@ -17,17 +17,44 @@ public const NAV_COUNT: usize = 6;
 const NAV_CONTROLS: usize = 1;
 const NAV_EFFECTS: usize = 2;
 
-fn navItems() -> StringView => "Dashboard|Controls|Effects|Projects|Activity|Settings";
-fn prioItems() -> StringView => "Low|Medium|High";
-fn fileItems() -> StringView => "README.md|main.c|clay.h|renderer.h|controls.h|PARITY.md";
-fn themeItems() -> StringView => "System|Light|Dark";
-fn ctxItems() -> StringView => "Cut|Copy|Paste|Delete";
-fn controlsTabs() -> StringView => "Inputs|Selection|Lists";
-fn sizeItems() -> StringView => "Small|Medium|Large|X-Large";
-fn tagItems() -> StringView => "layout|tailwind|clay|thorvg|immediate-mode|single-header|flexbox|wrap|margins|variants";
-fn blendNames() -> StringView =>
-    "multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity|plus-lighter";
-fn gradientDirs() -> StringView => "t|tr|r|br|b|bl|l|tl";
+const NAV_ITEMS: [StringView; 6] = ["Dashboard", "Controls", "Effects", "Projects", "Activity", "Settings"];
+const PRIO_ITEMS: [StringView; 3] = ["Low", "Medium", "High"];
+const FILE_ITEMS: [StringView; 6] = ["README.md", "main.c", "clay.h", "renderer.h", "controls.h", "PARITY.md"];
+const THEME_ITEMS: [StringView; 3] = ["System", "Light", "Dark"];
+const CTX_ITEMS: [StringView; 4] = ["Cut", "Copy", "Paste", "Delete"];
+const CONTROLS_TABS: [StringView; 3] = ["Inputs", "Selection", "Lists"];
+const SIZE_ITEMS: [StringView; 4] = ["Small", "Medium", "Large", "X-Large"];
+const TAG_ITEMS: [StringView; 10] = [
+    "layout",
+    "tailwind",
+    "clay",
+    "thorvg",
+    "immediate-mode",
+    "single-header",
+    "flexbox",
+    "wrap",
+    "margins",
+    "variants",
+];
+const BLEND_NAMES: [StringView; 16] = [
+    "multiply",
+    "screen",
+    "overlay",
+    "darken",
+    "lighten",
+    "color-dodge",
+    "color-burn",
+    "hard-light",
+    "soft-light",
+    "difference",
+    "exclusion",
+    "hue",
+    "saturation",
+    "color",
+    "luminosity",
+    "plus-lighter",
+];
+const GRADIENT_DIRS: [StringView; 8] = ["t", "tr", "r", "br", "b", "bl", "l", "tl"];
 
 /// The app state (main.c's statics), all caller-owned state for the controls.
 public struct DemoApp {
@@ -150,7 +177,8 @@ public fn demoFrame<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, 
     // Tooltip over the counter button, and a right-click context menu; both float on top, so they come last.
     Controls.tooltip(mut ui, "clickBtn", "Increments the click counter");
     Controls.tooltip(mut ui, "ci-save", "Counts saves (shown in Live state)");
-    match (Controls.contextMenu(mut ui, "ctx", ctxItems(), mut app.ctxOpen, app.ctxX, app.ctxY)) {
+    let ctxItems = CTX_ITEMS;
+    match (Controls.contextMenu(mut ui, "ctx", ctxItems[..], mut app.ctxOpen, app.ctxX, app.ctxY)) {
         Some(act) => { app.clicks += (truncate<i32>(act)) + 1; }
         null => {}
     }
@@ -188,7 +216,7 @@ fn update(ui: borrow mut Ui, app: borrow mut DemoApp) {
     }
     // A click on a nav item also selects it (and moves focus there).
     for (i in 0..NAV_COUNT) {
-        if (ui.pressedOn(hashId(itemAt(navItems(), i)))) {
+        if (ui.pressedOn(hashId(NAV_ITEMS[i]))) {
             app.activeNav = i;
             app.focusedNav = i;
         }
@@ -208,7 +236,7 @@ fn sidebar(ui: borrow mut Ui, app: borrow DemoApp) {
     ui.label(if (wide) "ClayWind" else "CW", Text.of().font(TEXT_2XL).color(inkCol(ui)).tracking(1.0));
     ui.close();
     for (i in 0..NAV_COUNT) {
-        let name = itemAt(navItems(), i);
+        let name = NAV_ITEMS[i];
         let active = i == app.activeNav;
         let itemBg = if (active) BLUE_600 else ui.theme(SLATE_800, SLATE_200);
         var style = Style.box().id(name).w(Size.grow()).px(space(3.0)).py(space(2.0)).bg(itemBg).rounded(Radius.Md)
@@ -385,12 +413,13 @@ fn dashboard(ui: borrow mut Ui, app: borrow DemoApp) {
 
     // A wrapping tag row (flex-wrap).
     ui.open(Style.row().id("tags").w(Size.grow()).wrap().gapX(space(2.0)).gapY(space(2.0)));
-    for (t in 0..itemCount(tagItems())) {
+    let tags = TAG_ITEMS;
+    for (t in 0..tags.length) {
         ui.open(Style.box().idHash(numberedId("tag-", truncate<i64>(t))).px(space(3.0)).py(space(1.0))
             .bg(ui.theme(SLATE_800, SLATE_200)).rounded(Radius.Md).cursor(Cursor.Pointer).hover(
             Style.of().bg(BLUE_600),
         ));
-        ui.label(itemAt(tagItems(), t), Text.of().color(inkCol(ui)));
+        ui.label(tags[t], Text.of().color(inkCol(ui)));
         ui.close();
     }
     ui.close();
@@ -446,7 +475,7 @@ fn stateRow(ui: borrow mut Ui, key: StringView, value: Slice<u8>) {
 fn inputsSection<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, metrics: borrow M) {
     ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
     caption(mut ui, "Name · caret editing (Left/Right/Home/End, Backspace/Delete)");
-    textInputEx(mut ui, metrics, "ci-name", mut app.nameBuf[..], mut app.nameLen, mut app.nameCaret);
+    Controls.textInputEx(mut ui, metrics, "ci-name", mut app.nameBuf[..], mut app.nameLen, mut app.nameCaret);
     ui.close();
     ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
     caption(mut ui, "Quick note · simple append-only input");
@@ -487,7 +516,8 @@ fn selectionSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
     ui.close();
     ui.open(Style.column().gap(space(2.0)));
     caption(mut ui, "Theme (radio) · Light/Dark switch the app");
-    if (Controls.radio(mut ui, "ci-theme", themeItems(), mut app.radioSel) && app.radioSel != 0) {
+    let themeItems = THEME_ITEMS;
+    if (Controls.radio(mut ui, "ci-theme", themeItems[..], mut app.radioSel) && app.radioSel != 0) {
         ui.setDarkMode(app.radioSel == 2);
     }
     ui.close();
@@ -495,11 +525,13 @@ fn selectionSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
     ui.open(Style.row().gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
     ui.open(Style.column().w(Size.fixed(180.0)).gap(space(1.0)));
     caption(mut ui, "Priority");
-    Controls.dropdown(mut ui, "ci-prio", prioItems(), mut app.prioSel, mut app.prioOpen);
+    let prioItems = PRIO_ITEMS;
+    Controls.dropdown(mut ui, "ci-prio", prioItems[..], mut app.prioSel, mut app.prioOpen);
     ui.close();
     ui.open(Style.column().w(Size.fixed(180.0)).gap(space(1.0)));
     caption(mut ui, "Size");
-    Controls.dropdown(mut ui, "ci-size", sizeItems(), mut app.sizeSel, mut app.sizeOpen);
+    let sizeItems = SIZE_ITEMS;
+    Controls.dropdown(mut ui, "ci-size", sizeItems[..], mut app.sizeSel, mut app.sizeOpen);
     ui.close();
     ui.close();
 }
@@ -508,11 +540,12 @@ fn listsSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
     ui.open(Style.row().w(Size.grow()).gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
     ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
     caption(mut ui, "Open (single select)");
-    Controls.listbox(mut ui, "ci-files", fileItems(), mut app.fileSel, Size.fixed(150.0));
+    let fileItems = FILE_ITEMS;
+    Controls.listbox(mut ui, "ci-files", fileItems[..], mut app.fileSel, Size.fixed(150.0));
     ui.close();
     ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
     caption(mut ui, "Stage (multi select)");
-    Controls.listboxMulti(mut ui, "ci-stage", fileItems(), mut app.filesChecked[..], Size.fixed(150.0));
+    Controls.listboxMulti(mut ui, "ci-stage", fileItems[..], mut app.filesChecked[..], Size.fixed(150.0));
     ui.close();
     ui.close();
     caption(mut ui, "Right-click anywhere for a context menu (it bumps the Dashboard's click counter).");
@@ -572,10 +605,10 @@ fn statePanel(ui: borrow mut Ui, app: borrow DemoApp) {
     w7.text(" / ");
     w7.text(if (app.notifyPush) "on" else "off");
     stateRow(mut ui, "email / push", w7.written());
-    stateRow(mut ui, "theme", itemAt(themeItems(), app.radioSel).bytes());
-    stateRow(mut ui, "priority", itemAt(prioItems(), app.prioSel).bytes());
-    stateRow(mut ui, "size", itemAt(sizeItems(), app.sizeSel).bytes());
-    stateRow(mut ui, "open", itemAt(fileItems(), app.fileSel).bytes());
+    stateRow(mut ui, "theme", THEME_ITEMS[app.radioSel].bytes());
+    stateRow(mut ui, "priority", PRIO_ITEMS[app.prioSel].bytes());
+    stateRow(mut ui, "size", SIZE_ITEMS[app.sizeSel].bytes());
+    stateRow(mut ui, "open", FILE_ITEMS[app.fileSel].bytes());
     var b8 = [0u8; 32];
     var w8 = TextWriter.create(mut b8[..]);
     w8.signed(staged);
@@ -590,7 +623,8 @@ fn controlsPage<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, metr
     ui.label("Controls", Text.of().font(TEXT_XL).color(inkCol(ui)).bold());
     ui.label("· controls.h · Tab cycles focus", Text.of().color(muteCol(ui)).wrap(TextWrap.None));
     ui.close();
-    Controls.tabs(mut ui, "ci-tabs", controlsTabs(), mut app.controlsTab);
+    let controlsTabs = CONTROLS_TABS;
+    Controls.tabs(mut ui, "ci-tabs", controlsTabs[..], mut app.controlsTab);
     ui.open(Style.row().w(Size.grow()).gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
     ui.open(
         Style.column().id("ci-panel").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
@@ -681,8 +715,8 @@ fn gradientsSection(ui: borrow mut Ui, app: borrow DemoApp) {
     );
     // All eight Tailwind directions.
     ui.open(Style.row().w(Size.grow()).gap(space(3.0)).wrap());
-    for (i in 0usize..8) {
-        gradientSwatch(mut ui, itemAt(gradientDirs(), i));
+    for (dir in GRADIENT_DIRS) {
+        gradientSwatch(mut ui, dir);
     }
     ui.close();
     // via + positions, radial, and a live CSS angle.
@@ -741,8 +775,9 @@ fn blendSection(ui: borrow mut Ui) {
         Style.column().id("blendCard").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
     );
     ui.open(Style.row().w(Size.grow()).gap(space(3.0)).wrap());
-    for (i in 0..itemCount(blendNames())) {
-        let name = itemAt(blendNames(), i);
+    let blendNames = BLEND_NAMES;
+    for (i in 0..blendNames.length) {
+        let name = blendNames[i];
         ui.open(
             Style.column().idHash(namedId("bm-", name)).gap(space(1.0)).alignXY(AxisAlign.Center, AxisAlign.Center),
         );

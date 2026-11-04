@@ -116,7 +116,7 @@ fn uiLaysOutAndRendersWithTheRasterFonts() -> Result<void, TestFailure> {
     ui.open(Style.row().id("label").p(4.0).bg(SLATE_900));
     ui.label("Hello", Text.of().size(20.0).color(WHITE));
     ui.close();
-    let ok = match (endFrame(mut ui, mut platform, ras)) {
+    let ok = match (ui.endFrame(mut platform, ras)) {
         Ok() => true,
         Err(_) => false,
     };
@@ -124,7 +124,7 @@ fn uiLaysOutAndRendersWithTheRasterFonts() -> Result<void, TestFailure> {
     // Arial "Hello" at 20px: H .722 + e .556 + l .222 + l .222 + o .556 em = 2.278 em = 45.56px, plus padding 8.
     expect("label width from Arial advances", ui.boxOf("label")!.w, 53.56)?;
     ras.begin(Color.rgb(240, 240, 240));
-    renderInto(ui, mut ras);
+    ui.renderInto(mut ras);
     ras.finish();
     var ink: u32 = 0;
     for (y in 0..30usize) {

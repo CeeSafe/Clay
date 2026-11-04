@@ -95,3 +95,29 @@ and the contract suite pass.
 
 **§D refactors in ClayWind:** possible now, but the code would then need this unreleased compiler
 (`~/dev/CeeSafe/out/ceesafec`), not the installed 0.10.3. They wait for a release, or for an explicit go-ahead.
+
+## G. Released in ceesafec 0.11.0; §D done (2026-11-04)
+
+ADRs 0063–0065 shipped as v0.11.0 (CeeSafe `main` 5204206, 45dde8d). ClayWind now requires 0.11.0.
+
+**§D refactors, done:**
+- `endLayout` and `renderInto` (was `renderTree`) are methods of `LayoutTree`, and `endFrame` and `renderInto` are
+  methods of `Ui`, in `impl<region r> … { }` blocks.
+- `textInputEx` is `Controls.textInputEx`.
+- Item lists are `Slice<StringView>`; `itemCount`/`itemAt` are gone. The demo's lists are `const [StringView; N]`
+  tables.
+- `Rig` is gone from the controls test, since a `borrow mut` platform is now reborrowed into `dyn`.
+- `ScriptPlatform<region r>` borrows its script instead of copying 4 KB of it.
+- `var k: usize = len + 0` became `var k: usize = len`.
+- The browser page is one `const PAGE: [StringView; 30]` table, not 30 calls.
+
+**Verified:** all seven packages check, and 72 tests pass compiled. The 14 headless demo scenes are byte-identical
+to before. The browser page is byte-identical, and `test_client.py` passes.
+
+**New, small findings:**
+- **`static` tables of views are rejected** (N0337: `[StringView; N]` is not `Share`). `static NAME: StringView`
+  is accepted through a special case for a bare view (`src/check/statics.cee:184`), which does not extend to arrays
+  of views. Static string data is safe to share, so the special case should cover arrays of views too.
+- **A `const` table must be bound to a local to slice it or take `.length`** (N0247, N0216). This is documented
+  (§10, "bound to a local to be sliced"), but it adds a line at every call that passes a table as a slice. A
+  `static` table would avoid it, which makes the first finding the one worth fixing.

@@ -188,9 +188,9 @@ fn main() -> i32 {
             platform.beginFrame();
             ui.begin(mut platform);
             demoFrame(mut ui, mut app, raster);
-            endFrame(mut ui, mut platform, raster)!;
+            ui.endFrame(mut platform, raster)!;
             raster.begin(Color.hex(pageBg(ui)));
-            renderInto(ui, mut raster);
+            ui.renderInto(mut raster);
             raster.finish();
             platform.endFrame();
         }
@@ -211,7 +211,7 @@ fn main() -> i32 {
         platform.beginFrame();
         ui.begin(mut platform);
         demoFrame(mut ui, mut app, raster);
-        match (endFrame(mut ui, mut platform, raster)) {
+        match (ui.endFrame(mut platform, raster)) {
             Ok() => {}
             Err(_) => {
                 Console.writeErrorLine("headless: the frame does not fit the UI capacity");
@@ -220,7 +220,7 @@ fn main() -> i32 {
         }
         if (f == target) {
             raster.begin(Color.hex(pageBg(ui)));
-            renderInto(ui, mut raster);
+            ui.renderInto(mut raster);
             raster.finish();
         }
         platform.endFrame();

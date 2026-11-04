@@ -70,7 +70,7 @@ fn text16(t: borrow mut LayoutTree, s: StringView) {
 
 fn finishTree(t: borrow mut LayoutTree) -> Result<void, TestFailure> {
     let measure = ClayMeasure { unused: 0 };
-    let ok = match (endLayout(mut t, measure)) {
+    let ok = match (t.endLayout(measure)) {
         Ok() => true,
         Err(_) => false,
     };

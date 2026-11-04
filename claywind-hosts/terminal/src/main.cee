@@ -131,7 +131,7 @@ fn frame(ui: borrow mut Ui, platform: borrow mut dyn Platform, screen: borrow mu
     let measure = CellMeasure { unused: 0 };
     ui.begin(platform);
     view(ui, app);
-    match (endFrame(mut ui, platform, measure)) {
+    match (ui.endFrame(platform, measure)) {
         Ok() => {}
         Err(_) => {}
     }

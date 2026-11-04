@@ -116,9 +116,8 @@ fn badInputIsReportedNotCrashed() -> Result<void, TestFailure> {
     Check.isTrue(errorIs(decodeImage(junk.bytes(), mut pixels.viewMut(), mut scratch.viewMut()), ImageError.NotAnImage),
         "unknown formats are NotAnImage")?;
     // Every prefix of a PNG and a BMP fails cleanly (no panic), and a too-small pixel buffer is TooSmall.
-    let names = "best.png|bgr24.bmp|pal4_i.png";
-    for (n in 0..itemCount(names)) {
-        let file = itemAt(names, n);
+    let names: [StringView; 3] = ["best.png", "bgr24.bmp", "pal4_i.png"];
+    for (file in names) {
         let whole = readFixture(file.bytes(), "");
         let all = whole.view();
         var cut: usize = 0;
@@ -138,9 +137,18 @@ fn badInputIsReportedNotCrashed() -> Result<void, TestFailure> {
     }
     // Every byte flipped in turn, in files using each deflate block type and both formats: an error or wrong
     // pixels, never a panic (overflow, out-of-bounds) or a hang.
-    let mutated = "stored.png|fixed.png|best.png|pal4_i.png|rgba16_i.png|bgra32_v4.bmp|core8.bmp|bmp_pal1.bmp";
-    for (n in 0..itemCount(mutated)) {
-        let original = readFixture(itemAt(mutated, n).bytes(), "");
+    let mutated: [StringView; 8] = [
+        "stored.png",
+        "fixed.png",
+        "best.png",
+        "pal4_i.png",
+        "rgba16_i.png",
+        "bgra32_v4.bmp",
+        "core8.bmp",
+        "bmp_pal1.bmp",
+    ];
+    for (name in mutated) {
+        let original = readFixture(name.bytes(), "");
         var corrupt = heap(original.length);
         corrupt.viewMut().copyFrom(original.view());
         for (k in 0..corrupt.length) {
@@ -184,7 +192,7 @@ fn loadedImagesDrawThroughTheRaster() -> Result<void, TestFailure> {
     leaf(mut t, "img", d);
     finishTree(mut t)?;
     ras.begin(Color.rgb(0, 0, 0));
-    renderTree(t, mut ras);
+    t.renderInto(mut ras);
     ras.finish();
     let px = ras.pixelAt(5, 3);
     Check.equalU64(85, px.r as u64)?;

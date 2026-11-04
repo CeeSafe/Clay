@@ -5,9 +5,10 @@
 // index, the open flag. A control's sub-elements get ids derived from its id ("save~3", "qty~inc" in C).
 //
 // Differences from C, all forced by the language and none visible: ids are hashed when built (no string formatting
-// into fixed char buffers), text buffers are byte slices with a separate length (no NUL terminator), and the one
-// control that measures text while it is declared (`textInputEx`, for its caret) takes the text metrics as an
-// argument, since the Ui does not hold them between frames.
+// into fixed char buffers), text buffers are byte slices with a separate length (no NUL terminator), item lists are
+// slices of views (C: `const char **` and a count), and the one control that measures text while it is declared
+// (`textInputEx`, for its caret) takes the text metrics as an argument, since the Ui does not hold them between
+// frames.
 
 /// The id of sub-element `suffix`/`index` of control `base` (C: snprintf("%s~%d") / "%s~pop").
 fn subId(base: StringView, suffix: StringView, index: i64) -> u32 {
@@ -20,42 +21,6 @@ fn subId(base: StringView, suffix: StringView, index: i64) -> u32 {
         w.signed(index);
     }
     return hashBytes(w.written());
-}
-
-/// How many items a '|'-separated item list holds ("Small|Medium|Large" holds 3; "" holds 0). C passes
-/// `const char **`; a slice of views is not allowed, so item lists are one view.
-public fn itemCount(items: StringView) -> usize {
-    if (items.length == 0) {
-        return 0;
-    }
-    let b = items.bytes();
-    var n: usize = 1;
-    for (k in 0..b.length) {
-        if (b[k] == '|') {
-            n += 1;
-        }
-    }
-    return n;
-}
-
-/// Item `index` of a '|'-separated item list (empty past the end).
-public fn itemAt<region r>(items: StringView<r>, index: usize) -> StringView<r> {
-    let b = items.bytes();
-    var start: usize = 0;
-    var seen: usize = 0;
-    for (k in 0..b.length) {
-        if (b[k] == '|') {
-            if (seen == index) {
-                return items[start..k];
-            }
-            seen += 1;
-            start = k + 1;
-        }
-    }
-    if (seen == index) {
-        return items[start..];
-    }
-    return items[0..0];
 }
 
 /// The controls (controls.h's ClayWind_* functions).
@@ -145,11 +110,11 @@ public struct Controls {
         return changed;
     }
 
-    /// ClayWind_Dropdown: a trigger showing `itemAt(items, selected)`; when `open`, a floating list (click outside closes).
+    /// ClayWind_Dropdown: a trigger showing `items[selected]`; when `open`, a floating list (click outside closes).
     public fn dropdown(
         ui: borrow mut Ui,
         id: StringView,
-        items: StringView,
+        items: Slice<StringView>,
         selected: borrow mut usize,
         open: borrow mut bool,
     ) -> bool {
@@ -162,8 +127,8 @@ public struct Controls {
             open = !open;
         }
         ui.open(Style.row().w(Size.grow()).alignXY(AxisAlign.Start, AxisAlign.Center));
-        if (selected < itemCount(items)) {
-            ui.label(itemAt(items, selected), Text.of().color(SLATE_100));
+        if (selected < items.length) {
+            ui.label(items[selected], Text.of().color(SLATE_100));
         }
         ui.open(Style.box().w(Size.grow()));
         ui.close();
@@ -175,7 +140,7 @@ public struct Controls {
             ui.open(Style.box().idHash(pop).absolute().top(38.0).z(200).w(Size.fixed(200.0)).h(Size.fit()).maxH(220.0)
                 .bg(SLATE_900).rounded(Radius.Md).border(1.0, SLATE_600).scroll(ScrollAxis.Vertical).p(space(1.0)));
             ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
-            for (i in 0..itemCount(items)) {
+            for (i in 0..items.length) {
                 let row = subId(id, "", truncate<i64>(i));
                 let isSelected = i == selected;
                 var style = Style.box().idHash(row).w(Size.grow()).px(space(3.0)).py(space(2.0)).rounded(Radius.Sm)
@@ -189,7 +154,7 @@ public struct Controls {
                     open = false;
                     changed = true;
                 }
-                ui.label(itemAt(items, i), Text.of().color(SLATE_100));
+                ui.label(items[i], Text.of().color(SLATE_100));
                 ui.close();
             }
             ui.close();
@@ -207,7 +172,7 @@ public struct Controls {
     public fn listbox(
         ui: borrow mut Ui,
         id: StringView,
-        items: StringView,
+        items: Slice<StringView>,
         selected: borrow mut usize,
         height: SizingAxis,
     ) -> bool {
@@ -218,7 +183,7 @@ public struct Controls {
                 .border(1.0, SLATE_600).p(space(1.0)),
         );
         ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
-        for (i in 0..itemCount(items)) {
+        for (i in 0..items.length) {
             let row = subId(id, "", truncate<i64>(i));
             let isSelected = i == selected;
             var style = Style.box().idHash(row).w(Size.grow()).px(space(3.0)).py(space(2.0)).rounded(Radius.Sm)
@@ -231,7 +196,7 @@ public struct Controls {
                 selected = i;
                 changed = true;
             }
-            ui.label(itemAt(items, i), Text.of().color(if (isSelected) WHITE else SLATE_200));
+            ui.label(items[i], Text.of().color(if (isSelected) WHITE else SLATE_200));
             ui.close();
         }
         ui.close();
@@ -243,7 +208,7 @@ public struct Controls {
     public fn listboxMulti(
         ui: borrow mut Ui,
         id: StringView,
-        items: StringView,
+        items: Slice<StringView>,
         selected: SliceMut<bool>,
         height: SizingAxis,
     ) -> bool {
@@ -254,7 +219,7 @@ public struct Controls {
                 .border(1.0, SLATE_600).p(space(1.0)),
         );
         ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
-        for (i in 0..itemCount(items)) {
+        for (i in 0..items.length) {
             let row = subId(id, "", truncate<i64>(i));
             let on = i < selected.length && selected[i];
             var style = Style.box().idHash(row).w(Size.grow()).px(space(3.0)).py(space(2.0)).rounded(Radius.Sm)
@@ -268,7 +233,7 @@ public struct Controls {
                 changed = true;
             }
             let nowOn = i < selected.length && selected[i];
-            ui.label(itemAt(items, i), Text.of().color(if (nowOn) WHITE else SLATE_200));
+            ui.label(items[i], Text.of().color(if (nowOn) WHITE else SLATE_200));
             ui.close();
         }
         ui.close();
@@ -314,11 +279,11 @@ public struct Controls {
     }
 
     /// ClayWind_Radio: one of `items`.
-    public fn radio(ui: borrow mut Ui, id: StringView, items: StringView, selected: borrow mut usize) -> bool {
+    public fn radio(ui: borrow mut Ui, id: StringView, items: Slice<StringView>, selected: borrow mut usize) -> bool {
         let h = hashId(id);
         var changed = false;
         ui.open(Style.column().idHash(h).gap(space(2.0)));
-        for (i in 0..itemCount(items)) {
+        for (i in 0..items.length) {
             let row = subId(id, "", truncate<i64>(i));
             ui.open(
                 Style.row().idHash(row).gap(space(2.0)).alignXY(
@@ -336,7 +301,7 @@ public struct Controls {
                 ui.close();
             }
             ui.close();
-            ui.label(itemAt(items, i), Text.of().color(SLATE_200));
+            ui.label(items[i], Text.of().color(SLATE_200));
             ui.close();
         }
         ui.close();
@@ -344,11 +309,11 @@ public struct Controls {
     }
 
     /// ClayWind_Tabs: a row of tabs; `active` is the open one.
-    public fn tabs(ui: borrow mut Ui, id: StringView, items: StringView, active: borrow mut usize) -> bool {
+    public fn tabs(ui: borrow mut Ui, id: StringView, items: Slice<StringView>, active: borrow mut usize) -> bool {
         let h = hashId(id);
         var changed = false;
         ui.open(Style.row().idHash(h).gap(space(1.0)));
-        for (i in 0..itemCount(items)) {
+        for (i in 0..items.length) {
             let tab = subId(id, "", truncate<i64>(i));
             let on = i == active;
             var style = Style.box().idHash(tab).px(space(3.0)).py(space(2.0)).roundedT(Radius.Md).cursor(Cursor.Pointer)
@@ -361,7 +326,7 @@ public struct Controls {
                 active = i;
                 changed = true;
             }
-            ui.label(itemAt(items, i), Text.of().color(if (on) SLATE_100 else SLATE_400));
+            ui.label(items[i], Text.of().color(if (on) SLATE_100 else SLATE_400));
             ui.close();
         }
         ui.close();
@@ -373,7 +338,7 @@ public struct Controls {
     public fn contextMenu(
         ui: borrow mut Ui,
         id: StringView,
-        items: StringView,
+        items: Slice<StringView>,
         open: borrow mut bool,
         x: f32,
         y: f32,
@@ -386,7 +351,7 @@ public struct Controls {
         ui.open(Style.box().idHash(h).fixed().left(x).top(y).z(300).bg(SLATE_900).p(space(1.0)).rounded(Radius.Md)
             .border(1.0, SLATE_600));
         ui.open(Style.column().w(Size.fixed(180.0)));
-        for (i in 0..itemCount(items)) {
+        for (i in 0..items.length) {
             let row = subId(id, "", truncate<i64>(i));
             ui.open(
                 Style.box().idHash(row).w(
@@ -398,7 +363,7 @@ public struct Controls {
                 chosen = i;
                 open = false;
             }
-            ui.label(itemAt(items, i), Text.of().color(SLATE_100));
+            ui.label(items[i], Text.of().color(SLATE_100));
             ui.close();
         }
         ui.close();
@@ -482,92 +447,92 @@ public struct Controls {
         }
         return changed;
     }
-}
 
-/// ClayWind_TextInputEx: a text field with a caller-owned caret (Left/Right/Home/End move it, Backspace/Delete and
-/// typing edit at it). It measures the text before the caret to place it, so it takes the text metrics.
-public fn textInputEx<M: TextMetrics>(
-    ui: borrow mut Ui,
-    metrics: borrow M,
-    id: StringView,
-    buf: SliceMut<u8>,
-    len: borrow mut usize,
-    caret: borrow mut usize,
-) -> bool {
-    let h = hashId(id);
-    ui.registerFocusable(h);
-    let focused = ui.hasFocus(h);
-    var changed = false;
-    if (caret > len) {
-        caret = len;
-    }
-    ui.open(Controls.fieldStyle(h, focused));
-    if (ui.pressedOn(h)) {
-        ui.setFocus(h);
-    }
-    if (focused) {
-        loop {
-            let c = ui.nextChar();
-            if (c == 0) {
-                break;
-            }
-            if (c >= 32 && c < 127 && len < buf.length) {
-                // Shift the tail right by one and insert at the caret.
-                var k: usize = len + 0;
-                while (k > caret) {
-                    buf[k] = buf[k - 1];
-                    k -= 1;
-                }
-                buf[caret] = truncate<u8>(c);
-                caret += 1;
-                len += 1;
-                changed = true;
-            }
-        }
-        if (ui.keyHit(Key.Backspace) && caret > 0) {
-            for (k in caret..len) {
-                buf[k - 1] = buf[k];
-            }
-            caret -= 1;
-            len -= 1;
-            changed = true;
-        }
-        if (ui.keyHit(Key.Delete) && caret < len) {
-            for (k in caret + 1..len) {
-                buf[k - 1] = buf[k];
-            }
-            len -= 1;
-            changed = true;
-        }
-        if (ui.keyHit(Key.Left) && caret > 0) {
-            caret -= 1;
-        }
-        if (ui.keyHit(Key.Right) && caret < len) {
-            caret += 1;
-        }
-        if (ui.keyPressed(Key.Home)) {
-            caret = 0;
-        }
-        if (ui.keyPressed(Key.End)) {
+    /// ClayWind_TextInputEx: a text field with a caller-owned caret (Left/Right/Home/End move it, Backspace/Delete and
+    /// typing edit at it). It measures the text before the caret to place it, so it takes the text metrics.
+    public fn textInputEx<M: TextMetrics>(
+        ui: borrow mut Ui,
+        metrics: borrow M,
+        id: StringView,
+        buf: SliceMut<u8>,
+        len: borrow mut usize,
+        caret: borrow mut usize,
+    ) -> bool {
+        let h = hashId(id);
+        ui.registerFocusable(h);
+        let focused = ui.hasFocus(h);
+        var changed = false;
+        if (caret > len) {
             caret = len;
         }
-        if (ui.keyPressed(Key.Enter)) {
-            ui.clearFocus();
+        ui.open(Controls.fieldStyle(h, focused));
+        if (ui.pressedOn(h)) {
+            ui.setFocus(h);
         }
-    }
-    if (len > 0) {
-        ui.labelBytes(buf[0..len], Text.of().color(SLATE_100));
-    }
-    // The caret, absolutely placed at the measured width of buf[0..caret), past the padding.
-    if (focused && (truncate<u64>((ui.time() * 2.0).floor()) & 1) == 0) {
-        let cx = metrics.measure(buf[0..caret], TextConfig.of(18.0)).w;
-        ui.open(
-            Style.box().absolute().left(
-                space(3.0) + cx,
-            ).top(space(2.0)).w(Size.fixed(2.0)).h(Size.fixed(18.0)).bg(SLATE_200),
-        );
+        if (focused) {
+            loop {
+                let c = ui.nextChar();
+                if (c == 0) {
+                    break;
+                }
+                if (c >= 32 && c < 127 && len < buf.length) {
+                    // Shift the tail right by one and insert at the caret.
+                    var k: usize = len;
+                    while (k > caret) {
+                        buf[k] = buf[k - 1];
+                        k -= 1;
+                    }
+                    buf[caret] = truncate<u8>(c);
+                    caret += 1;
+                    len += 1;
+                    changed = true;
+                }
+            }
+            if (ui.keyHit(Key.Backspace) && caret > 0) {
+                for (k in caret..len) {
+                    buf[k - 1] = buf[k];
+                }
+                caret -= 1;
+                len -= 1;
+                changed = true;
+            }
+            if (ui.keyHit(Key.Delete) && caret < len) {
+                for (k in caret + 1..len) {
+                    buf[k - 1] = buf[k];
+                }
+                len -= 1;
+                changed = true;
+            }
+            if (ui.keyHit(Key.Left) && caret > 0) {
+                caret -= 1;
+            }
+            if (ui.keyHit(Key.Right) && caret < len) {
+                caret += 1;
+            }
+            if (ui.keyPressed(Key.Home)) {
+                caret = 0;
+            }
+            if (ui.keyPressed(Key.End)) {
+                caret = len;
+            }
+            if (ui.keyPressed(Key.Enter)) {
+                ui.clearFocus();
+            }
+        }
+        if (len > 0) {
+            ui.labelBytes(buf[0..len], Text.of().color(SLATE_100));
+        }
+        // The caret, absolutely placed at the measured width of buf[0..caret), past the padding.
+        if (focused && (truncate<u64>((ui.time() * 2.0).floor()) & 1) == 0) {
+            let cx = metrics.measure(buf[0..caret], TextConfig.of(18.0)).w;
+            ui.open(
+                Style.box().absolute().left(
+                    space(3.0) + cx,
+                ).top(space(2.0)).w(Size.fixed(2.0)).h(Size.fixed(18.0)).bg(SLATE_200),
+            );
+            ui.close();
+        }
         ui.close();
+        return changed;
     }
-    ui.close();
-    return changed;
 }

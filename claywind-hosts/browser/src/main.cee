@@ -149,7 +149,7 @@ async fn sendFrame(
     out: borrow mut Vector<u8>,
 ) -> Result<void, AsyncError> {
     host.raster.begin(Color.hex(pageBg(host.ui)));
-    renderInto(host.ui, mut host.raster);
+    host.ui.renderInto(mut host.raster);
     host.raster.finish();
     let px = host.raster.pixels();
     let prev = host.previous.viewMut();
@@ -270,7 +270,7 @@ async fn session(stream: borrow mut AsyncTcpStream, host: borrow mut Host) -> Re
         }
         host.ui.begin(mut platform);
         demoFrame(mut host.ui, mut host.app, host.raster);
-        match (endFrame(mut host.ui, mut platform, host.raster)) {
+        match (host.ui.endFrame(mut platform, host.raster)) {
             Ok() => {}
             Err(_) => { await AsyncConsole.writeLine("browser: the frame does not fit the UI capacity")?; }
         }
