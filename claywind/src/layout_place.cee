@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Ported, and altered for CeeSafe, from Clay (https://github.com/nicbarker/clay), Copyright (c) 2024 Nic Barker,
+// under the zlib/libpng license; see THIRD_PARTY_NOTICES.md.
 // Positioning and render commands: the second half of Clay__CalculateFinalLayout, plus Clay__ElementBaseline.
 // Commands are emitted in Clay's order: on the way down opacity, filter, transform, blend, image, custom, clip,
 // shadow, background, gradient, icon, ring; on the way up border (and between-children dividers), clip end,

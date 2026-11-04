@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Ported, and altered for CeeSafe, from Clay (https://github.com/nicbarker/clay), Copyright (c) 2024 Nic Barker,
+// under the zlib/libpng license; see THIRD_PARTY_NOTICES.md.
 // Sizing along an axis (Clay__SizeContainersAlongAxis) and its flex-wrap helpers, ported from the ClayWind fork.
 
 /// One wrapped line: children [start, end) (Clay__WrapLine). Sizes include margins, mainSize the in-line gaps.

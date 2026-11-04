@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Ported, and altered for CeeSafe, from Clay (https://github.com/nicbarker/clay), Copyright (c) 2024 Nic Barker,
+// under the zlib/libpng license; see THIRD_PARTY_NOTICES.md.
 // Element declarations for the layout engine: the CeeSafe form of Clay's Clay_ElementDeclaration, including every
 // ClayWind fork field (margins, wrap, basis/shrink, transforms, effects). Plain Copy data with a `Decl.of()` default,
 // since CeeSafe has no struct defaults. The Tailwind-style builder (style.cee, Phase 3) produces these.

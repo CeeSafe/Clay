@@ -9,6 +9,10 @@ the compiler.
 The same demo runs in a native window on macOS, Windows and Linux, headless (for tests and screenshots), in a
 browser, and in a terminal.
 
+**Credits.** ClayWind stands on [Clay](https://github.com/nicbarker/clay) by Nic Barker. The layout model, the
+element and sizing rules and the layout algorithms are Clay's, and the layout engine here (`claywind/src/layout_*.cee`)
+is a port of them, altered for CeeSafe. Clay is under the zlib licence ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
 ![The ClayWind demo's dashboard, drawn by the CeeSafe renderer](docs/dashboard.png)
 
 ![The effects tab: rounded clipping, gradients and blend modes](docs/effects.png)

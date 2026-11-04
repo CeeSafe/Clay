@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Ported, and altered for CeeSafe, from Clay (https://github.com/nicbarker/clay), Copyright (c) 2024 Nic Barker,
+// under the zlib/libpng license; see THIRD_PARTY_NOTICES.md.
 // One sizing pass (Clay__SizeLayout), the relayout passes for widths that depend on heights, and the driver
 // (Clay__CalculateFinalLayout's first half). Positioning and render commands are in layout_place.cee.
 
