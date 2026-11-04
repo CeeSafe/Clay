@@ -227,6 +227,12 @@ fn configure(d: borrow mut Decl, key: Slice<u8>, v: Slice<u8>) {
     } else if (same(key, "filt")) {
         d.layout.filter = FilterMode.Blur;
         d.layout.filterAmount = parseNumber(v);
+    } else if (same(key, "gray")) {
+        d.layout.filter = FilterMode.Grayscale;
+        d.layout.filterAmount = 0.0;
+    } else if (same(key, "bright")) {
+        d.layout.filter = FilterMode.Brightness;
+        d.layout.filterAmount = parseNumber(v);
     }
 }
 

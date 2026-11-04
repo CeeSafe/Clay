@@ -6,9 +6,49 @@
 /// boxes but, at the quality 60 thorvg_backend.c asks for, run as two box passes per axis
 /// (level = int(3 * 0.59) + 1). Each pass is a sliding integer box over u8 premultiplied channels, truncating, with
 /// edges extended at the layer's bounds. `sigma2` is sigma squared, already scaled by the transform.
-fn gaussianBlur(r: borrow mut Raster, layer: Layer, sigma2: f32) {
+/// The part of a layer that holds anything (layer-relative, end-exclusive), or null when it is empty.
+struct LayerBounds {
+    x0: usize;
+    y0: usize;
+    x1: usize;
+    y1: usize;
+}
+
+fn contentBounds(r: borrow Raster, layer: Layer) -> LayerBounds? {
+    let w = idx(layer.x1 - layer.x0);
+    let h = idx(layer.y1 - layer.y0);
+    var b = LayerBounds { x0: w, y0: h, x1: 0, y1: 0 };
+    for (y in 0..h) {
+        let row = layer.offset + y * w;
+        var first = w;
+        for (x in 0..w) {
+            if (r.pool[row + x] != 0) {
+                first = x;
+                break;
+            }
+        }
+        if (first == w) {
+            continue;
+        }
+        var last = w - 1;
+        while (r.pool[row + last] == 0) {
+            last -= 1;
+        }
+        if (first < b.x0) { b.x0 = first; }
+        if (last + 1 > b.x1) { b.x1 = last + 1; }
+        if (y < b.y0) { b.y0 = y; }
+        b.y1 = y + 1;
+    }
+    return if (b.x1 > b.x0) b else null;
+}
+
+/// _gaussianFilter's three box passes per axis (ThorVG's box-blur approximation of a Gaussian with variance
+/// `sigma2`), over `content` grown by the passes' reach: beyond that the layer is zero before and after, and a region
+/// edge of zeros extends as the layer edge would, so the pixels are the same as blurring the whole layer. Returns the
+/// region it blurred.
+fn gaussianBlur(r: borrow mut Raster, layer: Layer, sigma2: f32, content: LayerBounds) -> LayerBounds {
     if (sigma2 <= 0.0) {
-        return;
+        return content;
     }
     var wl = truncate<i32>((12.0 * sigma2 / 3.0 + 1.0).sqrt());
     if (wl % 2 == 0) {
@@ -23,12 +63,19 @@ fn gaussianBlur(r: borrow mut Raster, layer: Layer, sigma2: f32) {
     let w = idx(layer.x1 - layer.x0);
     let h = idx(layer.y1 - layer.y0);
     if (w == 0 || h == 0) {
-        return; // clipped away entirely
+        return content; // clipped away entirely
     }
-    let longest = if (w > h) w else h;
+    let reach = idx(imax(k0, 0) + imax(k1, 0) + 2);
+    let region = LayerBounds {
+        x0: if (content.x0 > reach) content.x0 - reach else 0,
+        y0: if (content.y0 > reach) content.y0 - reach else 0,
+        x1: if (content.x1 + reach < w) content.x1 + reach else w,
+        y1: if (content.y1 + reach < h) content.y1 + reach else h,
+    };
+    let longest = if (region.x1 - region.x0 > region.y1 - region.y0) region.x1 - region.x0 else region.y1 - region.y0;
     if (longest > r.line.length) {
         r.overflowed = true;
-        return;
+        return content;
     }
     for (axis in 0..2) {
         for (level in 0..2) {
@@ -36,21 +83,22 @@ fn gaussianBlur(r: borrow mut Raster, layer: Layer, sigma2: f32) {
             if (d <= 0) {
                 continue;
             }
-            boxPass(mut r, layer, axis, d, w, h);
+            boxPass(mut r, layer, axis, d, w, region);
         }
     }
+    return region;
 }
 
-/// One sliding box pass of radius `d` along rows (axis 0) or columns (axis 1): _gaussianFilter. The source line is
-/// copied to a packed scratch line, so the pass can write the layer in place.
-fn boxPass(r: borrow mut Raster, layer: Layer, axis: i32, d: i32, w: usize, h: usize) {
-    let lines = if (axis == 0) h else w;
-    let length = if (axis == 0) w else h;
+/// One sliding box pass of radius `d` along rows (axis 0) or columns (axis 1) of `region`: _gaussianFilter. The
+/// source line is copied to a packed scratch line, so the pass can write the layer in place.
+fn boxPass(r: borrow mut Raster, layer: Layer, axis: i32, d: i32, w: usize, region: LayerBounds) {
+    let lines = if (axis == 0) region.y1 - region.y0 else region.x1 - region.x0;
+    let length = if (axis == 0) region.x1 - region.x0 else region.y1 - region.y0;
     let end = truncate<i32>(length) - 1;
     let iarr = 1.0 / round<f32>(d + d + 1);
     for (line in 0..lines) {
         for (i in 0..length) {
-            r.line[i] = r.pool[layer.offset + pixelIndex(axis, line, i, w)];
+            r.line[i] = r.pool[layer.offset + pixelIndex(axis, line, i, w, region)];
         }
         var a0: u32 = 0;
         var a1: u32 = 0;
@@ -79,7 +127,7 @@ fn boxPass(r: borrow mut Raster, layer: Layer, axis: i32, d: i32, w: usize, h: u
             let c1 = truncate<u32>(round<f32>(a1) * iarr);
             let c2 = truncate<u32>(round<f32>(a2) * iarr);
             let c3 = truncate<u32>(round<f32>(a3) * iarr);
-            r.pool[layer.offset + pixelIndex(axis, line, i, w)] = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+            r.pool[layer.offset + pixelIndex(axis, line, i, w, region)] = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
             hi += 1;
             lo += 1;
         }
@@ -89,8 +137,9 @@ fn boxPass(r: borrow mut Raster, layer: Layer, axis: i32, d: i32, w: usize, h: u
 /// _gaussianEdgeExtend.
 fn extend(end: i32, i: i32) -> i32 => if (i < 0) 0 else if (i > end) end else i;
 
-/// Element `i` of line `line`: a row (axis 0) or a column (axis 1) of a `w`-wide layer.
-fn pixelIndex(axis: i32, line: usize, i: usize, w: usize) -> usize => if (axis == 0) line * w + i else i * w + line;
+/// Element `i` of line `line` of `region`: a row (axis 0) or a column (axis 1) of a `w`-wide layer.
+fn pixelIndex(axis: i32, line: usize, i: usize, w: usize, region: LayerBounds) -> usize =>
+    if (axis == 0) (region.y0 + line) * w + region.x0 + i else (region.y0 + i) * w + region.x0 + line;
 
 /// ThorVG's INTERPOLATE on one channel: d + (s - d) * a / 256.
 fn interpolate8(s: u32, d: u32, a: u32) -> u32 {
@@ -101,7 +150,7 @@ fn interpolate8(s: u32, d: u32, a: u32) -> u32 {
     return truncate<u32>(if (v < 0) 0 else if (v > 255) 255 else v);
 }
 
-/// ThorVG's tint effect at thorvg_backend.c's intensity 100 (of 255): luma of the premultiplied pixel
+/// ThorVG's tint effect at thorvg_backend.c's intensity (TINT_INTENSITY): luma of the premultiplied pixel
 /// ((54 R + 182 G + 19 B) >> 8) mapped onto black -> white, mixed 100/256 into the original, then scaled by the
 /// pixel's alpha (ALPHA_BLEND). This is grayscale, and the image tint with a color in place of white.
 fn tintPixel(p: u32, black: Color, white: Color) -> u32 {
@@ -113,15 +162,19 @@ fn tintPixel(p: u32, black: Color, white: Color) -> u32 {
     let tr = interpolate8(white.r as u32, black.r as u32, luma);
     let tg = interpolate8(white.g as u32, black.g as u32, luma);
     let tb = interpolate8(white.b as u32, black.b as u32, luma);
-    // INTERPOLATE(val, src, 100), with val opaque.
-    let mr = interpolate8(tr, r, 100);
-    let mg = interpolate8(tg, g, 100);
-    let mb = interpolate8(tb, b, 100);
-    let ma = interpolate8(255, a, 100);
+    // INTERPOLATE(val, src, intensity), with val opaque. thorvg_backend.c passes 100 (percent), which ThorVG 1.1.2
+    // stores as (uint8_t)(100.0f * 2.55f) = 254, so the tint is all but complete.
+    let mr = interpolate8(tr, r, TINT_INTENSITY);
+    let mg = interpolate8(tg, g, TINT_INTENSITY);
+    let mb = interpolate8(tb, b, TINT_INTENSITY);
+    let ma = interpolate8(255, a, TINT_INTENSITY);
     // ALPHA_BLEND(val, alpha): every channel times (alpha + 1) / 256.
     let k = a + 1;
     return ((mr * k) >> 8) | (((mg * k) >> 8) << 8) | (((mb * k) >> 8) << 16) | (((ma * k) >> 8) << 24);
 }
+
+/// ThorVG's tint intensity for thorvg_backend.c's 100.0 (see tintPixel).
+const TINT_INTENSITY: u32 = 254;
 
 /// grayscale (thorvg_backend.c: tint black -> white).
 fn grayscaleLayer(r: borrow mut Raster, layer: Layer) {

@@ -302,12 +302,18 @@ fn pushClipShape(r: borrow mut Raster, area: Rect, radius: Corners) {
         r.clips.push(ClipState { x0: x0, y0: y0, x1: x1, y1: y1, hasMask: false, maskOffset: 0, maskTop: r.maskTop });
         return;
     }
-    let w = idx(x1 - x0);
-    let h = idx(y1 - y0);
+    // A shape clipper (ThorVG's rounded-rect clip path) keeps its anti-aliased edge, so the mask spans every pixel
+    // the shape touches: floor/ceil, not the rect clipper's rounding.
+    let mx0 = imax(truncate<i32>(Math.clamp(bounds.x.floor(), -1.0, 100000.0)), parent.x0);
+    let my0 = imax(truncate<i32>(Math.clamp(bounds.y.floor(), -1.0, 100000.0)), parent.y0);
+    let mx1 = imax(imin(truncate<i32>(Math.clamp((bounds.x + bounds.w).ceil(), -1.0, 100000.0)), parent.x1), mx0);
+    let my1 = imax(imin(truncate<i32>(Math.clamp((bounds.y + bounds.h).ceil(), -1.0, 100000.0)), parent.y1), my0);
+    let w = idx(mx1 - mx0);
+    let h = idx(my1 - my0);
     let saved = r.maskTop;
     if (r.maskTop + w * h > r.masks.length) {
         r.overflowed = true;
-        r.clips.push(ClipState { x0: x0, y0: y0, x1: x1, y1: y1, hasMask: false, maskOffset: 0, maskTop: saved });
+        r.clips.push(ClipState { x0: mx0, y0: my0, x1: mx1, y1: my1, hasMask: false, maskOffset: 0, maskTop: saved });
         return;
     }
     let offset = r.maskTop;
@@ -317,8 +323,8 @@ fn pushClipShape(r: borrow mut Raster, area: Rect, radius: Corners) {
     r.maskTop += w * h;
     beginPath(mut r);
     roundedRect(mut r, area, radius, 0.0, false);
-    fillPath(mut r, solidPaint(Color.hex(WHITE)), FillTarget.Mask(offset, x0, y0, x1 - x0));
-    r.clips.push(ClipState { x0: x0, y0: y0, x1: x1, y1: y1, hasMask: true, maskOffset: offset, maskTop: saved });
+    fillPath(mut r, solidPaint(Color.hex(WHITE)), FillTarget.Mask(offset, mx0, my0, mx1 - mx0));
+    r.clips.push(ClipState { x0: mx0, y0: my0, x1: mx1, y1: my1, hasMask: true, maskOffset: offset, maskTop: saved });
 }
 
 /// tvgb_text: the run as one filled path. Glyphs advance by (advance + kerning) font units, scaled to `fontSize`

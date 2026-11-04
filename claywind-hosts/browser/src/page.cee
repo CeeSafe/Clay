@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: MIT
+// The display client: one HTML page with a canvas and about sixty lines of JavaScript (approved in the plan, §8). It
+// paints the rectangles of pixels the server sends, and sends the pointer, wheel, keys and typed characters back as
+// short text messages:
+//
+//   m X Y        pointer moved            d X Y B / u X Y B   button B (0 primary, 2 secondary) down / up
+//   w DY         wheel                    k KEY / K KEY       a named key down / up (r KEY: an OS repeat)
+//   c CODE       a typed character        f                   the tab lost focus (release everything)
+//
+// Server to page: a binary message is a frame rectangle (x, y, w, h as little-endian u16, then RGBA rows); a text
+// message "cursor NAME" sets the CSS cursor.
+
+fn line(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
+    for (b in text.bytes()) {
+        out.push(b)?;
+    }
+    return out.push('\n');
+}
+
+/// The page, written line by line (a string literal ends at its line).
+public fn writePage(out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    line(mut out, "<!doctype html>")?;
+    line(mut out, "<html lang=\"en\"><head><meta charset=\"utf-8\"><title>ClayWind</title>")?;
+    line(mut out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")?;
+    line(
+        mut out,
+        "<style>html,body{margin:0;height:100%;background:#020617;display:flex;align-items:center;justify-content:center}",
+    )?;
+    line(mut out, "canvas{outline:none;image-rendering:auto;max-width:100vw;max-height:100vh}")?;
+    line(mut out, "#s{position:fixed;left:8px;bottom:6px;font:12px system-ui;color:#64748b}</style></head><body>")?;
+    line(
+        mut out,
+        "<canvas id=\"c\" width=\"1024\" height=\"640\" tabindex=\"0\"></canvas><div id=\"s\">connecting…</div>",
+    )?;
+    line(mut out, "<script>")?;
+    line(mut out, "const c=document.getElementById('c'),g=c.getContext('2d'),s=document.getElementById('s');")?;
+    line(
+        mut out,
+        "let ws;function connect(){ws=new WebSocket('ws://'+location.host+'/ws');ws.binaryType='arraybuffer';",
+    )?;
+    line(mut out, "ws.onopen=()=>{s.textContent='CeeSafe · ClayWind';c.focus()};")?;
+    line(mut out, "ws.onclose=()=>{s.textContent='disconnected, retrying…';setTimeout(connect,1000)};")?;
+    line(mut out, "ws.onmessage=e=>{if(typeof e.data==='string'){const p=e.data.split(' ');")?;
+    line(mut out, "if(p[0]==='cursor')c.style.cursor=p[1];return}")?;
+    line(
+        mut out,
+        "const v=new DataView(e.data),x=v.getUint16(0,true),y=v.getUint16(2,true),w=v.getUint16(4,true),h=v.getUint16(6,true);",
+    )?;
+    line(mut out, "if(w&&h)g.putImageData(new ImageData(new Uint8ClampedArray(e.data,8,w*h*4),w,h),x,y)}}")?;
+    line(mut out, "function send(t){if(ws&&ws.readyState===1)ws.send(t)}")?;
+    line(mut out, "function pos(e){const r=c.getBoundingClientRect();")?;
+    line(
+        mut out,
+        "return Math.round((e.clientX-r.left)*c.width/r.width)+' '+Math.round((e.clientY-r.top)*c.height/r.height)}",
+    )?;
+    line(mut out, "c.addEventListener('mousemove',e=>send('m '+pos(e)));")?;
+    line(mut out, "c.addEventListener('mousedown',e=>{c.focus();send('d '+pos(e)+' '+e.button);e.preventDefault()});")?;
+    line(mut out, "window.addEventListener('mouseup',e=>send('u '+pos(e)+' '+e.button));")?;
+    line(mut out, "c.addEventListener('contextmenu',e=>e.preventDefault());")?;
+    line(
+        mut out,
+        "c.addEventListener('wheel',e=>{send('w '+(-e.deltaY/40).toFixed(2));e.preventDefault()},{passive:false});",
+    )?;
+    line(
+        mut out,
+        "c.addEventListener('keydown',e=>{if(e.key.length===1&&!e.ctrlKey&&!e.metaKey){send('c '+e.key.codePointAt(0))}",
+    )?;
+    line(
+        mut out,
+        "else{send((e.repeat?'r ':'k ')+e.key)}if(e.key==='Tab'||e.key==='Backspace'||e.key===' '||e.key.startsWith('Arrow'))e.preventDefault()});",
+    )?;
+    line(mut out, "c.addEventListener('keyup',e=>{if(e.key.length!==1)send('K '+e.key)});")?;
+    line(mut out, "window.addEventListener('blur',()=>send('f'));")?;
+    line(mut out, "connect();")?;
+    line(mut out, "</script></body></html>")?;
+    return Ok();
+}

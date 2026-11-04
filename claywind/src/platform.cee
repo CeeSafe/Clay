@@ -141,21 +141,22 @@ public enum Cursor {
     Text,
 }
 
-/// What the host supplies each frame.
+/// What the host supplies each frame. Every method is `@effects()` (no blocking, no allocation): the host gathers
+/// its input beforehand, so a frame can run inside an async task.
 public interface Platform {
     /// Layout units (logical pixels).
-    fn screenSize(borrow this) -> Dims;
+    @effects() fn screenSize(borrow this) -> Dims;
     /// Seconds since the previous frame.
-    fn frameTime(borrow this) -> f32;
+    @effects() fn frameTime(borrow this) -> f32;
     /// Seconds since start (caret blink and the like).
-    fn time(borrow this) -> f64;
-    fn pointer(borrow this) -> Pointer;
-    fn keyDown(borrow this, key: Key) -> bool;
+    @effects() fn time(borrow this) -> f64;
+    @effects() fn pointer(borrow this) -> Pointer;
+    @effects() fn keyDown(borrow this, key: Key) -> bool;
     /// Went down this frame.
-    fn keyPressed(borrow this, key: Key) -> bool;
+    @effects() fn keyPressed(borrow this, key: Key) -> bool;
     /// The OS's key repeat fired this frame.
-    fn keyRepeated(borrow this, key: Key) -> bool;
+    @effects() fn keyRepeated(borrow this, key: Key) -> bool;
     /// The next typed Unicode code point queued this frame, or 0 when the queue is empty.
-    fn nextChar(borrow mut this) -> u32;
-    fn setCursor(borrow mut this, cursor: Cursor);
+    @effects() fn nextChar(borrow mut this) -> u32;
+    @effects() fn setCursor(borrow mut this, cursor: Cursor);
 }

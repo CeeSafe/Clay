@@ -195,7 +195,7 @@ of scope**. Every host below uses only `lib/std` (or `lib/core`), recommended or
 | 4 | Software renderer ✅ done 2026-11-03 (§13) | `raster/*` + SoftwareBackend (no text yet) | Golden BMPs for rect/border/radius/gradient/ring/shadow/blend/opacity/blur vs. ThorVG output from the C build (per-pixel tolerance) |
 | 5 | Fonts ✅ done 2026-11-03 (§14) | `font/*`, measure + baseline wired into layout | Text goldens; layout text widths match the ThorVG build within 1px |
 | 6 | Controls + images ✅ done 2026-11-03 (§15) | `controls`, icons, focus cycling; BMP (+PNG) images | Controls behaviour tests (scripted input through a FakePlatform) |
-| 7 | Hosts + demo | headless + terminal + browser hosts; `claywind-demo` port of `main.c` | Demo screenshots match the C build's `CLAYWIND_SCREENSHOT` for each tab |
+| 7 | Hosts + demo ✅ done 2026-11-03 (§16) | headless + terminal + browser hosts; `claywind-demo` port of `main.c` | Demo screenshots match the C build's `CLAYWIND_SCREENSHOT` for each tab |
 | 8 | CosmoOS | freestanding build (`--profile freestanding`, `--emit obj`) | Object links into CosmoOS; demo frame on the QEMU GOP |
 | 9 | Optional | perf pass (`ceesafe_emit_c` bounds-check report, dirty rects, only changed cells re-emitted to the terminal) | 60 fps at 1024×640 on the software path |
 
@@ -426,8 +426,9 @@ lines.
   with σ² scaled by the transform. A true Gaussian visibly differs.
 - **Blend modes:** ThorVG's u8 operators and its blended-scene composite. A blend composited directly into an
   effect scene is ignored, as in ThorVG.
-- **Grayscale and image tint:** ThorVG's tint effect at the intensity of 100 out of 255 that the C backend passes,
-  with luma (54R + 182G + 19B) >> 8.
+- **Grayscale and image tint:** ThorVG's tint effect, with luma (54R + 182G + 19B) >> 8. The C backend passes
+  intensity 100 (a percentage), which ThorVG stores as 254 out of 255. (Phase 4 used 100 out of 255; the Phase 7 demo
+  comparison caught it, §16.)
 
 **Verified:**
 1. **The C pixel suite:** `tests/thorvg_test.c` is ported check for check (all but text, which comes in Phase 5),
@@ -569,5 +570,79 @@ keeps the output identical.
 - A mutable sub-slice is returned with `borrow mut this.pool[a..b]`, and `let` (not `var`) binds a `SliceMut`.
 - `i32` has no `abs`.
 
-**Not done (moved to Phase 7):** the terminal demo doesn't use the new controls yet. Its `q`-to-quit key would
-also clash with typing in a text field.
+**Not done:** the terminal demo doesn't use the new controls (see §16).
+
+## 16. Phase 7 results (2026-11-03)
+
+**Built:**
+- **`claywind-demo`** (a freestanding library): `main.c` ported line for line. It has the sidebar, the Dashboard,
+  Controls (Inputs / Selection / Lists, with the live-state panel) and Effects pages, the rocking PRO badge, the
+  tooltips and the context menu.
+  - Hosts call `demoFrame(ui, app, metrics)` between `ui.begin` and `endFrame`.
+  - `ScriptPlatform` is a deterministic platform: fixed 1/60 s frames, and a `FRAME:click|right|move|key|type:ARG`
+    event script.
+  - One deliberate difference: `T` toggles the theme only when no field has focus, so it can be typed.
+- **Hosts** (all pure CeeSafe):
+  - **`claywind-hosts/headless`:** screenshots (`CLAYWIND_SCREENSHOT` as `.bmp` or raw RGBA,
+    `CLAYWIND_SCREENSHOT_TAB`, `CLAYWIND_SHOT_EVENTS`, `CLAYWIND_LIGHT`) and `CLAYWIND_BENCH`. It replaces
+    `main.c`'s screenshot hook and saves the same frame (28).
+  - **`claywind-hosts/browser`:** an HTTP + WebSocket server on `AsyncTcpListener`, with SHA-1, base64 and RFC 6455
+    framing written in CeeSafe.
+    - One async task per session waits for input with `Async.timeout` until the next 16 ms frame.
+    - It renders, then sends only the rectangle that changed since the last frame.
+    - The page has about 60 lines of JS: it paints rectangles with `putImageData` and sends pointer, wheel, keys
+      and typed characters.
+    - One session at a time; the app state survives reconnects.
+  - **`claywind-hosts/terminal`:** unchanged (Phase 3/6).
+- **`Platform`'s methods are now `@effects()`.** A `dyn Platform` call counts as "may block" otherwise, which async
+  code (the browser host) rejects.
+
+**Verified:**
+1. **Demo vs the C build**, scene by scene:
+   - **Setup:** `~/dev/ClayWind/tests/demo_shot.sh` builds `main.c` against a headless stand-in for
+     `sdl_backend.h` (ThorVG into a buffer, the same script grammar and clock). `demo_compare.py` diffs 14 scenes.
+   - **Scenes:** each tab in dark and light; hover; button clicks; typing with caret moves; Tab focus, the spin
+     input, slider and tooltip; checkbox and theme radio; dropdown open and pick; list single- and multi-select; the
+     context menu.
+   - **Result:** all 14 match. The Controls and Effects scenes have no pixel off by more than 40 per channel.
+     Dashboard scenes are within 0.04–0.1%: the stat cards' right-edge hairline is ThorVG bug A.
+   - **Interactions checked visually:** each scripted interaction does what it should in both builds.
+2. **Two real port bugs, found by the demo comparison and fixed:**
+   - **Grayscale tint was far too weak.** The C backend passes `100.0` to ThorVG's tint, which is a percentage,
+     stored as `(uint8_t)(100.0f * 2.55f)` = 254. The port used 100 out of 255. (§13's note is corrected.)
+   - **A rounded clip lost its anti-aliased edge at fractional positions.** The mask spanned the rounded clip
+     rectangle instead of every pixel the shape touches.
+3. **Render fuzzer, wider:** it now also generates grayscale (`gray=1`) and brightness (`bright=K`), and treats
+   grayscale as an effect scene for bugs B/C.
+   - **New known class E, a port limitation (not a ThorVG bug):** a blend inside a brightness filter. ThorVG's
+     brightness scene has no effect of its own, so it passes through and the blend reaches the backdrop; ThorVG then
+     draws a duplicate of the subtree for the overlay. The streaming port renders the filter isolated.
+   - **Results:** 490 of 500 frames match (seed 1) and 485 of 500 (seed 3), with the rest all known A–E. With Arial
+     text, 298 of 300. 0 unexplained. The layout fuzzer still matches 300 of 300.
+4. **Browser host:**
+   - **Automated:** `claywind-hosts/browser/test_client.py`, a raw-socket client, checks the page, the 404, the
+     handshake's accept key, frame rectangles, the pointer cursor, clicks ("Clicked 2"), opening Controls, typing
+     into the name field, Tab, Enter, and `T` to light mode.
+   - **Manually in Chrome:** the page renders, and clicks switch tabs and the theme.
+5. **Tests:** 72, including `demo_test.cee` (every tab fits; a scripted Down, Down, Enter opens Effects; the clock).
+
+**Performance:**
+- Layers (opacity, blend, filter, shadow) now blur and composite only their content's bounding box, grown by the
+  blur's reach. The pixels are the same as before, and the fuzzer and demo results are unchanged.
+- **Dashboard frame:** 35.7 → 16.9 ms. Controls take 7.6 ms and Effects 12.1 ms (1024×640, Apple silicon, -O2).
+- **What's left in the profile:** `fillPath` (rasterization) leads, then `popLayer`'s content scan.
+
+**Language findings:**
+- A struct that holds a loan cannot be a `dyn` interface value (N0268), so `ScriptPlatform` copies its script.
+- `Console` is blocking, so async code uses `AsyncConsole`.
+- A `dyn` call is "may sleep" unless the interface method is `@effects()`.
+- There are no multi-line string literals: the page is written line by line. Arrays of `StringView` aren't allowed
+  either.
+- Program arguments come from `Process.argument(i)`.
+- `TextWriter` has `signed` but no `unsigned`.
+
+**Not done:**
+- The browser canvas is fixed at 1024×640: the Raster's size is set at creation, so window resizing would need a
+  Raster sized for the largest window.
+- The terminal host still runs its own small demo, not `claywind-demo`, which is laid out for 1024×640 pixels, not
+  character cells.

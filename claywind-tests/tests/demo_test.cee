@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// The demo (claywind_demo, the port of main.c) driven by its scripted platform: every nav tab lays out within
+// capacity, and scripted input reaches the app state. Pixel parity with the C build is checked outside the suite
+// (~/dev/ClayWind/tests/demo_compare.py, which needs ThorVG).
+
+import claywind;
+import claywind_demo;
+
+/// Runs `frames` frames of the demo on `tab` with `script`; false when a frame does not fit.
+fn runDemo(tab: usize, script: StringView, frames: u32, app: borrow mut DemoApp) -> bool {
+    var storage = heap(8388608);
+    let memory = FixedBufferAllocator.over(mut storage.viewMut());
+    var ui = Ui.create(memory, UiCapacity.of(2048))!;
+    ui.setDarkMode(true);
+    var platform = ScriptPlatform.create(script.bytes(), Dims { w: 1024.0, h: 640.0 });
+    let metrics = MetricMeasure { unused: 0 };
+    app.selectTab(tab);
+    for (f in 0..frames) {
+        platform.beginFrame();
+        ui.begin(mut platform);
+        demoFrame(mut ui, mut app, metrics);
+        let ok = match (endFrame(mut ui, mut platform, metrics)) {
+            Ok() => true,
+            Err(_) => false,
+        };
+        if (!ok) {
+            return false;
+        }
+        platform.endFrame();
+    }
+    return true;
+}
+
+@test
+fn everyTabLaysOut() -> Result<void, TestFailure> {
+    for (tab in 0usize..6) {
+        var app = DemoApp.create();
+        Check.isTrue(runDemo(tab, "", 3, mut app), "the tab fits the UI capacity")?;
+        Check.equalU64(tab as u64, app.activeNav as u64)?;
+    }
+    return Ok();
+}
+
+@test
+fn scriptedInputReachesTheApp() -> Result<void, TestFailure> {
+    // Down twice then Enter moves the nav focus to Effects and opens it; time advances 1/60 s a frame.
+    var app = DemoApp.create();
+    Check.isTrue(runDemo(0, "2:key:down;3:key:down;4:key:enter", 30, mut app), "fits")?;
+    Check.equalU64(2, app.activeNav as u64)?;
+    Check.equalU64(2, app.focusedNav as u64)?;
+    expect("elapsed after 30 frames", app.elapsed, 0.5)?;
+    return Ok();
+}

@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MIT
+// The browser as a ClayWind platform: the page's input messages folded into per-frame state.
+
+import claywind.Platform;
+import claywind.Pointer;
+import claywind.Cursor;
+import claywind.Key;
+import claywind.Dims;
+import claywind.Vec2;
+import claywind.keyIndex;
+import claywind_demo.parseDecimal;
+import claywind_demo.parseUnsigned;
+
+public struct BrowserPlatform {
+    size: Dims;
+    pointerState: Pointer;
+    /// Keys held, went down this frame, and OS-repeated this frame, by `keyIndex`.
+    down: u64;
+    pressed: u64;
+    repeated: u64;
+    typed: [u32; 64];
+    typedCount: usize;
+    typedRead: usize;
+    dt: f32;
+    clock: f64;
+    public cursor: Cursor;
+
+    public fn create(size: Dims) -> BrowserPlatform => BrowserPlatform {
+        size: size,
+        pointerState: Pointer.at(Vec2 { x: -100.0, y: -100.0 }),
+        down: 0,
+        pressed: 0,
+        repeated: 0,
+        typed: [0u32; 64],
+        typedCount: 0,
+        typedRead: 0,
+        dt: 0.0,
+        clock: 0.0,
+        cursor: Cursor.Default,
+    };
+
+    /// Seconds since the previous frame (the host measures it).
+    public fn setFrameTime(borrow mut this, seconds: f32) {
+        this.dt = if (seconds > 0.25) 0.25 else seconds;
+        this.clock += seconds as f64;
+    }
+
+    /// Clears the one-frame edges after a frame used them.
+    public fn endFrame(borrow mut this) {
+        this.pointerState.pressed = false;
+        this.pointerState.released = false;
+        this.pointerState.secondaryPressed = false;
+        this.pointerState.wheel = Vec2.zero();
+        this.pressed = 0;
+        this.repeated = 0;
+        this.typedCount = 0;
+        this.typedRead = 0;
+    }
+
+    /// Folds one message from the page into this frame's state.
+    public fn apply(borrow mut this, message: Slice<u8>) {
+        if (message.length == 0) {
+            return;
+        }
+        let kind = message[0];
+        let rest = if (message.length > 2) message[2..] else message[0..0];
+        let a = field(rest, 0);
+        let b = field(rest, 1);
+        let c = field(rest, 2);
+        if (kind == 'm' || kind == 'd' || kind == 'u') {
+            this.pointerState.position = Vec2 { x: parseDecimal(a), y: parseDecimal(b) };
+            let secondary = c.length == 1 && c[0] == '2';
+            if (kind == 'd') {
+                if (secondary) {
+                    this.pointerState.secondaryDown = true;
+                    this.pointerState.secondaryPressed = true;
+                } else {
+                    this.pointerState.down = true;
+                    this.pointerState.pressed = true;
+                }
+            } else if (kind == 'u') {
+                if (secondary) {
+                    this.pointerState.secondaryDown = false;
+                } else if (this.pointerState.down) {
+                    this.pointerState.down = false;
+                    this.pointerState.released = true;
+                }
+            }
+        } else if (kind == 'w') {
+            this.pointerState.wheel.y += parseDecimal(a);
+        } else if (kind == 'c') {
+            let code = parseUnsigned(a);
+            if (code < 0x110000 && this.typedCount < 64) {
+                this.typed[this.typedCount] = truncate<u32>(code);
+                this.typedCount += 1;
+            }
+        } else if (kind == 'k' || kind == 'r' || kind == 'K') {
+            match (keyNamed(rest)) {
+                Some(k) => {
+                    let bit = 1u64 << (keyIndex(k) as u64);
+                    if (kind == 'k') {
+                        this.down = this.down | bit;
+                        this.pressed = this.pressed | bit;
+                    } else if (kind == 'r') {
+                        this.repeated = this.repeated | bit;
+                    } else {
+                        this.down = this.down & (bit ^ 0xFFFFFFFFFFFFFFFF);
+                    }
+                }
+                null => {}
+            }
+        } else if (kind == 'f') {
+            this.down = 0;
+            this.pointerState.down = false;
+            this.pointerState.secondaryDown = false;
+        }
+    }
+}
+
+impl Platform for BrowserPlatform {
+    fn screenSize(borrow this) -> Dims => this.size;
+    fn frameTime(borrow this) -> f32 => this.dt;
+    fn time(borrow this) -> f64 => this.clock;
+    fn pointer(borrow this) -> Pointer => this.pointerState;
+    fn keyDown(borrow this, key: Key) -> bool => (this.down >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyPressed(borrow this, key: Key) -> bool => (this.pressed >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyRepeated(borrow this, key: Key) -> bool => (this.repeated >> (keyIndex(key) as u64)) & 1 == 1;
+    fn nextChar(borrow mut this) -> u32 {
+        if (this.typedRead >= this.typedCount) {
+            return 0;
+        }
+        let c = this.typed[this.typedRead];
+        this.typedRead += 1;
+        return c;
+    }
+    fn setCursor(borrow mut this, cursor: Cursor) {
+        this.cursor = cursor;
+    }
+}
+
+/// Space-separated field `n` of `s`.
+fn field(s: Slice<u8>, n: usize) -> Slice<u8> {
+    var start: usize = 0;
+    var index: usize = 0;
+    for (k in 0..s.length + 1) {
+        if (k == s.length || s[k] == ' ') {
+            if (index == n) {
+                return s[start..k];
+            }
+            index += 1;
+            start = k + 1;
+        }
+    }
+    return s[0..0];
+}
+
+fn is(a: Slice<u8>, b: StringView) -> bool {
+    let bb = b.bytes();
+    if (a.length != bb.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != bb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A DOM KeyboardEvent.key name as a Key.
+fn keyNamed(name: Slice<u8>) -> Key? {
+    if (is(name, "Escape")) { return Key.Escape; }
+    if (is(name, "Enter")) { return Key.Enter; }
+    if (is(name, "Tab")) { return Key.Tab; }
+    if (is(name, "Backspace")) { return Key.Backspace; }
+    if (is(name, "Delete")) { return Key.Delete; }
+    if (is(name, "ArrowLeft")) { return Key.Left; }
+    if (is(name, "ArrowRight")) { return Key.Right; }
+    if (is(name, "ArrowUp")) { return Key.Up; }
+    if (is(name, "ArrowDown")) { return Key.Down; }
+    if (is(name, "Home")) { return Key.Home; }
+    if (is(name, "End")) { return Key.End; }
+    if (is(name, "PageUp")) { return Key.PageUp; }
+    if (is(name, "PageDown")) { return Key.PageDown; }
+    if (is(name, "Shift")) { return Key.LeftShift; }
+    if (is(name, "Control")) { return Key.LeftControl; }
+    if (is(name, "Alt")) { return Key.LeftAlt; }
+    if (is(name, "F2")) { return Key.F2; }
+    return null;
+}

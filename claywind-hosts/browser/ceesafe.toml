@@ -1,0 +1,8 @@
+[package]
+name = "browser"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+claywind = { path = "../../claywind" }
+claywind_demo = { path = "../../claywind-demo" }

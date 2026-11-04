@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MIT
+// The parts of RFC 6455 a one-page app needs: the handshake's accept key, decoding the client's (masked) frames from a
+// byte stream, and the header of a server frame (unmasked, never fragmented).
+
+/// The Sec-WebSocket-Accept value for a Sec-WebSocket-Key.
+public fn acceptKey(w: borrow mut TextWriter, key: Slice<u8>) {
+    var joined = [0u8; 128];
+    var j = TextWriter.create(mut joined[..]);
+    j.bytes(key);
+    j.text("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let digest = sha1(j.written());
+    base64(mut w, digest[..]);
+}
+
+/// A complete client frame at the start of a buffer.
+public struct WsFrame {
+    public opcode: u8;
+    /// Where the (unmasked, in place) payload is in the buffer, and how long it is.
+    public payloadStart: usize;
+    public payloadLength: usize;
+    /// Bytes the whole frame used.
+    public used: usize;
+}
+
+/// The first frame in `bytes`, unmasking its payload in place, or null when the frame is not complete yet. Frames
+/// longer than the buffer can hold are not expected from the page (its messages are a few bytes).
+public fn takeFrame(bytes: SliceMut<u8>, length: usize) -> WsFrame? {
+    if (length < 2) {
+        return null;
+    }
+    let opcode = bytes[0] & 0x0F;
+    let masked = (bytes[1] & 0x80) != 0;
+    var payload = (bytes[1] & 0x7F) as usize;
+    var at: usize = 2;
+    if (payload == 126) {
+        if (length < 4) {
+            return null;
+        }
+        payload = ((bytes[2] as usize) << 8) | (bytes[3] as usize);
+        at = 4;
+    } else if (payload == 127) {
+        if (length < 10) {
+            return null;
+        }
+        var v: usize = 0;
+        for (i in 2usize..10) {
+            v = (v << 8) | (bytes[i] as usize);
+        }
+        payload = v;
+        at = 10;
+    }
+    let maskAt = at;
+    if (masked) {
+        at += 4;
+    }
+    if (length < at + payload) {
+        return null;
+    }
+    if (masked) {
+        for (i in 0..payload) {
+            bytes[at + i] = bytes[at + i] ^ bytes[maskAt + i % 4];
+        }
+    }
+    return WsFrame { opcode: opcode, payloadStart: at, payloadLength: payload, used: at + payload };
+}
+
+/// A server frame header (FIN set, no mask) for `length` payload bytes; returns how many header bytes it wrote.
+public fn frameHeader(out: SliceMut<u8>, opcode: u8, length: usize) -> usize {
+    out[0] = 0x80 | opcode;
+    if (length < 126) {
+        out[1] = truncate<u8>(length);
+        return 2;
+    }
+    if (length < 65536) {
+        out[1] = 126;
+        out[2] = truncate<u8>(length >> 8);
+        out[3] = truncate<u8>(length);
+        return 4;
+    }
+    out[1] = 127;
+    for (i in 0usize..8) {
+        out[2 + i] = truncate<u8>(length >> ((7 - i) * 8));
+    }
+    return 10;
+}

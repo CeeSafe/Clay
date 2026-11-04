@@ -1,0 +1,842 @@
+// SPDX-License-Identifier: MIT
+// The ClayWind example dashboard, ported from main.c: a sidebar with six nav items and three pages (Dashboard,
+// Controls, Effects) that show off the Tailwind-style API, every control, and the ThorVG-era effects. Every host
+// (headless, terminal, browser) runs this same code:
+//
+//     ui.begin(mut platform);
+//     demoFrame(mut ui, mut app, metrics);
+//     endFrame(mut ui, mut platform, metrics)?;
+//     // then render with a backend over app.pageBg(ui)
+//
+// The layout, styles and texts follow main.c line for line, so a frame matches the C build's.
+
+import claywind;
+
+/// main.c's NAV_COUNT, NAV_CONTROLS and NAV_EFFECTS.
+public const NAV_COUNT: usize = 6;
+const NAV_CONTROLS: usize = 1;
+const NAV_EFFECTS: usize = 2;
+
+fn navItems() -> StringView => "Dashboard|Controls|Effects|Projects|Activity|Settings";
+fn prioItems() -> StringView => "Low|Medium|High";
+fn fileItems() -> StringView => "README.md|main.c|clay.h|renderer.h|controls.h|PARITY.md";
+fn themeItems() -> StringView => "System|Light|Dark";
+fn ctxItems() -> StringView => "Cut|Copy|Paste|Delete";
+fn controlsTabs() -> StringView => "Inputs|Selection|Lists";
+fn sizeItems() -> StringView => "Small|Medium|Large|X-Large";
+fn tagItems() -> StringView => "layout|tailwind|clay|thorvg|immediate-mode|single-header|flexbox|wrap|margins|variants";
+fn blendNames() -> StringView =>
+    "multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity|plus-lighter";
+fn gradientDirs() -> StringView => "t|tr|r|br|b|bl|l|tl";
+
+/// The app state (main.c's statics), all caller-owned state for the controls.
+public struct DemoApp {
+    public clicks: i32;
+    public elapsed: f32;
+    public activeNav: usize;
+    public focusedNav: usize;
+    nameBuf: [u8; 64];
+    nameLen: usize;
+    nameCaret: usize;
+    subscribe: bool;
+    prioSel: usize;
+    prioOpen: bool;
+    fileSel: usize;
+    volume: f32;
+    qty: i32;
+    radioSel: usize;
+    filesChecked: [bool; 6];
+    ctxOpen: bool;
+    ctxX: f32;
+    ctxY: f32;
+    controlsTab: usize;
+    noteBuf: [u8; 64];
+    noteLen: usize;
+    saves: i32;
+    notifyEmail: bool;
+    notifyPush: bool;
+    sizeSel: usize;
+    sizeOpen: bool;
+
+    /// main.c's initial state (and `ClayWind_darkMode = true`, which the host sets on the Ui).
+    public fn create() -> DemoApp => DemoApp {
+        clicks: 0,
+        elapsed: 0.0,
+        activeNav: 0,
+        focusedNav: 0,
+        nameBuf: [0u8; 64],
+        nameLen: 0,
+        nameCaret: 0,
+        subscribe: false,
+        prioSel: 1,
+        prioOpen: false,
+        fileSel: 0,
+        volume: 0.5,
+        qty: 3,
+        radioSel: 0,
+        filesChecked: [false; 6],
+        ctxOpen: false,
+        ctxX: 0.0,
+        ctxY: 0.0,
+        controlsTab: 0,
+        noteBuf: [0u8; 64],
+        noteLen: 0,
+        saves: 0,
+        notifyEmail: true,
+        notifyPush: false,
+        sizeSel: 1,
+        sizeOpen: false,
+    };
+
+    /// Opens nav tab `index` (CLAYWIND_SCREENSHOT_TAB).
+    public fn selectTab(borrow mut this, index: usize) {
+        if (index < NAV_COUNT) {
+            this.activeNav = index;
+            this.focusedNav = index;
+        }
+    }
+}
+
+// ---- themed colors (Tailwind dark:) ------------------------------------------------------------------------------------
+
+/// The page background, which the host also clears the frame to.
+public fn pageBg(ui: borrow Ui) -> u32 => ui.theme(SLATE_950, SLATE_100);
+fn panelBg(ui: borrow Ui) -> u32 => ui.theme(SLATE_900, WHITE);
+fn rowBg(ui: borrow Ui, alt: bool) -> u32 => if (alt) ui.theme(CHARCOAL, SLATE_200) else ui.theme(SLATE_800, SLATE_100);
+fn inkCol(ui: borrow Ui) -> u32 => ui.theme(SLATE_100, SLATE_800);
+fn muteCol(ui: borrow Ui) -> u32 => ui.theme(SLATE_500, SLATE_500);
+fn lineCol(ui: borrow Ui) -> u32 => ui.theme(SLATE_700, SLATE_300);
+
+/// main.c's clicked(): hovered and the button went down this frame.
+fn clicked(ui: borrow Ui, id: StringView) -> bool => ui.pressedOn(hashId(id));
+
+/// Hash of `prefix` + `n` (main.c's F("tag-%d", t) ids).
+fn numberedId(prefix: StringView, n: i64) -> u32 {
+    var buffer = [0u8; 48];
+    var w = TextWriter.create(mut buffer[..]);
+    w.text(prefix);
+    w.signed(n);
+    return hashBytes(w.written());
+}
+
+/// Hash of `prefix` + `name`.
+fn namedId(prefix: StringView, name: StringView) -> u32 {
+    var buffer = [0u8; 48];
+    var w = TextWriter.create(mut buffer[..]);
+    w.text(prefix);
+    w.text(name);
+    return hashBytes(w.written());
+}
+
+/// The frame: main.c's update() then BuildUI().
+public fn demoFrame<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, metrics: borrow M) {
+    update(mut ui, mut app);
+    ui.open(Style.row().id("root").w(Size.grow()).h(Size.grow()).bg(pageBg(ui)));
+    sidebar(mut ui, app);
+    if (app.activeNav == NAV_CONTROLS) {
+        controlsPage(mut ui, mut app, metrics);
+    } else if (app.activeNav == NAV_EFFECTS) {
+        effectsPage(mut ui, app);
+    } else {
+        dashboard(mut ui, app);
+    }
+    // Fixed, floating badge pinned to the top-right of the window (position + z-index), translucent, rocking.
+    ui.open(
+        Style.box().id("proBadge").fixed().top(12.0).left(ui.screenSize().w - 78.0).z(10).px(space(3.0)).py(space(1.0))
+            .bg(withAlpha(AMBER_500, 235)).rounded(Radius.Md).rotate(Math.sin(app.elapsed * 2.0) * 6.0),
+    );
+    ui.label("PRO", Text.of().font(FONT_18).color(SLATE_950).tracking(2.0).align(TextAlign.Center));
+    ui.close();
+    // Tooltip over the counter button, and a right-click context menu; both float on top, so they come last.
+    Controls.tooltip(mut ui, "clickBtn", "Increments the click counter");
+    Controls.tooltip(mut ui, "ci-save", "Counts saves (shown in Live state)");
+    match (Controls.contextMenu(mut ui, "ctx", ctxItems(), mut app.ctxOpen, app.ctxX, app.ctxY)) {
+        Some(act) => { app.clicks += (truncate<i32>(act)) + 1; }
+        null => {}
+    }
+    ui.close();
+}
+
+fn update(ui: borrow mut Ui, app: borrow mut DemoApp) {
+    app.elapsed += ui.frameTime();
+    if (clicked(ui, "clickBtn")) {
+        app.clicks += 1;
+    }
+    if (app.clicks > 0 && clicked(ui, "resetBtn")) {
+        app.clicks = 0; // the disabled button does nothing
+    }
+    let p = ui.pointer();
+    if (p.secondaryPressed) {
+        app.ctxOpen = true;
+        app.ctxX = p.position.x;
+        app.ctxY = p.position.y;
+    }
+    // T toggles the theme (main.c checks the T key; here it is the typed letter, ignored while a field has focus).
+    if (ui.focused() == 0 && (ui.typed('T') || ui.typed('t'))) {
+        let dark = ui.isDarkMode();
+        ui.setDarkMode(!dark);
+    }
+    // Keyboard focus: Up/Down move the cursor, Enter selects the focused item.
+    if (ui.keyPressed(Key.Down)) {
+        app.focusedNav = (app.focusedNav + 1) % NAV_COUNT;
+    }
+    if (ui.keyPressed(Key.Up)) {
+        app.focusedNav = (app.focusedNav + NAV_COUNT - 1) % NAV_COUNT;
+    }
+    if (ui.keyPressed(Key.Enter)) {
+        app.activeNav = app.focusedNav;
+    }
+    // A click on a nav item also selects it (and moves focus there).
+    for (i in 0..NAV_COUNT) {
+        if (ui.pressedOn(hashId(itemAt(navItems(), i)))) {
+            app.activeNav = i;
+            app.focusedNav = i;
+        }
+    }
+}
+
+// ---- sidebar -------------------------------------------------------------------------------------------------------------
+
+fn sidebar(ui: borrow mut Ui, app: borrow DemoApp) {
+    let wide = match (ui.breakpoint()) {
+        Breakpoint.Sm => false,
+        _ => true,
+    };
+    ui.open(Style.column().id("sidebar").w(Size.fixed(if (wide) 220.0 else 72.0)).h(Size.grow()).bg(panelBg(ui))
+        .p(space(5.0)).gap(space(2.0)));
+    ui.open(Style.row().pb(space(3.0)));
+    ui.label(if (wide) "ClayWind" else "CW", Text.of().font(TEXT_2XL).color(inkCol(ui)).tracking(1.0));
+    ui.close();
+    for (i in 0..NAV_COUNT) {
+        let name = itemAt(navItems(), i);
+        let active = i == app.activeNav;
+        let itemBg = if (active) BLUE_600 else ui.theme(SLATE_800, SLATE_200);
+        var style = Style.box().id(name).w(Size.grow()).px(space(3.0)).py(space(2.0)).bg(itemBg).rounded(Radius.Md)
+            .cursor(Cursor.Pointer).isFocused(i == app.focusedNav).focus(Style.of().border(2.0, BLUE_300));
+        if (!active) {
+            style = style.hover(Style.of().bg(ui.theme(SLATE_700, SLATE_300)));
+        }
+        ui.open(style);
+        let fg = if (active) WHITE else muteCol(ui);
+        if (wide) {
+            ui.label(name, Text.of().color(fg));
+        } else {
+            ui.label(name[0..1], Text.of().color(fg).align(TextAlign.Center));
+        }
+        ui.close();
+    }
+    // Push the footer to the bottom.
+    ui.open(Style.box().h(Size.grow()));
+    ui.close();
+    if (wide) {
+        // A long description clamped to two lines with an ellipsis (line-clamp-2).
+        ui.label(
+            "A Tailwind-style UI toolkit for Clay, rendered by ThorVG, forked for extra parity.",
+            Text.of().color(muteCol(ui)).clamp(2),
+        );
+        ui.label("v0.1 · Clay 0.14", Text.of().color(muteCol(ui)));
+    }
+    ui.close();
+}
+
+// ---- dashboard -----------------------------------------------------------------------------------------------------------
+
+fn statCard(ui: borrow mut Ui, id: StringView, label: StringView, value: Slice<u8>, accent: u32) {
+    // The card is a group: hovering anywhere in it brightens the faded accent dot.
+    ui.open(
+        Style.column().id(id).w(Size.grow()).h(Size.fixed(110.0)).minW(150.0).maxW(320.0).bg(panelBg(ui)).p(space(4.0))
+            .gap(space(2.0)).rounded(Radius.Lg).borderL(4.0, accent).shadow(ShadowSize.Lg)
+            .transition(
+                TransitionSpec.transformOnly().durationMs(150.0),
+            ).cursor(Cursor.Pointer).hover(Style.of().scale(1.03)),
+    );
+    ui.open(Style.row().w(Size.grow()).gap(space(2.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label(label, Text.of().color(muteCol(ui)).tracking(1.0));
+    ui.open(Style.box().w(Size.grow()));
+    ui.close();
+    ui.open(Style.box().w(Size.fixed(8.0)).aspect(1.0).bg(withAlpha(accent, 90)).rounded(Radius.Md)
+        .groupHover(id, Style.of().bg(accent)));
+    ui.close();
+    ui.close();
+    ui.labelBytes(value, Text.of().font(TEXT_2XL).color(inkCol(ui)));
+    ui.close();
+}
+
+fn spacer(ui: borrow mut Ui) {
+    ui.open(Style.box().w(Size.grow()));
+    ui.close();
+}
+
+fn dashboard(ui: borrow mut Ui, app: borrow DemoApp) {
+    ui.open(Style.column().id("content").w(Size.grow()).h(Size.grow()).bg(pageBg(ui)).p(space(6.0)).gap(space(5.0)));
+    // Header row.
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label("Dashboard", Text.of().font(TEXT_XL).color(inkCol(ui)).bold());
+    // @container: react to the content panel's own width (not the window's).
+    ui.label(if (ui.containerWidth("content") >= 760.0) "· wide" else "· compact", Text.of().color(muteCol(ui)));
+    spacer(mut ui);
+    ui.open(Style.box().id("clickBtn").px(space(4.0)).py(space(3.0)).bg(EMERALD_600).rounded(Radius.Md)
+        .ring(2.0, EMERALD_300, 2.0).transition(TransitionSpec.colorsOnly().durationMs(200.0)).cursor(Cursor.Pointer)
+        .hover(Style.of().bg(EMERALD_500)).active(Style.of().bg(EMERALD_700)));
+    var clickText = [0u8; 32];
+    var cw = TextWriter.create(mut clickText[..]);
+    cw.text("Clicked ");
+    cw.signed(app.clicks as i64);
+    ui.labelBytes(cw.written(), Text.of().color(WHITE));
+    ui.close();
+    // Reset: disabled (greyed, no hover/cursor) until there is something to reset.
+    ui.open(
+        Style.box().id("resetBtn").px(space(4.0)).py(space(3.0)).bg(ROSE_600).rounded(Radius.Md).cursor(Cursor.Pointer)
+            .hover(Style.of().bg(ROSE_500)).isDisabled(app.clicks == 0).disabled(
+            Style.of().bg(ui.theme(SLATE_800, SLATE_300)),
+        ),
+    );
+    ui.label("Reset", Text.of().color(if (app.clicks == 0) muteCol(ui) else WHITE));
+    ui.close();
+    ui.close();
+
+    // Gradient banner, rounded like any other background, at 60% opacity.
+    ui.open(
+        Style.box().id("banner").w(Size.grow()).h(Size.fixed(6.0)).gradient(
+            GradientDir.ToTopRight,
+            INDIGO_600,
+            VIOLET_500,
+        )
+            .via(FUCHSIA_500).rounded(Radius.Md).opacity(0.6),
+    );
+    ui.close();
+
+    // Nested opacity: an outer group at 60% holding an inner one at 50%.
+    ui.open(Style.box().id("nestop").w(Size.grow()).h(Size.fixed(6.0)).opacity(0.6));
+    ui.open(Style.row().alignXY(AxisAlign.Start, AxisAlign.Center).gap(space(2.0)));
+    ui.open(Style.box().w(Size.fixed(80.0)).h(Size.fixed(5.0)).bg(SKY_500).rounded(Radius.Md));
+    ui.close();
+    ui.open(Style.box().w(Size.fixed(80.0)).h(Size.fixed(5.0)).opacity(0.5).bg(EMERALD_400).rounded(Radius.Md));
+    ui.close();
+    ui.close();
+    ui.close();
+
+    // mix-blend: overlapping translucent RGB chips with additive blend.
+    ui.open(Style.box().id("blend").blend(BlendMode.Add).h(Size.fixed(26.0)));
+    ui.open(Style.row().alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.open(Style.box().w(Size.fixed(60.0)).h(Size.fixed(26.0)).bg(withAlpha(RED_500, 150)).rounded(Radius.Lg));
+    ui.close();
+    ui.open(
+        Style.box().w(Size.fixed(60.0)).h(Size.fixed(26.0)).ml(-24.0).bg(withAlpha(GREEN_500, 150)).rounded(Radius.Lg),
+    );
+    ui.close();
+    ui.open(
+        Style.box().w(Size.fixed(60.0)).h(Size.fixed(26.0)).ml(-24.0).bg(withAlpha(BLUE_500, 150)).rounded(Radius.Lg),
+    );
+    ui.close();
+    ui.close();
+    ui.close();
+
+    // Filters: a blurred chip and a grayscale chip.
+    ui.open(Style.row().gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.open(Style.box().px(space(3.0)).py(space(1.0)).bg(SKY_500).rounded(Radius.Md).blur(3.0));
+    ui.label("blur", Text.of().color(SLATE_950));
+    ui.close();
+    ui.open(Style.box().px(space(3.0)).py(space(1.0)).bg(AMBER_500).rounded(Radius.Md).grayscale());
+    ui.label("grayscale", Text.of().color(SLATE_950));
+    ui.close();
+    ui.close();
+
+    // items-baseline: a big price and a small suffix on one baseline.
+    ui.open(Style.row().gap(space(1.0)).items(Items.Baseline));
+    ui.label("$49", Text.of().size(40.0).bold().color(inkCol(ui)));
+    ui.label("/mo", Text.of().size(18.0).color(muteCol(ui)));
+    ui.open(Style.box().w(Size.fixed(12.0)));
+    ui.close();
+    ui.label("billed annually", Text.of().size(14.0).color(muteCol(ui)));
+    ui.close();
+
+    // size-*, basis + shrink-0, and space-x.
+    ui.open(Style.row().w(Size.grow()).h(Size.fixed(40.0)).gapX(space(2.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.open(Style.box().size(Size.fixed(32.0)).bg(SKY_500).rounded(Radius.Md));
+    ui.close();
+    ui.open(Style.box().size(Size.fixed(32.0)).bg(VIOLET_500).rounded(Radius.Md));
+    ui.close();
+    ui.open(Style.box().basis(160.0).shrink0().h(Size.fixed(32.0)).bg(ui.theme(SLATE_800, SLATE_200)).rounded(Radius.Md)
+        .px(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label("basis-160 · shrink-0", Text.of().size(14.0).color(muteCol(ui)));
+    ui.close();
+    ui.open(Style.box().w(Size.grow()).h(Size.fixed(32.0)).bg(EMERALD_700).rounded(Radius.Md));
+    ui.close();
+    ui.close();
+
+    // Stat cards.
+    ui.open(Style.row().w(Size.grow()).gap(space(4.0)));
+    var uptime = [0u8; 32];
+    var uw = TextWriter.create(mut uptime[..]);
+    Format.fixed(mut uw, app.elapsed, 1);
+    uw.byte('s');
+    statCard(mut ui, "cardUptime", "Uptime", uw.written(), BLUE_500);
+    var clicks = [0u8; 32];
+    var kw = TextWriter.create(mut clicks[..]);
+    kw.signed(app.clicks as i64);
+    statCard(mut ui, "cardClicks", "Clicks", kw.written(), EMERALD_500);
+    let dt = ui.frameTime();
+    var fps = [0u8; 32];
+    var fw = TextWriter.create(mut fps[..]);
+    fw.signed(truncate<i64>((1.0 / (if (dt > 0.000001) dt else 0.000001)).floor()));
+    statCard(mut ui, "cardFps", "FPS", fw.written(), AMBER_500);
+    ui.close();
+
+    // A wrapping tag row (flex-wrap).
+    ui.open(Style.row().id("tags").w(Size.grow()).wrap().gapX(space(2.0)).gapY(space(2.0)));
+    for (t in 0..itemCount(tagItems())) {
+        ui.open(Style.box().idHash(numberedId("tag-", truncate<i64>(t))).px(space(3.0)).py(space(1.0))
+            .bg(ui.theme(SLATE_800, SLATE_200)).rounded(Radius.Md).cursor(Cursor.Pointer).hover(
+            Style.of().bg(BLUE_600),
+        ));
+        ui.label(itemAt(tagItems(), t), Text.of().color(inkCol(ui)));
+        ui.close();
+    }
+    ui.close();
+
+    // A scrollable activity log.
+    ui.label("Activity", Text.of().font(TEXT_XL).color(inkCol(ui)));
+    ui.open(
+        Style.box().id("log").w(
+            Size.grow(),
+        ).h(Size.grow()).bg(panelBg(ui)).p(space(2.0)).gap(space(2.0)).rounded(Radius.Lg)
+            .scroll(ScrollAxis.Vertical),
+    );
+    ui.open(Style.column().w(Size.grow()).gap(space(2.0)).divide(1.0, lineCol(ui)));
+    for (i in 0..40) {
+        ui.open(Style.row().idHash(numberedId("row-", i as i64)).w(Size.grow()).px(space(3.0)).py(space(3.0))
+            .bg(rowBg(ui, i % 2 == 0)).rounded(Radius.Sm).alignXY(AxisAlign.Start, AxisAlign.Center));
+        ui.open(
+            Style.box().w(Size.fixed(10.0)).aspect(1.0).bg(if (i % 3 == 0) ROSE_400 else TEAL_400).rounded(Radius.Md),
+        );
+        ui.close();
+        ui.open(Style.box().w(Size.fixed(12.0)));
+        ui.close();
+        var event = [0u8; 40];
+        var ew = TextWriter.create(mut event[..]);
+        ew.text("Event #");
+        ew.signed((i + 1) as i64);
+        ew.text(" processed");
+        ui.labelBytes(ew.written(), Text.of().color(inkCol(ui)).mono());
+        ui.close();
+    }
+    ui.close();
+    ui.close();
+    ui.close();
+}
+
+// ---- controls page -------------------------------------------------------------------------------------------------------
+
+/// A small muted caption above a control.
+fn caption(ui: borrow mut Ui, text: StringView) {
+    let c = muteCol(ui);
+    ui.label(text, Text.of().size(14.0).color(c));
+}
+
+/// One "key  value" line in the live-state panel.
+fn stateRow(ui: borrow mut Ui, key: StringView, value: Slice<u8>) {
+    ui.open(Style.row().w(Size.grow()).gap(space(2.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label(key, Text.of().size(14.0).color(muteCol(ui)));
+    spacer(mut ui);
+    ui.labelBytes(value, Text.of().size(14.0).color(inkCol(ui)).mono());
+    ui.close();
+}
+
+fn inputsSection<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, metrics: borrow M) {
+    ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
+    caption(mut ui, "Name · caret editing (Left/Right/Home/End, Backspace/Delete)");
+    textInputEx(mut ui, metrics, "ci-name", mut app.nameBuf[..], mut app.nameLen, mut app.nameCaret);
+    ui.close();
+    ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
+    caption(mut ui, "Quick note · simple append-only input");
+    Controls.textInput(mut ui, "ci-note", mut app.noteBuf[..], mut app.noteLen);
+    ui.close();
+    ui.open(Style.row().gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    caption(mut ui, "Volume");
+    Controls.slider(mut ui, "ci-vol", mut app.volume, 0.0, 1.0, 200.0);
+    var pct = [0u8; 16];
+    var pw = TextWriter.create(mut pct[..]);
+    pw.signed(truncate<i64>((app.volume * 100.0 + 0.5).floor()));
+    pw.byte('%');
+    ui.labelBytes(pw.written(), Text.of().color(inkCol(ui)).mono());
+    ui.close();
+    ui.open(Style.row().gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    caption(mut ui, "Quantity");
+    Controls.spinInput(mut ui, "ci-qty", mut app.qty, 0, 99, 1);
+    ui.close();
+    ui.open(Style.row().gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    if (Controls.button(mut ui, "ci-save", "Save")) {
+        app.saves += 1;
+    }
+    if (Controls.button(mut ui, "ci-clear", "Clear")) {
+        app.nameLen = 0;
+        app.nameCaret = 0;
+        app.noteLen = 0;
+    }
+    caption(mut ui, if (app.saves != 0) "Saved · see Live state" else "Hover Save for a tooltip");
+    ui.close();
+}
+
+fn selectionSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
+    ui.open(Style.column().gap(space(2.0)));
+    caption(mut ui, "Checkboxes");
+    Controls.checkbox(mut ui, "ci-sub", "Subscribe to updates", mut app.subscribe);
+    Controls.checkbox(mut ui, "ci-email", "Email notifications", mut app.notifyEmail);
+    Controls.checkbox(mut ui, "ci-push", "Push notifications", mut app.notifyPush);
+    ui.close();
+    ui.open(Style.column().gap(space(2.0)));
+    caption(mut ui, "Theme (radio) · Light/Dark switch the app");
+    if (Controls.radio(mut ui, "ci-theme", themeItems(), mut app.radioSel) && app.radioSel != 0) {
+        ui.setDarkMode(app.radioSel == 2);
+    }
+    ui.close();
+    // Dropdowns float their list below the trigger, above everything else.
+    ui.open(Style.row().gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
+    ui.open(Style.column().w(Size.fixed(180.0)).gap(space(1.0)));
+    caption(mut ui, "Priority");
+    Controls.dropdown(mut ui, "ci-prio", prioItems(), mut app.prioSel, mut app.prioOpen);
+    ui.close();
+    ui.open(Style.column().w(Size.fixed(180.0)).gap(space(1.0)));
+    caption(mut ui, "Size");
+    Controls.dropdown(mut ui, "ci-size", sizeItems(), mut app.sizeSel, mut app.sizeOpen);
+    ui.close();
+    ui.close();
+}
+
+fn listsSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
+    ui.open(Style.row().w(Size.grow()).gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
+    ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
+    caption(mut ui, "Open (single select)");
+    Controls.listbox(mut ui, "ci-files", fileItems(), mut app.fileSel, Size.fixed(150.0));
+    ui.close();
+    ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
+    caption(mut ui, "Stage (multi select)");
+    Controls.listboxMulti(mut ui, "ci-stage", fileItems(), mut app.filesChecked[..], Size.fixed(150.0));
+    ui.close();
+    ui.close();
+    caption(mut ui, "Right-click anywhere for a context menu (it bumps the Dashboard's click counter).");
+}
+
+/// `"text"` into `w`.
+fn quoted(w: borrow mut TextWriter, text: Slice<u8>) {
+    w.byte('"');
+    w.bytes(text);
+    w.byte('"');
+}
+
+fn statePanel(ui: borrow mut Ui, app: borrow DemoApp) {
+    var staged: i64 = 0;
+    for (i in 0usize..6) {
+        if (app.filesChecked[i]) {
+            staged += 1;
+        }
+    }
+    ui.open(
+        Style.column().id("ci-state").w(
+            Size.fixed(260.0),
+        ).bg(panelBg(ui)).p(space(5.0)).gap(space(2.0)).rounded(Radius.Lg),
+    );
+    ui.label("Live state", Text.of().color(inkCol(ui)).bold());
+    ui.open(Style.box().h(Size.fixed(4.0)));
+    ui.close();
+    var b = [0u8; 96];
+    var w = TextWriter.create(mut b[..]);
+    quoted(mut w, app.nameBuf[0..app.nameLen]);
+    stateRow(mut ui, "name", w.written());
+    var b2 = [0u8; 32];
+    var w2 = TextWriter.create(mut b2[..]);
+    w2.signed(truncate<i64>(app.nameCaret));
+    stateRow(mut ui, "caret", w2.written());
+    var b3 = [0u8; 96];
+    var w3 = TextWriter.create(mut b3[..]);
+    quoted(mut w3, app.noteBuf[0..app.noteLen]);
+    stateRow(mut ui, "note", w3.written());
+    var b4 = [0u8; 32];
+    var w4 = TextWriter.create(mut b4[..]);
+    Format.fixed(mut w4, app.volume, 2);
+    stateRow(mut ui, "volume", w4.written());
+    var b5 = [0u8; 32];
+    var w5 = TextWriter.create(mut b5[..]);
+    w5.signed(app.qty as i64);
+    stateRow(mut ui, "quantity", w5.written());
+    var b6 = [0u8; 32];
+    var w6 = TextWriter.create(mut b6[..]);
+    w6.signed(app.saves as i64);
+    stateRow(mut ui, "saves", w6.written());
+    let sub = if (app.subscribe) "yes" else "no";
+    stateRow(mut ui, "subscribe", sub.bytes());
+    var b7 = [0u8; 32];
+    var w7 = TextWriter.create(mut b7[..]);
+    w7.text(if (app.notifyEmail) "on" else "off");
+    w7.text(" / ");
+    w7.text(if (app.notifyPush) "on" else "off");
+    stateRow(mut ui, "email / push", w7.written());
+    stateRow(mut ui, "theme", itemAt(themeItems(), app.radioSel).bytes());
+    stateRow(mut ui, "priority", itemAt(prioItems(), app.prioSel).bytes());
+    stateRow(mut ui, "size", itemAt(sizeItems(), app.sizeSel).bytes());
+    stateRow(mut ui, "open", itemAt(fileItems(), app.fileSel).bytes());
+    var b8 = [0u8; 32];
+    var w8 = TextWriter.create(mut b8[..]);
+    w8.signed(staged);
+    w8.text(if (staged == 1) " file" else " files");
+    stateRow(mut ui, "staged", w8.written());
+    ui.close();
+}
+
+fn controlsPage<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, metrics: borrow M) {
+    ui.open(Style.column().id("content").w(Size.grow()).h(Size.grow()).bg(pageBg(ui)).p(space(6.0)).gap(space(5.0)));
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label("Controls", Text.of().font(TEXT_XL).color(inkCol(ui)).bold());
+    ui.label("· controls.h · Tab cycles focus", Text.of().color(muteCol(ui)).wrap(TextWrap.None));
+    ui.close();
+    Controls.tabs(mut ui, "ci-tabs", controlsTabs(), mut app.controlsTab);
+    ui.open(Style.row().w(Size.grow()).gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
+    ui.open(
+        Style.column().id("ci-panel").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
+    );
+    if (app.controlsTab == 0) {
+        inputsSection(mut ui, mut app, metrics);
+    } else if (app.controlsTab == 1) {
+        selectionSection(mut ui, mut app);
+    } else {
+        listsSection(mut ui, mut app);
+    }
+    ui.close();
+    statePanel(mut ui, app);
+    ui.close();
+    ui.close();
+}
+
+// ---- effects page --------------------------------------------------------------------------------------------------------
+
+fn sectionTitle(ui: borrow mut Ui, title: StringView, hint: StringView) {
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label(title, Text.of().font(TEXT_XL).color(inkCol(ui)).bold());
+    ui.label(hint, Text.of().color(muteCol(ui)));
+    ui.close();
+}
+
+fn dirOf(name: StringView) -> GradientDir {
+    let b = name.bytes();
+    let first = b[0];
+    let second: u8 = if (b.length > 1) b[1] else 0;
+    if (first == 't') {
+        return if (second ==
+            'r') GradientDir.ToTopRight else if (second == 'l') GradientDir.ToTopLeft else GradientDir.ToTop;
+    }
+    if (first == 'b') {
+        return if (second ==
+            'r') GradientDir.ToBottomRight else if (second == 'l') GradientDir.ToBottomLeft else GradientDir.ToBottom;
+    }
+    return if (first == 'r') GradientDir.ToRight else GradientDir.ToLeft;
+}
+
+fn blendOf(i: usize) -> BlendMode => match (i) {
+    0 => BlendMode.Multiply,
+    1 => BlendMode.Screen,
+    2 => BlendMode.Overlay,
+    3 => BlendMode.Darken,
+    4 => BlendMode.Lighten,
+    5 => BlendMode.ColorDodge,
+    6 => BlendMode.ColorBurn,
+    7 => BlendMode.HardLight,
+    8 => BlendMode.SoftLight,
+    9 => BlendMode.Difference,
+    10 => BlendMode.Exclusion,
+    11 => BlendMode.Hue,
+    12 => BlendMode.Saturation,
+    13 => BlendMode.Color,
+    14 => BlendMode.Luminosity,
+    _ => BlendMode.Add, // plus-lighter
+};
+
+fn gradientSwatch(ui: borrow mut Ui, dir: StringView) {
+    ui.open(Style.column().idHash(namedId("gsw-", dir)).gap(space(1.0)).alignXY(AxisAlign.Center, AxisAlign.Center));
+    ui.open(
+        Style.box().w(Size.fixed(72.0)).h(Size.fixed(48.0)).rounded(Radius.Lg).gradient(
+            dirOf(dir),
+            INDIGO_600,
+            ROSE_500,
+        ),
+    );
+    ui.close();
+    var b = [0u8; 16];
+    var w = TextWriter.create(mut b[..]);
+    w.text("to-");
+    w.text(dir);
+    ui.labelBytes(w.written(), Text.of().color(muteCol(ui)));
+    ui.close();
+}
+
+/// A captioned column of one swatch.
+fn swatchOpen(ui: borrow mut Ui) {
+    ui.open(Style.column().gap(space(1.0)).alignXY(AxisAlign.Center, AxisAlign.Center));
+}
+
+fn gradientsSection(ui: borrow mut Ui, app: borrow DemoApp) {
+    sectionTitle(mut ui, "Gradients", "bg-gradient-to-* · from/via/to · stop positions · bg-radial · angle");
+    ui.open(
+        Style.column().id("gradCard").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
+    );
+    // All eight Tailwind directions.
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).wrap());
+    for (i in 0usize..8) {
+        gradientSwatch(mut ui, itemAt(gradientDirs(), i));
+    }
+    ui.close();
+    // via + positions, radial, and a live CSS angle.
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).wrap().alignXY(AxisAlign.Start, AxisAlign.Center));
+    swatchOpen(mut ui);
+    ui.open(
+        Style.box().w(Size.fixed(160.0)).h(Size.fixed(48.0)).rounded(Radius.Lg).gradient(
+            GradientDir.ToRight,
+            SKY_500,
+            AMBER_500,
+        )
+            .via(FUCHSIA_500),
+    );
+    ui.close();
+    ui.label("from · via · to", Text.of().color(muteCol(ui)));
+    ui.close();
+    swatchOpen(mut ui);
+    ui.open(Style.box().w(Size.fixed(160.0)).h(Size.fixed(48.0)).rounded(Radius.Lg)
+        .gradient(GradientDir.ToRight, EMERALD_500, EMERALD_500).via(SLATE_950).stops(20.0, 50.0, 80.0));
+    ui.close();
+    ui.label("from-20% via-50% to-80%", Text.of().color(muteCol(ui)));
+    ui.close();
+    swatchOpen(mut ui);
+    ui.open(
+        Style.box().w(Size.fixed(96.0)).h(Size.fixed(48.0)).rounded(Radius.Lg).gradient(
+            GradientDir.Radial,
+            AMBER_500,
+            ROSE_500,
+        ),
+    );
+    ui.close();
+    ui.label("bg-radial", Text.of().color(muteCol(ui)));
+    ui.close();
+    swatchOpen(mut ui);
+    let turns = app.elapsed * 40.0 / 360.0;
+    var angle = (turns - turns.floor()) * 360.0;
+    if (angle < 1.0) {
+        angle = 1.0; // 0 would mean "use the direction"
+    }
+    ui.open(Style.box().id("gradSpin").w(Size.fixed(96.0)).h(Size.fixed(48.0)).rounded(Radius.Full)
+        .gradient(GradientDir.ToRight, CYAN_500, INDIGO_600).gradientAngle(angle));
+    ui.close();
+    var b = [0u8; 32];
+    var w = TextWriter.create(mut b[..]);
+    Format.fixed(mut w, angle, 0);
+    w.text("deg (live)");
+    ui.labelBytes(w.written(), Text.of().color(muteCol(ui)));
+    ui.close();
+    ui.close();
+    ui.close();
+}
+
+fn blendSection(ui: borrow mut Ui) {
+    sectionTitle(mut ui, "Blend modes", "mix-blend-* · every CSS mode; ThorVG renders all 17");
+    ui.open(
+        Style.column().id("blendCard").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
+    );
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).wrap());
+    for (i in 0..itemCount(blendNames())) {
+        let name = itemAt(blendNames(), i);
+        ui.open(
+            Style.column().idHash(namedId("bm-", name)).gap(space(1.0)).alignXY(AxisAlign.Center, AxisAlign.Center),
+        );
+        // Backdrop: a sky-to-amber tile. Source: a rose disc blended over it.
+        ui.open(
+            Style.box().w(Size.fixed(88.0)).h(Size.fixed(56.0)).rounded(Radius.Md).gradient(
+                GradientDir.ToBottomRight,
+                SKY_500,
+                AMBER_500,
+            )
+                .clip(),
+        );
+        ui.open(
+            Style.box().blend(blendOf(i)).w(
+                Size.fixed(40.0),
+            ).h(Size.fixed(40.0)).mt(8.0).ml(24.0).bg(ROSE_500).rounded(Radius.Full),
+        );
+        ui.close();
+        ui.close();
+        ui.label(name, Text.of().color(muteCol(ui)));
+        ui.close();
+    }
+    ui.close();
+    ui.close();
+}
+
+/// The clip demo's content: an oversized gradient strip and an offset chip.
+fn clipContent(ui: borrow mut Ui) {
+    ui.open(
+        Style.box().w(Size.fixed(260.0)).h(Size.fixed(60.0)).m(-8.0).gradient(
+            GradientDir.ToRight,
+            VIOLET_500,
+            CYAN_500,
+        ),
+    );
+    ui.close();
+    ui.open(Style.box().w(Size.fixed(80.0)).h(Size.fixed(80.0)).mt(40.0).ml(-20.0).bg(AMBER_500).rounded(Radius.Md));
+    ui.close();
+}
+
+fn clipSection(ui: borrow mut Ui) {
+    sectionTitle(mut ui, "Rounded clipping", "overflow-hidden follows rounded-* (CSS behavior)");
+    ui.open(Style.row().w(Size.grow()).gap(space(4.0)).wrap());
+    // Clipped: the oversized child and the offset chip are cut at the rounded corners.
+    swatchOpen(mut ui);
+    ui.open(
+        Style.box().id("clipOn").w(Size.fixed(220.0)).h(Size.fixed(120.0)).bg(panelBg(ui)).rounded(Radius.Xl2).clip(),
+    );
+    clipContent(mut ui);
+    ui.close();
+    ui.label("rounded-2xl overflow-hidden", Text.of().color(muteCol(ui)));
+    ui.close();
+    // The same content without clip.
+    swatchOpen(mut ui);
+    ui.open(Style.box().id("clipOff").w(Size.fixed(220.0)).h(Size.fixed(120.0)).bg(panelBg(ui)).rounded(Radius.Xl2));
+    clipContent(mut ui);
+    ui.close();
+    ui.label("rounded-2xl (no clip)", Text.of().color(muteCol(ui)));
+    ui.close();
+    // A scroll container with rounded corners: scrolling clips to the radius too.
+    swatchOpen(mut ui);
+    ui.open(
+        Style.column().id("clipScroll").w(Size.fixed(220.0)).h(Size.fixed(120.0)).bg(panelBg(ui)).rounded(Radius.Xl2)
+            .scroll(ScrollAxis.Vertical).p(space(3.0)).gap(space(2.0)),
+    );
+    for (i in 0usize..8) {
+        ui.open(
+            Style.box().w(Size.grow()).py(space(2.0)).px(space(3.0)).bg(
+                ui.theme(SLATE_800, SLATE_200),
+            ).rounded(Radius.Md),
+        );
+        var b = [0u8; 40];
+        var w = TextWriter.create(mut b[..]);
+        w.text("row ");
+        w.signed(truncate<i64>(i + 1));
+        w.text(" · wheel to scroll");
+        ui.labelBytes(w.written(), Text.of().color(inkCol(ui)));
+        ui.close();
+    }
+    ui.close();
+    ui.label("overflow-y-auto rounded-2xl", Text.of().color(muteCol(ui)));
+    ui.close();
+    ui.close();
+}
+
+fn effectsPage(ui: borrow mut Ui, app: borrow DemoApp) {
+    ui.open(Style.column().id("content").w(Size.grow()).h(Size.grow()).bg(pageBg(ui)).p(space(6.0)).gap(space(5.0))
+        .scroll(ScrollAxis.Vertical));
+    ui.open(Style.row().w(Size.grow()).gap(space(3.0)).alignXY(AxisAlign.Start, AxisAlign.Center));
+    ui.label("Effects", Text.of().font(TEXT_XL).color(inkCol(ui)).bold());
+    ui.label("· gradients, blend modes and rounded clipping, all rendered by ThorVG", Text.of().color(muteCol(ui)));
+    ui.close();
+    clipSection(mut ui);
+    gradientsSection(mut ui, app);
+    blendSection(mut ui);
+    ui.close();
+}

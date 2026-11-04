@@ -1,0 +1,447 @@
+// SPDX-License-Identifier: MIT
+// The browser host: a small HTTP + WebSocket server, all CeeSafe, that runs the ClayWind demo with the software
+// renderer and streams the changed part of each frame to a <canvas> page, which sends input back.
+//
+//   ./out/browser [PORT]          then open http://127.0.0.1:PORT/ (default 8080)
+//   CLAYWIND_FONT_DIR=DIR         where Arial.ttf, "Arial Bold.ttf" and "Courier New.ttf" are
+//
+// One page session at a time: a second page waits until the first disconnects. The app state lives across
+// reconnects. Esc in the page closes the session (the page reconnects).
+
+import claywind;
+import claywind_demo;
+
+const WIDTH: usize = 1024;
+const HEIGHT: usize = 640;
+const FRAME_MS: u64 = 16;
+
+fn readFile(path: Slice<u8>) -> Vector<u8> {
+    var bytes = Vector<u8>.create();
+    let name = match (StringView.fromUtf8(path)) {
+        Some(s) => s,
+        null => { return bytes; }
+    };
+    match (File.open(name)) {
+        Ok(f) => {
+            var file = f;
+            var chunk = [0u8; 65536];
+            loop {
+                let n = match (file.read(mut chunk[..])) {
+                    Ok(k) => k,
+                    Err(_) => 0,
+                };
+                if (n == 0) {
+                    break;
+                }
+                for (i in 0usize..n) {
+                    bytes.push(chunk[i])!;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    return bytes;
+}
+
+fn loadFontFile(raster: borrow mut Raster, id: u32, dir: Slice<u8>, file: StringView) -> bool {
+    var path = [0u8; 512];
+    var w = TextWriter.create(mut path[..]);
+    w.bytes(dir);
+    w.byte('/');
+    w.text(file);
+    let bytes = readFile(w.written());
+    if (bytes.length == 0 || !raster.loadFont(id, bytes.view())) {
+        Console.writeError("browser: cannot load font ");
+        Console.writeErrorLine(file);
+        return false;
+    }
+    return true;
+}
+
+/// Everything a session draws with: the UI, renderer, app and the last frame sent (for the changed rectangle).
+struct Host<region r> {
+    ui: Ui<r>;
+    raster: Raster<r>;
+    app: DemoApp;
+    previous: Vector<u32>;
+    /// Whether the page has the whole current frame (false after a (re)connect).
+    synced: bool;
+    lastCursor: u8;
+}
+
+/// HTTP: finds `name: value` in the request head.
+fn header<region r>(head: Slice<r, u8>, name: StringView) -> Slice<r, u8> {
+    let n = name.bytes();
+    var lineStart: usize = 0;
+    for (k in 0..head.length) {
+        if (head[k] != '\n') {
+            continue;
+        }
+        let line = head[lineStart..k];
+        lineStart = k + 1;
+        if (line.length <= n.length + 1 || line[n.length] != ':') {
+            continue;
+        }
+        var same = true;
+        for (i in 0..n.length) {
+            let a = if (line[i] >= 'A' && line[i] <= 'Z') line[i] + 32 else line[i];
+            let b = if (n[i] >= 'A' && n[i] <= 'Z') n[i] + 32 else n[i];
+            if (a != b) {
+                same = false;
+                break;
+            }
+        }
+        if (!same) {
+            continue;
+        }
+        var s = n.length + 1;
+        var e = line.length;
+        while (s < e && line[s] == ' ') {
+            s += 1;
+        }
+        while (e > s && (line[e - 1] == '\r' || line[e - 1] == ' ')) {
+            e -= 1;
+        }
+        return line[s..e];
+    }
+    return head[0..0];
+}
+
+fn startsWith(s: Slice<u8>, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    if (s.length < p.length) {
+        return false;
+    }
+    for (i in 0..p.length) {
+        if (s[i] != p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+async fn respond(
+    stream: borrow mut AsyncTcpStream,
+    status: StringView,
+    kind: StringView,
+    body: Slice<u8>,
+) -> Result<void, AsyncError> {
+    var head = [0u8; 256];
+    var w = TextWriter.create(mut head[..]);
+    w.text("HTTP/1.1 ");
+    w.text(status);
+    w.text("\r\nContent-Type: ");
+    w.text(kind);
+    w.text("\r\nContent-Length: ");
+    w.signed(truncate<i64>(body.length));
+    w.text("\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+    await stream.write(w.written())?;
+    if (body.length > 0) {
+        await stream.write(body)?;
+    }
+    return Ok();
+}
+
+/// Renders a frame and sends the rectangle that changed since the last one sent (nothing when nothing changed).
+async fn sendFrame(
+    stream: borrow mut AsyncTcpStream,
+    host: borrow mut Host,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AsyncError> {
+    host.raster.begin(Color.hex(pageBg(host.ui)));
+    renderInto(host.ui, mut host.raster);
+    host.raster.finish();
+    let px = host.raster.pixels();
+    let prev = host.previous.viewMut();
+    var x0 = WIDTH;
+    var y0 = HEIGHT;
+    var x1: usize = 0;
+    var y1: usize = 0;
+    for (y in 0..HEIGHT) {
+        for (x in 0..WIDTH) {
+            let i = y * WIDTH + x;
+            if (!host.synced || px[i] != prev[i]) {
+                if (x < x0) { x0 = x; }
+                if (x >= x1) { x1 = x + 1; }
+                if (y < y0) { y0 = y; }
+                if (y >= y1) { y1 = y + 1; }
+            }
+        }
+    }
+    if (x1 <= x0) {
+        return Ok();
+    }
+    host.synced = true;
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let payload = 8 + w * h * 4;
+    out.clear();
+    var header = [0u8; 10];
+    let n = frameHeader(mut header[..], 2, payload);
+    for (i in 0..n) {
+        out.push(header[i])!;
+    }
+    for (v in [x0, y0, w, h]) {
+        out.push(truncate<u8>(v))!;
+        out.push(truncate<u8>(v >> 8))!;
+    }
+    for (y in y0..y1) {
+        for (x in x0..x1) {
+            let p = px[y * WIDTH + x];
+            prev[y * WIDTH + x] = p;
+            // 0xAABBGGRR is R, G, B, A in memory order: canvas ImageData's.
+            out.push(truncate<u8>(p))!;
+            out.push(truncate<u8>(p >> 8))!;
+            out.push(truncate<u8>(p >> 16))!;
+            out.push(truncate<u8>(p >> 24))!;
+        }
+    }
+    await stream.write(out.view())?;
+    return Ok();
+}
+
+async fn sendText(stream: borrow mut AsyncTcpStream, text: StringView) -> Result<void, AsyncError> {
+    var frame = [0u8; 140];
+    let n = frameHeader(mut frame[..], 1, text.length);
+    let b = text.bytes();
+    for (i in 0..b.length) {
+        frame[n + i] = b[i];
+    }
+    await stream.write(frame[0..n + b.length])?;
+    return Ok();
+}
+
+/// One WebSocket session: input in, frames out, until the page goes away.
+async fn session(stream: borrow mut AsyncTcpStream, host: borrow mut Host) -> Result<void, AsyncError> {
+    var platform = BrowserPlatform.create(Dims { w: round<f32>(WIDTH), h: round<f32>(HEIGHT) });
+    var input = [0u8; 65536];
+    var have: usize = 0;
+    var out = Vector<u8>.withCapacity(WIDTH * HEIGHT * 4 + 32)!;
+    host.synced = false;
+    host.lastCursor = 255;
+    var last = Timer.now();
+    var next = last;
+    loop {
+        // Wait for input until the next frame is due.
+        let now = Timer.now();
+        let wait = if (next > now) next - now else 0;
+        let got: Result<usize, AsyncError> = await Async.timeout(
+            wait,
+            AsyncError.TimedOut,
+            async () => await stream.read(mut input[have..]),
+        );
+        match (got) {
+            Ok(0) => { return Ok(); } // the page closed the connection
+            Ok(n) => {
+                have += n;
+                loop {
+                    let frame = match (takeFrame(mut input[..], have)) {
+                        Some(f) => f,
+                        null => { break; }
+                    };
+                    if (frame.opcode == 8) {
+                        return Ok(); // close
+                    }
+                    if (frame.opcode == 1) {
+                        platform.apply(input[frame.payloadStart..frame.payloadStart + frame.payloadLength]);
+                    }
+                    // Drop the frame from the buffer.
+                    for (i in frame.used..have) {
+                        input[i - frame.used] = input[i];
+                    }
+                    have -= frame.used;
+                }
+                if (have == input.length) {
+                    return Ok(); // a message too long for the page's protocol
+                }
+            }
+            Err(AsyncError.TimedOut) => {}
+            Err(e) => { return Err(e); }
+        }
+        if (Timer.now() < next) {
+            continue;
+        }
+        let t = Timer.now();
+        platform.setFrameTime(round<f32>(t - last) / 1000.0);
+        last = t;
+        next = t + FRAME_MS;
+        if (platform.keyPressed(Key.Escape)) {
+            return Ok();
+        }
+        host.ui.begin(mut platform);
+        demoFrame(mut host.ui, mut host.app, host.raster);
+        match (endFrame(mut host.ui, mut platform, host.raster)) {
+            Ok() => {}
+            Err(_) => { await AsyncConsole.writeLine("browser: the frame does not fit the UI capacity")?; }
+        }
+        platform.endFrame();
+        let cursor: u8 = match (platform.cursor) {
+            Cursor.Default => 0,
+            Cursor.Pointer => 1,
+            Cursor.Text => 2,
+        };
+        if (cursor != host.lastCursor) {
+            host.lastCursor = cursor;
+            await sendText(
+                mut stream,
+                if (cursor == 1) "cursor pointer" else if (cursor == 2) "cursor text" else "cursor default",
+            )?;
+        }
+        await sendFrame(mut stream, mut host, mut out)?;
+    }
+}
+
+/// Reads a request head (to the blank line); returns its length, 0 when the connection ended first.
+async fn readHead(stream: borrow mut AsyncTcpStream, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+    var have: usize = 0;
+    while (have < buffer.length) {
+        let n = await stream.read(mut buffer[have..])?;
+        if (n == 0) {
+            return Ok(0);
+        }
+        have += n;
+        if (have >= 4) {
+            for (k in 3..have) {
+                if (buffer[k - 3] == '\r' && buffer[k - 2] == '\n' && buffer[k - 1] == '\r' && buffer[k] == '\n') {
+                    return Ok(k + 1);
+                }
+            }
+        }
+    }
+    return Ok(have);
+}
+
+async fn connection(
+    stream: borrow mut AsyncTcpStream,
+    host: borrow mut Host,
+    page: Slice<u8>,
+) -> Result<void, AsyncError> {
+    var buffer = [0u8; 8192];
+    let length = await readHead(mut stream, mut buffer[..])?;
+    if (length == 0) {
+        return Ok();
+    }
+    let head = buffer[0..length];
+    if (startsWith(head, "GET /ws ")) {
+        let key = header(head, "Sec-WebSocket-Key");
+        if (key.length == 0 || key.length > 64) {
+            return await respond(mut stream, "400 Bad Request", "text/plain", "not a WebSocket request".bytes());
+        }
+        var reply = [0u8; 256];
+        var w = TextWriter.create(mut reply[..]);
+        w.text(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ",
+        );
+        acceptKey(mut w, key);
+        w.text("\r\n\r\n");
+        await stream.write(w.written())?;
+        match (stream.setNoDelay(true)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        await AsyncConsole.writeLine("browser: page connected")?;
+        let result = await session(mut stream, mut host);
+        await AsyncConsole.writeLine("browser: page disconnected")?;
+        return result;
+    }
+    if (startsWith(head, "GET / ") || startsWith(head, "GET /index.html ")) {
+        return await respond(mut stream, "200 OK", "text/html; charset=utf-8", page);
+    }
+    return await respond(mut stream, "404 Not Found", "text/plain", "not found".bytes());
+}
+
+async fn serve(port: u16, host: borrow mut Host, page: Slice<u8>) -> Result<void, AsyncError> {
+    let listener = match (AsyncTcpListener.bind("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => { return Err(AsyncError.Io(e)); }
+    };
+    var banner = [0u8; 64];
+    var w = TextWriter.create(mut banner[..]);
+    w.text("browser: open http://127.0.0.1:");
+    w.signed(port as i64);
+    w.byte('/');
+    match (StringView.fromUtf8(w.written())) {
+        Some(text) => { await AsyncConsole.writeLine(text)?; }
+        null => {}
+    }
+    loop {
+        var stream = await listener.accept()?;
+        match (await connection(mut stream, mut host, page)) {
+            Ok() => {}
+            Err(AsyncError.Cancelled) => { return Err(AsyncError.Cancelled); }
+            Err(_) => {} // a page that went away mid-write: wait for the next
+        }
+    }
+}
+
+fn main() -> i32 {
+    var port: u16 = 8080;
+    match (Process.argument(1)) {
+        Some(a) => {
+            let p = parseUnsigned(a.bytes());
+            if (p > 0 && p < 65536) {
+                port = truncate<u16>(p);
+            }
+        }
+        null => {}
+    }
+    var uiStorage = Vector<u8>.create();
+    var rasterStorage = Vector<u8>.create();
+    for (i in 0..8388608) {
+        uiStorage.push(0)!;
+    }
+    for (i in 0..67108864) {
+        rasterStorage.push(0)!;
+    }
+    let uiMemory = FixedBufferAllocator.over(mut uiStorage.viewMut());
+    let rasterMemory = FixedBufferAllocator.over(mut rasterStorage.viewMut());
+    let ui = match (Ui.create(uiMemory, UiCapacity.of(2048))) {
+        Ok(u) => u,
+        Err(_) => {
+            Console.writeErrorLine("browser: not enough memory for the UI");
+            return 1;
+        }
+    };
+    var raster = match (Raster.create(rasterMemory, RasterCapacity.of(WIDTH, HEIGHT))) {
+        Ok(r) => r,
+        Err(_) => {
+            Console.writeErrorLine("browser: not enough memory for the renderer");
+            return 1;
+        }
+    };
+    let dir = match (Environment.variable("CLAYWIND_FONT_DIR")) {
+        Some(d) => d,
+        null => "/System/Library/Fonts/Supplemental",
+    };
+    if (!loadFontFile(
+        mut raster,
+        FONT_18,
+        dir.bytes(),
+        "Arial.ttf",
+    ) || !loadFontFile(mut raster, FONT_BOLD, dir.bytes(), "Arial Bold.ttf") ||
+        !loadFontFile(mut raster, FONT_MONO, dir.bytes(), "Courier New.ttf")) {
+        return 1;
+    }
+    var previous = Vector<u32>.withCapacity(WIDTH * HEIGHT)!;
+    for (i in 0..WIDTH * HEIGHT) {
+        previous.push(0)!;
+    }
+    var host = Host {
+        ui: ui,
+        raster: raster,
+        app: DemoApp.create(),
+        previous: previous,
+        synced: false,
+        lastCursor: 255,
+    };
+    host.ui.setDarkMode(true);
+    var page = Vector<u8>.create();
+    writePage(mut page)!;
+    match (Async.run(serve(port, mut host, page.view()))) {
+        Ok() => { return 0; }
+        Err(_) => {
+            Console.writeErrorLine("browser: cannot listen (is the port in use?)");
+            return 1;
+        }
+    }
+}

@@ -331,6 +331,16 @@ public struct Ui<region r> {
         return c;
     }
 
+    /// Whether `c` was typed this frame, without consuming it (ClayWind_KeyPressed on a letter key).
+    public fn typed(borrow this, c: u32) -> bool {
+        for (i in 0..this.chars.length()) {
+            if (this.chars.get(i) == c) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Seconds since start, from the platform (ClayWind_Time).
     public fn time(borrow this) -> f64 => this.clock;
 

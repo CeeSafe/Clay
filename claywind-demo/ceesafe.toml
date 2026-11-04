@@ -1,0 +1,8 @@
+[package]
+name = "claywind_demo"
+version = "0.1.0"
+kind = "library"
+profile = "freestanding"
+
+[dependencies]
+claywind = { path = "../claywind" }

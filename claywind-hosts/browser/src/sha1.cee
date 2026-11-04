@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: MIT
+// SHA-1 (FIPS 180-4) and base64 (RFC 4648), for the WebSocket handshake's Sec-WebSocket-Accept (RFC 6455 §4.2.2).
+
+/// SHA-1 of `data`.
+public fn sha1(data: Slice<u8>) -> [u8; 20] {
+    var h = [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    var block = [0u8; 64];
+    let bitLength = (data.length as u64) * 8;
+    // Message, 0x80, zeros to 56 mod 64, then the length: total blocks.
+    let total = (data.length + 9 + 63) / 64 * 64;
+    var offset: usize = 0;
+    while (offset < total) {
+        for (i in 0usize..64) {
+            let k = offset + i;
+            block[i] = if (k < data.length) data[k] else if (k == data.length) 0x80 else 0;
+        }
+        if (offset + 64 == total) {
+            for (i in 0usize..8) {
+                block[56 + i] = truncate<u8>(bitLength >> ((7 - i) * 8) as u64);
+            }
+        }
+        compress(mut h, block);
+        offset += 64;
+    }
+    var out = [0u8; 20];
+    for (i in 0usize..5) {
+        out[4 * i] = truncate<u8>(h[i] >> 24);
+        out[4 * i + 1] = truncate<u8>(h[i] >> 16);
+        out[4 * i + 2] = truncate<u8>(h[i] >> 8);
+        out[4 * i + 3] = truncate<u8>(h[i]);
+    }
+    return out;
+}
+
+fn rotl(x: u32, n: u32) -> u32 => (x << n) | (x >> (32 - n));
+
+fn compress(h: borrow mut [u32; 5], block: [u8; 64]) {
+    var w = [0u32; 80];
+    for (t in 0usize..16) {
+        w[t] = ((block[4 * t] as u32) << 24) | ((block[4 * t + 1] as u32) << 16) | ((block[4 * t + 2] as u32) << 8) |
+            (block[4 * t + 3] as u32);
+    }
+    for (t in 16usize..80) {
+        w[t] = rotl(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+    }
+    var a = h[0];
+    var b = h[1];
+    var c = h[2];
+    var d = h[3];
+    var e = h[4];
+    for (t in 0usize..80) {
+        var f: u32 = 0;
+        var k: u32 = 0;
+        if (t < 20) {
+            f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+            k = 0x5A827999;
+        } else if (t < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1;
+        } else if (t < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDC;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6;
+        }
+        let temp = rotl(a, 5).wrappingAdd(f).wrappingAdd(e).wrappingAdd(k).wrappingAdd(w[t]);
+        e = d;
+        d = c;
+        c = rotl(b, 30);
+        b = a;
+        a = temp;
+    }
+    h[0] = h[0].wrappingAdd(a);
+    h[1] = h[1].wrappingAdd(b);
+    h[2] = h[2].wrappingAdd(c);
+    h[3] = h[3].wrappingAdd(d);
+    h[4] = h[4].wrappingAdd(e);
+}
+
+fn base64Digit(v: u32) -> u8 {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    return alphabet.bytes()[v as usize];
+}
+
+/// `data` in base64, with padding.
+public fn base64(w: borrow mut TextWriter, data: Slice<u8>) {
+    var i: usize = 0;
+    while (i < data.length) {
+        let n = data.length - i;
+        let b0 = data[i] as u32;
+        let b1: u32 = if (n > 1) data[i + 1] as u32 else 0;
+        let b2: u32 = if (n > 2) data[i + 2] as u32 else 0;
+        let v = (b0 << 16) | (b1 << 8) | b2;
+        w.byte(base64Digit((v >> 18) & 63));
+        w.byte(base64Digit((v >> 12) & 63));
+        w.byte(if (n > 1) base64Digit((v >> 6) & 63) else '=');
+        w.byte(if (n > 2) base64Digit(v & 63) else '=');
+        i += 3;
+    }
+}

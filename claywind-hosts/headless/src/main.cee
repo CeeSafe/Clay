@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+// The headless host: runs the ClayWind demo with a scripted platform and the software renderer, and writes frames to
+// files. It replaces main.c's CLAYWIND_SCREENSHOT dev aid and is the CI/golden host.
+//
+//   CLAYWIND_SCREENSHOT=PATH   the frame to write (.bmp: a 32-bit BMP; anything else: raw RGBA bytes)
+//   CLAYWIND_SCREENSHOT_TAB=N  the nav tab to open (as in main.c)
+//   CLAYWIND_SHOT_EVENTS=...   scripted input (see claywind_demo's ScriptPlatform)
+//   CLAYWIND_SHOT_FRAME=N      the frame to write (default 28: the one main.c's hook saves on its 30th update)
+//   CLAYWIND_LIGHT=1           start in light mode
+//   CLAYWIND_FONT_DIR=DIR      where Arial.ttf, "Arial Bold.ttf" and "Courier New.ttf" are
+//                              (default /System/Library/Fonts/Supplemental)
+//   CLAYWIND_BENCH=N           run N frames and report the time per frame instead
+
+import claywind;
+import claywind_demo;
+
+const WIDTH: usize = 1024;
+const HEIGHT: usize = 640;
+
+fn readFile(path: Slice<u8>) -> Vector<u8> {
+    var bytes = Vector<u8>.create();
+    let name = match (StringView.fromUtf8(path)) {
+        Some(s) => s,
+        null => { return bytes; }
+    };
+    match (File.open(name)) {
+        Ok(f) => {
+            var file = f;
+            var chunk = [0u8; 65536];
+            loop {
+                let n = match (file.read(mut chunk[..])) {
+                    Ok(k) => k,
+                    Err(_) => 0,
+                };
+                if (n == 0) {
+                    break;
+                }
+                for (i in 0usize..n) {
+                    bytes.push(chunk[i])!;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    return bytes;
+}
+
+/// Loads `dir/file` as font `id`; false (with a message) when it is missing or does not fit.
+fn loadFontFile(raster: borrow mut Raster, id: u32, dir: Slice<u8>, file: StringView) -> bool {
+    var path = [0u8; 512];
+    var w = TextWriter.create(mut path[..]);
+    w.bytes(dir);
+    w.byte('/');
+    w.text(file);
+    let bytes = readFile(w.written());
+    if (bytes.length == 0 || !raster.loadFont(id, bytes.view())) {
+        Console.writeError("headless: cannot load font ");
+        Console.writeErrorLine(file);
+        return false;
+    }
+    return true;
+}
+
+fn pushLe(out: borrow mut Vector<u8>, v: u32, bytes: u32) -> Result<void, AllocError> {
+    for (i in 0..bytes) {
+        out.push(truncate<u8>(v >> (8 * i)))?;
+    }
+    return Ok();
+}
+
+/// The frame as a top-down 32-bit BMP (BITMAPV4HEADER with an alpha mask), or raw RGBA.
+fn encodeFrame(pixels: Slice<u32>, w: usize, h: usize, bmp: bool) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.withCapacity(w * h * 4 + 122)?;
+    if (bmp) {
+        let size = truncate<u32>(w * h * 4);
+        out.push('B')?;
+        out.push('M')?;
+        pushLe(mut out, 122 + size, 4)?;
+        pushLe(mut out, 0, 4)?;
+        pushLe(mut out, 122, 4)?;
+        pushLe(mut out, 108, 4)?;
+        pushLe(mut out, truncate<u32>(w), 4)?;
+        pushLe(mut out, truncate<u32>(h) ^ 0xFFFFFFFF + 1, 4)?; // negative height: top-down rows
+        pushLe(mut out, 1, 2)?;
+        pushLe(mut out, 32, 2)?;
+        pushLe(mut out, 3, 4)?; // BI_BITFIELDS
+        pushLe(mut out, size, 4)?;
+        pushLe(mut out, 2835, 4)?;
+        pushLe(mut out, 2835, 4)?;
+        pushLe(mut out, 0, 4)?;
+        pushLe(mut out, 0, 4)?;
+        pushLe(mut out, 0x00FF0000, 4)?;
+        pushLe(mut out, 0x0000FF00, 4)?;
+        pushLe(mut out, 0x000000FF, 4)?;
+        pushLe(mut out, 0xFF000000, 4)?;
+        pushLe(mut out, 0x73524742, 4)?; // LCS_sRGB
+        for (i in 0..48) {
+            out.push(0)?;
+        }
+        for (p in pixels) {
+            // 0xAABBGGRR -> B, G, R, A
+            out.push(truncate<u8>(p >> 16))?;
+            out.push(truncate<u8>(p >> 8))?;
+            out.push(truncate<u8>(p))?;
+            out.push(truncate<u8>(p >> 24))?;
+        }
+    } else {
+        for (p in pixels) {
+            pushLe(mut out, p, 4)?;
+        }
+    }
+    return Ok(out);
+}
+
+fn envNumber(name: StringView, fallback: u64) -> u64 {
+    let n = match (Environment.variable(name)) {
+        Some(v) => parseUnsigned(v.bytes()),
+        null => 0xFFFFFFFFFFFFFFFF,
+    };
+    return if (n == 0xFFFFFFFFFFFFFFFF) fallback else n;
+}
+
+fn endsWith(s: Slice<u8>, suffix: StringView) -> bool {
+    let b = suffix.bytes();
+    if (s.length < b.length) {
+        return false;
+    }
+    for (i in 0..b.length) {
+        if (s[s.length - b.length + i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    var uiStorage = Vector<u8>.create();
+    var rasterStorage = Vector<u8>.create();
+    for (i in 0..8388608) {
+        uiStorage.push(0)!;
+    }
+    for (i in 0..67108864) {
+        rasterStorage.push(0)!;
+    }
+    let uiMemory = FixedBufferAllocator.over(mut uiStorage.viewMut());
+    let rasterMemory = FixedBufferAllocator.over(mut rasterStorage.viewMut());
+    var ui = match (Ui.create(uiMemory, UiCapacity.of(2048))) {
+        Ok(u) => u,
+        Err(_) => {
+            Console.writeErrorLine("headless: not enough memory for the UI");
+            return 1;
+        }
+    };
+    var raster = match (Raster.create(rasterMemory, RasterCapacity.of(WIDTH, HEIGHT))) {
+        Ok(r) => r,
+        Err(_) => {
+            Console.writeErrorLine("headless: not enough memory for the renderer");
+            return 1;
+        }
+    };
+    let dir = match (Environment.variable("CLAYWIND_FONT_DIR")) {
+        Some(d) => d,
+        null => "/System/Library/Fonts/Supplemental",
+    };
+    // renderer.h's font setup: the regular face for FONT_18..FONT_24 (ids 1-3 fall back to 0), bold, mono.
+    if (!loadFontFile(
+        mut raster,
+        FONT_18,
+        dir.bytes(),
+        "Arial.ttf",
+    ) || !loadFontFile(mut raster, FONT_BOLD, dir.bytes(), "Arial Bold.ttf") ||
+        !loadFontFile(mut raster, FONT_MONO, dir.bytes(), "Courier New.ttf")) {
+        return 1;
+    }
+    let script = match (Environment.variable("CLAYWIND_SHOT_EVENTS")) {
+        Some(s) => s,
+        null => "",
+    };
+    var platform = ScriptPlatform.create(script.bytes(), Dims { w: round<f32>(WIDTH), h: round<f32>(HEIGHT) });
+    var app = DemoApp.create();
+    ui.setDarkMode(Environment.variable("CLAYWIND_LIGHT") == null);
+    app.selectTab(truncate<usize>(envNumber("CLAYWIND_SCREENSHOT_TAB", 0)));
+
+    let bench = envNumber("CLAYWIND_BENCH", 0);
+    if (bench > 0) {
+        let started = Timer.now();
+        for (f in 0..bench) {
+            platform.beginFrame();
+            ui.begin(mut platform);
+            demoFrame(mut ui, mut app, raster);
+            endFrame(mut ui, mut platform, raster)!;
+            raster.begin(Color.hex(pageBg(ui)));
+            renderInto(ui, mut raster);
+            raster.finish();
+            platform.endFrame();
+        }
+        let ms = Timer.now() - started;
+        Console.write("frames ");
+        Console.write(bench);
+        Console.write(" ms-per-frame ");
+        Console.writeLine(round<f64>(ms) / round<f64>(bench));
+        return 0;
+    }
+
+    let target = envNumber("CLAYWIND_SHOT_FRAME", 28);
+    let path = match (Environment.variable("CLAYWIND_SCREENSHOT")) {
+        Some(p) => p,
+        null => "claywind.bmp",
+    };
+    for (f in 0..target + 1) {
+        platform.beginFrame();
+        ui.begin(mut platform);
+        demoFrame(mut ui, mut app, raster);
+        match (endFrame(mut ui, mut platform, raster)) {
+            Ok() => {}
+            Err(_) => {
+                Console.writeErrorLine("headless: the frame does not fit the UI capacity");
+                return 1;
+            }
+        }
+        if (f == target) {
+            raster.begin(Color.hex(pageBg(ui)));
+            renderInto(ui, mut raster);
+            raster.finish();
+        }
+        platform.endFrame();
+    }
+    let bytes = match (encodeFrame(raster.pixels(), WIDTH, HEIGHT, endsWith(path.bytes(), ".bmp"))) {
+        Ok(b) => b,
+        Err(_) => { return 1; }
+    };
+    match (File.create(path)) {
+        Ok(f) => {
+            var file = f;
+            match (file.write(bytes.view())) {
+                Ok() => {}
+                Err(_) => {
+                    Console.writeErrorLine("headless: cannot write the screenshot");
+                    return 1;
+                }
+            }
+        }
+        Err(_) => {
+            Console.writeErrorLine("headless: cannot create the screenshot file");
+            return 1;
+        }
+    }
+    return 0;
+}
