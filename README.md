@@ -132,7 +132,8 @@ host loop in about 230 lines: window events, layout, incremental rendering, and 
 
 ## Licence and credits
 
-- **This port:** MIT ([LICENSE](LICENSE)); every source file is marked `SPDX-License-Identifier: MIT`.
+- **This port:** MIT ([LICENSE](LICENSE)); every source file is marked `SPDX-License-Identifier: MIT`. Clay's notice
+  is also in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - **Clay** (layout): the layout engine (`claywind/src/layout_*.cee`) is a port, altered for CeeSafe, of the ClayWind
   fork of [Clay](https://github.com/nicbarker/clay) 0.14, by Nic Barker. Clay is under the zlib/libpng licence:
 
