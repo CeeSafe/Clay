@@ -292,7 +292,9 @@ fn drawImage(r: borrow mut Raster, b: Rect, tint: Color, radius: Corners, handle
 fn pushClipShape(r: borrow mut Raster, area: Rect, radius: Corners) {
     let parent = r.currentClip();
     let m = r.currentTransform();
-    let identity = m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0;
+    // The frame's own transform (the pixel ratio's scale, the identity at 1) keeps the rectangle clipper; any other
+    // transform clips with a mask, as ThorVG does.
+    let identity = m.a == r.ratio && m.b == 0.0 && m.c == 0.0 && m.d == r.ratio;
     let bounds = m.bounds(area);
     let x0 = imax(truncate<i32>(Math.clamp(Math.round(bounds.x), -1.0, 100000.0)), parent.x0);
     let y0 = imax(truncate<i32>(Math.clamp(Math.round(bounds.y), -1.0, 100000.0)), parent.y0);
@@ -304,10 +306,18 @@ fn pushClipShape(r: borrow mut Raster, area: Rect, radius: Corners) {
     }
     // A shape clipper (ThorVG's rounded-rect clip path) keeps its anti-aliased edge, so the mask spans every pixel
     // the shape touches: floor/ceil, not the rect clipper's rounding.
-    let mx0 = imax(truncate<i32>(Math.clamp(bounds.x.floor(), -1.0, 100000.0)), parent.x0);
-    let my0 = imax(truncate<i32>(Math.clamp(bounds.y.floor(), -1.0, 100000.0)), parent.y0);
-    let mx1 = imax(imin(truncate<i32>(Math.clamp((bounds.x + bounds.w).ceil(), -1.0, 100000.0)), parent.x1), mx0);
-    let my1 = imax(imin(truncate<i32>(Math.clamp((bounds.y + bounds.h).ceil(), -1.0, 100000.0)), parent.y1), my0);
+    // Only where the current layer's pixels are needed (the region being redrawn, for the frame itself).
+    let limit = r.currentLimit();
+    let mx0 = imax(imax(truncate<i32>(Math.clamp(bounds.x.floor(), -1.0, 100000.0)), parent.x0), limit.x0);
+    let my0 = imax(imax(truncate<i32>(Math.clamp(bounds.y.floor(), -1.0, 100000.0)), parent.y0), limit.y0);
+    let mx1 = imax(imin(
+        imin(truncate<i32>(Math.clamp((bounds.x + bounds.w).ceil(), -1.0, 100000.0)), parent.x1),
+        limit.x1,
+    ), mx0);
+    let my1 = imax(imin(
+        imin(truncate<i32>(Math.clamp((bounds.y + bounds.h).ceil(), -1.0, 100000.0)), parent.y1),
+        limit.y1,
+    ), my0);
     let w = idx(mx1 - mx0);
     let h = idx(my1 - my0);
     let saved = r.maskTop;

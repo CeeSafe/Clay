@@ -315,9 +315,35 @@ fn accumulateLine(acc: SliceMut<f32>, stride: usize, rows: usize, maxX: f32, ax:
         let line = idx(yi) * stride;
         let dy = (yf + 1.0).min(y1p) - yf.max(y0p);
         let xNextTrue = xTrue + dxdy * dy;
-        let x = Math.clamp(xTrue, 0.0, maxX);
-        let xnext = Math.clamp(xNextTrue, 0.0, maxX);
-        let d = dy * dir;
+        // A box clipped to a region (Raster.beginRegion) can start or end partway along a path, so an edge may cross
+        // its left or right side within a row. Clamping such an edge would bend it and change the boundary pixels'
+        // coverage, so it is split there: the part left of the box covers every pixel of the row, as an edge at
+        // x = 0 does, and the part right of it covers none that is read. A whole path's box never cuts an edge.
+        var xa = xTrue;
+        var xb = xNextTrue;
+        var d = dy * dir;
+        if ((xa < 0.0) != (xb < 0.0)) {
+            let t = (0.0 - xa) / (xb - xa);
+            let left = if (xa < 0.0) t else 1.0 - t;
+            acc[line] += d * left;
+            d = d * (1.0 - left);
+            if (xa < 0.0) {
+                xa = 0.0;
+            } else {
+                xb = 0.0;
+            }
+        }
+        if ((xa > maxX) != (xb > maxX)) {
+            let t = (maxX - xa) / (xb - xa);
+            d = d * (if (xa > maxX) 1.0 - t else t);
+            if (xa > maxX) {
+                xa = maxX;
+            } else {
+                xb = maxX;
+            }
+        }
+        let x = Math.clamp(xa, 0.0, maxX);
+        let xnext = Math.clamp(xb, 0.0, maxX);
         let lo = x.min(xnext);
         let hi = x.max(xnext);
         let lofloor = lo.floor();
@@ -374,10 +400,12 @@ fn fillPath(r: borrow mut Raster, paint: Paint, target: FillTarget) {
     }
     let clip = r.clips.last();
     let layer = r.layers.last();
-    var bx0 = imax(imax(truncate<i32>(Math.clamp(minX.floor(), -1.0, 100000.0)), clip.x0), layer.x0);
-    var by0 = imax(imax(truncate<i32>(Math.clamp(minY.floor(), -1.0, 100000.0)), clip.y0), layer.y0);
-    var bx1 = imin(imin(truncate<i32>(Math.clamp(maxX.ceil(), -1.0, 100000.0)), clip.x1), layer.x1);
-    var by1 = imin(imin(truncate<i32>(Math.clamp(maxY.ceil(), -1.0, 100000.0)), clip.y1), layer.y1);
+    // The layer's limit: its own box, or for the frame itself the region being redrawn (Raster.beginRegion).
+    let limit = r.currentLimit();
+    var bx0 = imax(imax(truncate<i32>(Math.clamp(minX.floor(), -1.0, 100000.0)), clip.x0), limit.x0);
+    var by0 = imax(imax(truncate<i32>(Math.clamp(minY.floor(), -1.0, 100000.0)), clip.y0), limit.y0);
+    var bx1 = imin(imin(truncate<i32>(Math.clamp(maxX.ceil(), -1.0, 100000.0)), clip.x1), limit.x1);
+    var by1 = imin(imin(truncate<i32>(Math.clamp(maxY.ceil(), -1.0, 100000.0)), clip.y1), limit.y1);
     match (target) {
         FillTarget.Mask(_, mx0, my0, mw) => {
             bx0 = imax(bx0, mx0);

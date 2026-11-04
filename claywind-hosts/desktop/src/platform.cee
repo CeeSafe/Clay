@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MIT
+// A native window (lib/std's Window, CeeSafe ADR 0069) as a ClayWind platform: its events folded into per-frame state.
+
+import claywind.Platform;
+import claywind.Pointer;
+import claywind.Cursor;
+import claywind.Key;
+import claywind.Dims;
+import claywind.Vec2;
+import claywind.keyIndex;
+
+/// Wheel lines to ClayWind's wheel units: what the browser host's page sends for one notch.
+const WHEEL_UNITS: f32 = 2.5;
+
+public struct DesktopPlatform {
+    size: Dims;
+    pointerState: Pointer;
+    /// Keys held, went down this frame, and OS-repeated this frame, by `keyIndex`.
+    down: u64;
+    pressed: u64;
+    repeated: u64;
+    typed: [u32; 64];
+    typedCount: usize;
+    typedRead: usize;
+    dt: f32;
+    clock: f64;
+    public cursor: Cursor;
+
+    public fn create(size: Dims) -> DesktopPlatform => DesktopPlatform {
+        size: size,
+        pointerState: Pointer.at(Vec2 { x: -100.0, y: -100.0 }),
+        down: 0,
+        pressed: 0,
+        repeated: 0,
+        typed: [0u32; 64],
+        typedCount: 0,
+        typedRead: 0,
+        dt: 0.0,
+        clock: 0.0,
+        cursor: Cursor.Default,
+    };
+
+    /// Seconds since the previous frame (the host measures it).
+    public fn setFrameTime(borrow mut this, seconds: f32) {
+        this.dt = if (seconds > 0.25) 0.25 else seconds;
+        this.clock += seconds as f64;
+    }
+
+    /// Clears the one-frame edges after a frame used them.
+    public fn endFrame(borrow mut this) {
+        this.pointerState.pressed = false;
+        this.pointerState.released = false;
+        this.pointerState.secondaryPressed = false;
+        this.pointerState.wheel = Vec2.zero();
+        this.pressed = 0;
+        this.repeated = 0;
+        this.typedCount = 0;
+        this.typedRead = 0;
+    }
+
+    /// Folds one window event into this frame's state (Closed is the host's).
+    public fn apply(borrow mut this, e: WindowEvent) {
+        match (e) {
+            WindowEvent.Resized(s) => { this.size = Dims { w: round<f32>(s.width), h: round<f32>(s.height) }; }
+            WindowEvent.PointerMoved(x, y) => { this.pointerState.position = Vec2 { x: x, y: y }; }
+            WindowEvent.PointerButton(button, down, x, y) => {
+                this.pointerState.position = Vec2 { x: x, y: y };
+                match (button) {
+                    WindowButton.Secondary => {
+                        this.pointerState.secondaryDown = down;
+                        if (down) {
+                            this.pointerState.secondaryPressed = true;
+                        }
+                    }
+                    WindowButton.Middle => {}
+                    WindowButton.Primary => {
+                        if (down) {
+                            this.pointerState.down = true;
+                            this.pointerState.pressed = true;
+                        } else if (this.pointerState.down) {
+                            this.pointerState.down = false;
+                            this.pointerState.released = true;
+                        }
+                    }
+                }
+            }
+            WindowEvent.Wheel(_, dy) => { this.pointerState.wheel.y += dy * WHEEL_UNITS; }
+            WindowEvent.Key(key, down, repeat, modifiers) => {
+                // A modifier key alone sends nothing on every system, so the held modifiers come with each key.
+                this.hold(Key.LeftShift, modifiers.shift);
+                this.hold(Key.LeftControl, modifiers.control);
+                this.hold(Key.LeftAlt, modifiers.alt);
+                match (claywindKey(key)) {
+                    Some(k) => {
+                        let bit = 1u64 << (keyIndex(k) as u64);
+                        if (!down) {
+                            this.down = this.down & (bit ^ 0xFFFFFFFFFFFFFFFF);
+                        } else if (repeat) {
+                            this.repeated = this.repeated | bit;
+                        } else {
+                            this.down = this.down | bit;
+                            this.pressed = this.pressed | bit;
+                        }
+                    }
+                    null => {}
+                }
+            }
+            WindowEvent.Text(c) => {
+                if (this.typedCount < 64) {
+                    this.typed[this.typedCount] = c;
+                    this.typedCount += 1;
+                }
+            }
+            WindowEvent.Focus(focused) => {
+                if (!focused) {
+                    // Keys and buttons released while another window had the focus never arrive.
+                    this.down = 0;
+                    this.pointerState.down = false;
+                    this.pointerState.secondaryDown = false;
+                }
+            }
+            WindowEvent.Closed => {}
+        }
+    }
+
+    fn hold(borrow mut this, key: Key, held: bool) {
+        let bit = 1u64 << (keyIndex(key) as u64);
+        this.down = if (held) this.down | bit else this.down & (bit ^ 0xFFFFFFFFFFFFFFFF);
+    }
+}
+
+impl Platform for DesktopPlatform {
+    fn screenSize(borrow this) -> Dims => this.size;
+    fn frameTime(borrow this) -> f32 => this.dt;
+    fn time(borrow this) -> f64 => this.clock;
+    fn pointer(borrow this) -> Pointer => this.pointerState;
+    fn keyDown(borrow this, key: Key) -> bool => (this.down >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyPressed(borrow this, key: Key) -> bool => (this.pressed >> (keyIndex(key) as u64)) & 1 == 1;
+    fn keyRepeated(borrow this, key: Key) -> bool => (this.repeated >> (keyIndex(key) as u64)) & 1 == 1;
+    fn nextChar(borrow mut this) -> u32 {
+        if (this.typedRead >= this.typedCount) {
+            return 0;
+        }
+        let c = this.typed[this.typedRead];
+        this.typedRead += 1;
+        return c;
+    }
+    fn setCursor(borrow mut this, cursor: Cursor) {
+        this.cursor = cursor;
+    }
+}
+
+/// The window's key as ClayWind's; printable keys arrive as typed text instead (`Text`).
+fn claywindKey(key: WindowKey) -> Key? => match (key) {
+    WindowKey.Escape => Key.Escape,
+    WindowKey.Enter => Key.Enter,
+    WindowKey.Tab => Key.Tab,
+    WindowKey.Backspace => Key.Backspace,
+    WindowKey.Delete => Key.Delete,
+    WindowKey.Left => Key.Left,
+    WindowKey.Right => Key.Right,
+    WindowKey.Up => Key.Up,
+    WindowKey.Down => Key.Down,
+    WindowKey.Home => Key.Home,
+    WindowKey.End => Key.End,
+    WindowKey.PageUp => Key.PageUp,
+    WindowKey.PageDown => Key.PageDown,
+    WindowKey.Function(n) => match (n) {
+        1 => Key.F1,
+        2 => Key.F2,
+        3 => Key.F3,
+        4 => Key.F4,
+        5 => Key.F5,
+        6 => Key.F6,
+        7 => Key.F7,
+        8 => Key.F8,
+        9 => Key.F9,
+        10 => Key.F10,
+        11 => Key.F11,
+        _ => Key.F12,
+    },
+    _ => null,
+};
+
+/// ClayWind's cursor as the window's.
+public fn windowCursor(cursor: Cursor) -> WindowCursor => match (cursor) {
+    Cursor.Default => WindowCursor.Default,
+    Cursor.Pointer => WindowCursor.Pointer,
+    Cursor.Text => WindowCursor.Text,
+};

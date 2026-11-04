@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: MIT
+// The desktop host: the ClayWind demo in a native window (lib/std's Window, CeeSafe ADR 0069: AppKit on macOS, Win32
+// on Windows, X11 on Linux), drawn by ClayWind's software renderer. 100% CeeSafe, no C.
+//
+//   ./out/desktop
+//   CLAYWIND_FONT_DIR=DIR   where Arial.ttf, "Arial Bold.ttf" and "Courier New.ttf" are (otherwise the system's
+//                           fonts are looked for: macOS, Windows, then Linux's Microsoft core fonts or DejaVu)
+//   CLAYWIND_LIGHT=1        start in light mode (T toggles it, as in the demo)
+//
+// The window resizes freely and the layout follows it. Frames are drawn at the display's pixel ratio (2 on a Retina
+// display, Raster.setPixelRatio), up to MAX_PIXELS_WIDTH × MAX_PIXELS_HEIGHT pixels: a window too large for that at
+// its ratio is drawn at a lower one, which the window scales up. Each frame redraws only what changed (Damage), and
+// nothing is presented when nothing did.
+
+import claywind;
+import claywind_demo;
+
+const START_WIDTH: u32 = 1024;
+const START_HEIGHT: u32 = 640;
+const MAX_PIXELS_WIDTH: usize = 2880;
+const MAX_PIXELS_HEIGHT: usize = 1800;
+
+fn readFile(path: StringView) -> Vector<u8> {
+    var bytes = Vector<u8>.create();
+    match (File.open(path)) {
+        Ok(f) => {
+            var file = f;
+            var chunk = [0u8; 65536];
+            loop {
+                let n = match (file.read(mut chunk[..])) {
+                    Ok(k) => k,
+                    Err(_) => 0,
+                };
+                if (n == 0) {
+                    break;
+                }
+                for (i in 0usize..n) {
+                    bytes.push(chunk[i])!;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    return bytes;
+}
+
+/// Loads `dir/file` as font `id`; false when it is missing or does not fit.
+fn loadFont(raster: borrow mut Raster, id: u32, dir: StringView, file: StringView) -> bool {
+    var path = [0u8; 512];
+    var w = TextWriter.create(mut path[..]);
+    w.text(dir);
+    w.byte('/');
+    w.text(file);
+    let name = match (StringView.fromUtf8(w.written())) {
+        Some(n) => n,
+        null => { return false; }
+    };
+    let bytes = readFile(name);
+    return bytes.length > 0 && raster.loadFont(id, bytes.view());
+}
+
+/// The regular, bold and monospaced faces from the first place that has them.
+fn loadFonts(raster: borrow mut Raster) -> bool {
+    match (Environment.variable("CLAYWIND_FONT_DIR")) {
+        Some(dir) => {
+            return loadFont(mut raster, FONT_18, dir, "Arial.ttf") &&
+                loadFont(mut raster, FONT_BOLD, dir, "Arial Bold.ttf") &&
+                loadFont(mut raster, FONT_MONO, dir, "Courier New.ttf");
+        }
+        null => {}
+    }
+    let places: [StringView; 16] = [
+        "/System/Library/Fonts/Supplemental",
+        "Arial.ttf",
+        "Arial Bold.ttf",
+        "Courier New.ttf",
+        "C:/Windows/Fonts",
+        "arial.ttf",
+        "arialbd.ttf",
+        "cour.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts",
+        "Arial.ttf",
+        "Arial_Bold.ttf",
+        "Courier_New.ttf",
+        "/usr/share/fonts/truetype/dejavu",
+        "DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSansMono.ttf",
+    ];
+    for (k in 0usize..4) {
+        let dir = places[k * 4];
+        if (loadFont(mut raster, FONT_18, dir, places[k * 4 + 1])) {
+            return loadFont(mut raster, FONT_BOLD, dir, places[k * 4 + 2]) &&
+                loadFont(mut raster, FONT_MONO, dir, places[k * 4 + 3]);
+        }
+    }
+    return false;
+}
+
+fn zeros(count: usize) -> Vector<u8> {
+    var v = Vector<u8>.withCapacity(count)!;
+    for (i in 0..count) {
+        v.push(0)!;
+    }
+    return v;
+}
+
+/// The ratio to draw at: the window's, lowered until `size` points fit the raster's pixels.
+fn ratioFor(size: WindowSize, scale: f32) -> f32 {
+    let w = round<f32>(if (size.width < 1) 1 else size.width);
+    let h = round<f32>(if (size.height < 1) 1 else size.height);
+    let wanted = if (scale >= 1.0) scale else 1.0;
+    let fitW = round<f32>(MAX_PIXELS_WIDTH) / w;
+    let fitH = round<f32>(MAX_PIXELS_HEIGHT) / h;
+    return wanted.min(fitW).min(fitH);
+}
+
+/// Sizes the raster's frame for the window: its points times the ratio, in pixels.
+fn fitRaster(raster: borrow mut Raster, size: WindowSize, scale: f32) {
+    let ratio = ratioFor(size, scale);
+    let w = saturatingTruncate<usize>(Math.round(round<f32>(size.width) * ratio));
+    let h = saturatingTruncate<usize>(Math.round(round<f32>(size.height) * ratio));
+    raster.setPixelRatio(ratio);
+    raster.resize(
+        if (w < 1) 1 else if (w > MAX_PIXELS_WIDTH) MAX_PIXELS_WIDTH else w,
+        if (h < 1) 1 else if (h > MAX_PIXELS_HEIGHT) MAX_PIXELS_HEIGHT else h,
+    );
+}
+
+fn main() -> i32 {
+    var window = match (Window.open("ClayWind — CeeSafe", START_WIDTH, START_HEIGHT)) {
+        Ok(w) => w,
+        Err(e) => {
+            Console.writeError("desktop: cannot open a window: ");
+            Console.writeErrorLine(match (e) {
+                WindowError.Unsupported => "this system has no window support",
+                WindowError.NoDisplay => "no display",
+                WindowError.NotMainThread => "not on the main thread",
+                WindowError.Resources => "the system refused",
+            });
+            return 1;
+        }
+    };
+    var uiStorage = zeros(16777216);
+    var rasterStorage = zeros(201326592);
+    let uiMemory = FixedBufferAllocator.over(mut uiStorage.viewMut());
+    let rasterMemory = FixedBufferAllocator.over(mut rasterStorage.viewMut());
+    var ui = match (Ui.create(uiMemory, UiCapacity.of(4096))) {
+        Ok(u) => u,
+        Err(_) => {
+            Console.writeErrorLine("desktop: not enough memory for the UI");
+            return 1;
+        }
+    };
+    var raster = match (Raster.create(rasterMemory, RasterCapacity.of(MAX_PIXELS_WIDTH, MAX_PIXELS_HEIGHT))) {
+        Ok(r) => r,
+        Err(_) => {
+            Console.writeErrorLine("desktop: not enough memory for the renderer");
+            return 1;
+        }
+    };
+    if (!loadFonts(mut raster)) {
+        Console.writeErrorLine("desktop: no fonts found; set CLAYWIND_FONT_DIR");
+        return 1;
+    }
+    // Only what changed is redrawn each frame (Damage): an idle frame costs a layout and a comparison.
+    var damageStorage = zeros(4194304);
+    let damageMemory = FixedBufferAllocator.over(mut damageStorage.viewMut());
+    var damage = match (Damage.create(damageMemory, 16384)) {
+        Ok(d) => d,
+        Err(_) => {
+            Console.writeErrorLine("desktop: not enough memory for the damage tracker");
+            return 1;
+        }
+    };
+    let size = window.size();
+    var platform = DesktopPlatform.create(Dims { w: round<f32>(size.width), h: round<f32>(size.height) });
+    var app = DemoApp.create();
+    ui.setDarkMode(Environment.variable("CLAYWIND_LIGHT") == null);
+    var last = Timer.now();
+    loop {
+        loop {
+            match (window.nextEvent()) {
+                Some(WindowEvent.Closed) => { return 0; }
+                Some(e) => {
+                    platform.apply(e);
+                }
+                null => { break; }
+            }
+        }
+        // Every frame: a resize, or a move to a display of another scale, changes the frame's pixels.
+        fitRaster(mut raster, window.size(), window.scale());
+        let now = Timer.now();
+        platform.setFrameTime(round<f32>(now - last) / 1000.0);
+        last = now;
+        ui.begin(mut platform);
+        demoFrame(mut ui, mut app, raster);
+        match (ui.endFrame(mut platform, raster)) {
+            Ok() => {}
+            Err(_) => {
+                Console.writeErrorLine("desktop: the frame does not fit the UI capacity");
+                return 1;
+            }
+        }
+        window.setCursor(windowCursor(platform.cursor));
+        if (damage.render(mut raster, ui, Color.hex(pageBg(ui)))) {
+            let width = truncate<u32>(raster.frameWidth());
+            let height = truncate<u32>(raster.frameHeight());
+            match (window.present(raster.pixels(), width, height)) {
+                Ok() => {}
+                Err(_) => {
+                    Console.writeErrorLine("desktop: the window refused a frame");
+                    return 1;
+                }
+            }
+        }
+        platform.endFrame();
+        window.waitFrame();
+    }
+}

@@ -113,6 +113,17 @@ public struct Raster<region r> {
     fonts: FixedList<r, FontSlot>;
     width: i32;
     height: i32;
+    /// The largest frame `create` made room for; `resize` stays within it.
+    capacityWidth: i32;
+    capacityHeight: i32;
+    /// Device pixels per layout point (2 on a Retina display): the base transform of every frame.
+    ratio: f32;
+    /// The pixels this frame redraws (`beginRegion`; the whole frame after `begin`). Drawing into the frame itself
+    /// stays inside them; a layer is computed over them, widened by its blur's reach, and composited inside them.
+    regionX0: i32;
+    regionY0: i32;
+    regionX1: i32;
+    regionY1: i32;
 
     public fn create(
         memory: borrow(r) FixedBufferAllocator,
@@ -171,16 +182,45 @@ public struct Raster<region r> {
             fonts: FixedList<FontSlot>.over(fonts),
             width: truncate<i32>(capacity.width),
             height: truncate<i32>(capacity.height),
+            capacityWidth: truncate<i32>(capacity.width),
+            capacityHeight: truncate<i32>(capacity.height),
+            ratio: 1.0,
+            regionX0: 0,
+            regionY0: 0,
+            regionX1: truncate<i32>(capacity.width),
+            regionY1: truncate<i32>(capacity.height),
         });
     }
 
     /// Starts a frame: clears to `clear` (straight RGBA) and resets the stacks.
     public fn begin(borrow mut this, clear: Color) {
+        let w = idx(this.width);
+        let h = idx(this.height);
+        this.beginRegion(clear, 0, 0, w, h);
+    }
+
+    /// Starts a frame that redraws only the pixels [x0, x1) × [y0, y1) (clamped to the frame): they are cleared to
+    /// `clear` and everything drawn is clipped to them, while the rest keep the previous frame's pixels. With a
+    /// region from `Damage`, which covers whatever changed and every blur it touches, the frame is the one `begin`
+    /// would draw.
+    public fn beginRegion(borrow mut this, clear: Color, x0: usize, y0: usize, x1: usize, y1: usize) {
         let c = premultiply(clear);
-        let frame = (idx(this.width)) * (idx(this.height));
-        for (i in 0..frame) {
-            this.pool[i] = c;
+        let w = idx(this.width);
+        let h = idx(this.height);
+        let rx1 = if (x1 > w) w else x1;
+        let ry1 = if (y1 > h) h else y1;
+        let rx0 = if (x0 > rx1) rx1 else x0;
+        let ry0 = if (y0 > ry1) ry1 else y0;
+        for (y in ry0..ry1) {
+            for (x in rx0..rx1) {
+                this.pool[y * w + x] = c;
+            }
         }
+        this.regionX0 = truncate<i32>(rx0);
+        this.regionY0 = truncate<i32>(ry0);
+        this.regionX1 = truncate<i32>(rx1);
+        this.regionY1 = truncate<i32>(ry1);
+        let frame = w * h;
         this.poolTop = frame;
         this.maskTop = 0;
         this.overflowed = false;
@@ -201,7 +241,7 @@ public struct Raster<region r> {
             ClipState { x0: 0, y0: 0, x1: this.width, y1: this.height, hasMask: false, maskOffset: 0, maskTop: 0 },
         );
         this.transforms.clear();
-        this.transforms.push(Affine2.identity());
+        this.transforms.push(Affine2 { a: this.ratio, b: 0.0, c: 0.0, d: this.ratio, e: 0.0, f: 0.0 });
     }
 
     /// Closes any brackets left open (an unbalanced command stream) so the frame is complete.
@@ -213,6 +253,30 @@ public struct Raster<region r> {
 
     public fn frameWidth(borrow this) -> usize => idx(this.width);
     public fn frameHeight(borrow this) -> usize => idx(this.height);
+
+    /// Draws the next frames at `ratio` device pixels per layout point (from the next `begin`): commands stay in
+    /// points, and every path, clip, image and blur is scaled, so a Retina display gets one pixel per pixel. The
+    /// frame's size (`resize`) is in pixels, so a host sets it to the layout size times `ratio`. Ignored unless
+    /// positive and finite; 1 (the default) draws exactly as before.
+    public fn setPixelRatio(borrow mut this, ratio: f32) {
+        if (ratio > 0.0 && ratio < 64.0) {
+            this.ratio = ratio;
+        }
+    }
+
+    /// The ratio frames are drawn at.
+    public fn pixelRatio(borrow this) -> f32 => this.ratio;
+
+    /// Changes the frame's size for the next `begin` (a resized window); false, and no change, when it is 0 or larger
+    /// than the capacity `create` was given. Every buffer was sized for the capacity, so nothing is reallocated.
+    public fn resize(borrow mut this, width: usize, height: usize) -> bool {
+        if (width == 0 || height == 0 || width > idx(this.capacityWidth) || height > idx(this.capacityHeight)) {
+            return false;
+        }
+        this.width = truncate<i32>(width);
+        this.height = truncate<i32>(height);
+        return true;
+    }
 
     /// The frame's pixels, premultiplied RGBA8 packed as bytes R, G, B, A; row-major, `frameWidth()` per row.
     public fn pixels(borrow this) -> Slice<u32> => this.pool[0..(idx(this.width)) * (idx(this.height))];
@@ -348,6 +412,24 @@ public struct Raster<region r> {
 
     fn currentLayer(borrow this) -> Layer => this.layers.last();
 
+    /// Where the current layer's pixels are needed: the region for the frame itself, a layer's own box otherwise
+    /// (already limited when it was pushed).
+    fn currentLimit(borrow this) -> ClipState {
+        if (this.layers.length() <= 1) {
+            return ClipState {
+                x0: this.regionX0,
+                y0: this.regionY0,
+                x1: this.regionX1,
+                y1: this.regionY1,
+                hasMask: false,
+                maskOffset: 0,
+                maskTop: 0,
+            };
+        }
+        let l = this.layers.last();
+        return ClipState { x0: l.x0, y0: l.y0, x1: l.x1, y1: l.y1, hasMask: false, maskOffset: 0, maskTop: 0 };
+    }
+
     fn pushTransform(borrow mut this, m: Affine2) {
         let composed = this.currentTransform().after(m);
         if (!this.transforms.push(composed)) {
@@ -368,10 +450,18 @@ public struct Raster<region r> {
     }
 
     fn pushLayerOver(borrow mut this, kind: LayerKind, ax0: i32, ay0: i32, ax1: i32, ay1: i32) {
-        let x0 = imax(ax0, 0);
-        let y0 = imax(ay0, 0);
-        let x1 = imax(imin(ax1, this.width), x0);
-        let y1 = imax(imin(ay1, this.height), y0);
+        // Only what the parent's needed pixels depend on: its limit, widened by the reach of this layer's blur.
+        let m0 = this.currentTransform();
+        let reach = match (kind) {
+            LayerKind.Blurred(sigma2) => blurReach(sigma2 * (m0.a * m0.a + m0.c * m0.c)),
+            LayerKind.Filtered(FilterMode.Blur, amount) => blurReach(amount * amount * (m0.a * m0.a + m0.c * m0.c)),
+            _ => 0,
+        };
+        let limit = this.currentLimit();
+        let x0 = imax(imax(ax0, 0), limit.x0 - reach);
+        let y0 = imax(imax(ay0, 0), limit.y0 - reach);
+        let x1 = imax(imin(imin(ax1, this.width), limit.x1 + reach), x0);
+        let y1 = imax(imin(imin(ay1, this.height), limit.y1 + reach), y0);
         let size = (idx(x1 - x0)) * (idx(y1 - y0));
         if (this.poolTop + size > this.pool.length || this.layers.length() >= this.layers.items.length) {
             // No room: draw straight into the parent instead (the bracket's effect is lost, not the content).
@@ -410,6 +500,7 @@ public struct Raster<region r> {
             _ => {}
         }
         let parent = this.currentLayer();
+        let target = this.currentLimit();
         let w = idx(top.x1 - top.x0);
         // Only the part of the layer that holds anything is processed (and, for a blur, its reach).
         var region = match (contentBounds(this, top)) {
@@ -444,12 +535,12 @@ public struct Raster<region r> {
         }
         for (y in region.y0..region.y1) {
             let dy = top.y0 + truncate<i32>(y);
-            if (dy < parent.y0 || dy >= parent.y1) {
+            if (dy < parent.y0 || dy >= parent.y1 || dy < target.y0 || dy >= target.y1) {
                 continue;
             }
             for (x in region.x0..region.x1) {
                 let dx = top.x0 + truncate<i32>(x);
-                if (dx < parent.x0 || dx >= parent.x1) {
+                if (dx < parent.x0 || dx >= parent.x1 || dx < target.x0 || dx >= target.x1) {
                     continue;
                 }
                 let src = this.pool[top.offset + y * w + x];

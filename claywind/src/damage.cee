@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: MIT
+// Which part of a frame changed since the previous one, so that a host redraws only that (Raster.beginRegion) or
+// nothing at all. Not in the C ClayWind, which redraws every frame through ThorVG.
+//
+// Each frame's commands are hashed (a Text command by its bytes, not by its place in the text buffer) together with
+// the area each one can paint, in points: its rectangle, widened for what is drawn outside it (a shadow's offset and
+// blur, a ring's offset, text that overhangs its line box), and transformed by the transform brackets around it. The
+// damage is then:
+// - nothing, when every hash matches the previous frame's;
+// - the full frame, when the number of commands, the kind of a command, the clear color, the frame's size or ratio
+//   differs, or on the first frame;
+// - otherwise the old and new areas of what changed: a changed command's own, or for a changed bracket (an animated
+//   transform or opacity) those of everything inside it. They are kept as up to four boxes, so that two small
+//   changes far apart stay two small redraws.
+// A redraw of a box gives the pixels a full redraw would: the raster computes a shadow or a blur over the box widened
+// by the blur's reach, and everything else is drawn per pixel.
+
+/// What a frame needs redrawn.
+public enum DamageResult {
+    /// Nothing changed: the previous frame's pixels are this frame's.
+    Nothing,
+    /// Only this area, in points (before the pixel ratio).
+    Region(Rect),
+    /// The whole frame.
+    Everything,
+}
+
+/// The previous frame's commands, by hash and area.
+public struct Damage<region r> {
+    hashes: SliceMut<r, u64>;
+    areas: SliceMut<r, Rect>;
+    brackets: SliceMut<r, bool>;
+    kinds: SliceMut<r, u64>;
+    count: usize;
+    previousHashes: SliceMut<r, u64>;
+    previousAreas: SliceMut<r, Rect>;
+    previousBrackets: SliceMut<r, bool>;
+    previousKinds: SliceMut<r, u64>;
+    previousCount: usize;
+    transforms: SliceMut<r, Affine2>;
+    previousClear: u64;
+    valid: bool;
+    /// The pixels the last `render` redrew (empty when nothing).
+    last: Rect;
+    /// This frame's damage as up to four boxes, in points: two small changes far apart (an animated badge and a
+    /// clock) stay two small redraws rather than the box around both.
+    pieces: [Rect; 4];
+    pieceCount: usize;
+    /// Why the last `update` was `Everything` (`fullReason`), and the command that made it so.
+    reason: u32;
+    reasonCommand: usize;
+    /// The raster frame the last `render` drew: another size or ratio is a full redraw.
+    width: usize;
+    height: usize;
+    ratio: f32;
+
+    /// Room for frames of up to `commands` render commands.
+    public fn create(memory: borrow(r) FixedBufferAllocator, commands: usize) -> Result<Damage<r>, AllocError> {
+        let none = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        return Ok(Damage {
+            hashes: memory.allocArray(commands, 0u64)?,
+            areas: memory.allocArray(commands, none)?,
+            brackets: memory.allocArray(commands, false)?,
+            kinds: memory.allocArray(commands, 0u64)?,
+            count: 0,
+            previousHashes: memory.allocArray(commands, 0u64)?,
+            previousAreas: memory.allocArray(commands, none)?,
+            previousBrackets: memory.allocArray(commands, false)?,
+            previousKinds: memory.allocArray(commands, 0u64)?,
+            previousCount: 0,
+            transforms: memory.allocArray(64, Affine2.identity())?,
+            previousClear: 0,
+            valid: false,
+            last: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            pieces: [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 4],
+            pieceCount: 0,
+            reason: 0,
+            reasonCommand: 0,
+            width: 0,
+            height: 0,
+            ratio: 0.0,
+        });
+    }
+
+    /// Forgets the previous frame: the next `update` is `Everything` (after a resize, or when the pixels are lost).
+    public fn invalidate(borrow mut this) {
+        this.valid = false;
+    }
+
+    /// Draws `ui`'s frame into `raster`, redrawing only what changed since the frame this last drew (all of it the
+    /// first time, or after `invalidate`): the damage in points, at the raster's pixel ratio, widened by a pixel for
+    /// anti-aliasing. False when nothing changed and `raster` still holds the frame.
+    public fn render(borrow mut this, raster: borrow mut Raster, ui: borrow Ui, clear: Color) -> bool {
+        let ratio = raster.pixelRatio();
+        let w = raster.frameWidth();
+        let h = raster.frameHeight();
+        if (w != this.width || h != this.height || ratio != this.ratio) {
+            this.valid = false;
+            this.width = w;
+            this.height = h;
+            this.ratio = ratio;
+        }
+        match (this.update(ui, clear)) {
+            DamageResult.Nothing => {
+                this.last = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+                return false;
+            }
+            DamageResult.Everything => {
+                this.last = Rect { x: 0.0, y: 0.0, w: round<f32>(w), h: round<f32>(h) };
+                raster.begin(clear);
+            }
+            DamageResult.Region(_) => {
+                // One pass per box: each redraws only its pixels, and leaves the others' alone.
+                this.last = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+                for (k in 0..this.pieceCount) {
+                    let r = this.pieces[k];
+                    let x0 = Math.clamp((r.x * ratio).floor() - 1.0, 0.0, round<f32>(w));
+                    let y0 = Math.clamp((r.y * ratio).floor() - 1.0, 0.0, round<f32>(h));
+                    let x1 = Math.clamp(((r.x + r.w) * ratio).ceil() + 1.0, 0.0, round<f32>(w));
+                    let y1 = Math.clamp(((r.y + r.h) * ratio).ceil() + 1.0, 0.0, round<f32>(h));
+                    this.last = joined(this.last, k > 0, Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+                    raster.beginRegion(
+                        clear,
+                        saturatingTruncate<usize>(x0),
+                        saturatingTruncate<usize>(y0),
+                        saturatingTruncate<usize>(x1),
+                        saturatingTruncate<usize>(y1),
+                    );
+                    ui.renderInto(mut raster);
+                    raster.finish();
+                }
+                return true;
+            }
+        }
+        ui.renderInto(mut raster);
+        raster.finish();
+        return true;
+    }
+
+    /// Why the last frame was redrawn whole: 0 it was not, 1 the first frame (or after `invalidate`, a resize or a
+    /// new ratio), 2 the number of commands changed, 3 the clear color changed, 4 a bracket changed
+    /// (`fullReasonCommand` is its index).
+    public fn fullReason(borrow this) -> u32 => this.reason;
+
+    public fn fullReasonCommand(borrow this) -> usize => this.reasonCommand;
+
+    /// The pixels the last `render` redrew: the whole frame, a region, or an empty box when nothing changed.
+    public fn lastRegion(borrow this) -> Rect => this.last;
+
+    /// Compares `ui`'s laid-out frame, cleared to `clear`, with the previous one, and remembers it for the next.
+    public fn update(borrow mut this, ui: borrow Ui, clear: Color) -> DamageResult {
+        let n = ui.commandCount();
+        let clearKey = colorKey(clear);
+        if (n > this.hashes.length) {
+            this.valid = false;
+            this.count = 0;
+            return DamageResult.Everything;
+        }
+        this.scan(ui, n);
+        this.pieceCount = 0;
+        var result = DamageResult.Nothing;
+        this.reason = 0;
+        if (!this.valid || n != this.previousCount || clearKey != this.previousClear) {
+            result = DamageResult.Everything;
+            this.reason = if (!this.valid) 1 else if (n != this.previousCount) 2 else 3;
+        } else {
+            var region = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+            var any = false;
+            var everything = false;
+            for (i in 0..n) {
+                if (this.kinds[i] != this.previousKinds[i]) {
+                    // Another structure: brackets pair differently, so no range below means the same in both.
+                    everything = true;
+                    this.reason = 4;
+                    this.reasonCommand = i;
+                    break;
+                }
+            }
+            var i: usize = 0;
+            while (!everything && i < n) {
+                if (this.hashes[i] == this.previousHashes[i]) {
+                    i += 1;
+                    continue;
+                }
+                // A changed command repaints its old and new areas; a changed bracket (an animated transform, an
+                // opacity) repaints everything inside it, under the old and the new bracket alike.
+                var first = i;
+                var last = i;
+                if (this.brackets[i]) {
+                    let span = this.bracketSpan(i, n);
+                    first = span.first;
+                    last = span.last;
+                }
+                for (k in first..last + 1) {
+                    region = joined(region, any, this.areas[k]);
+                    any = true;
+                    region = joined(region, true, this.previousAreas[k]);
+                    let now = this.areas[k];
+                    let before = this.previousAreas[k];
+                    this.addPiece(now);
+                    this.addPiece(before);
+                }
+                i += 1;
+            }
+            if (everything) {
+                result = DamageResult.Everything;
+            } else if (any) {
+                result = DamageResult.Region(region);
+            }
+        }
+        // This frame becomes the previous one.
+        for (i in 0..n) {
+            this.previousHashes[i] = this.hashes[i];
+            this.previousAreas[i] = this.areas[i];
+            this.previousBrackets[i] = this.brackets[i];
+            this.previousKinds[i] = this.kinds[i];
+        }
+        this.previousCount = n;
+        this.previousClear = clearKey;
+        this.valid = true;
+        return result;
+    }
+
+    /// Hashes, kinds and areas of this frame's commands.
+    fn scan(borrow mut this, ui: borrow Ui, n: usize) {
+        this.count = n;
+        var depth: usize = 0;
+        this.transforms[0] = Affine2.identity();
+        for (i in 0..n) {
+            let command = ui.commandAt(i);
+            let m = this.transforms[depth];
+            var h = mix(0xcbf29ce484222325, kindOf(command));
+            var bracket = false;
+            var area = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+            match (command) {
+                Command.Fill(rect, color, corners) => {
+                    h = mixCorners(mixColor(mixRect(h, rect), color), corners);
+                    area = rect;
+                }
+                Command.Stroke(rect, color, corners, w) => {
+                    h = mixCorners(mixColor(mixRect(h, rect), color), corners);
+                    h = mixF(mixF(mixF(mixF(mixF(h, w.left), w.right), w.top), w.bottom), w.betweenChildren);
+                    area = rect;
+                }
+                Command.Text(rect, run) => {
+                    h = mixF(
+                        mixF(mixF(mixColor(mixRect(h, rect), run.color), run.fontSize), run.letterSpacing),
+                        run.lineHeight,
+                    );
+                    h = mix(h, run.fontId as u64);
+                    for (b in ui.textOf(command)) {
+                        h = mix(h, b as u64);
+                    }
+                    let overhang = (run.fontSize * 0.35).max(2.0);
+                    area = grown(rect, overhang);
+                }
+                Command.Picture(rect, tint, corners, handle) => {
+                    h = mix(mixCorners(mixColor(mixRect(h, rect), tint), corners), handle as u64);
+                    area = rect;
+                }
+                Command.CustomDraw(rect, color, corners, id) => {
+                    h = mix(mixCorners(mixColor(mixRect(h, rect), color), corners), id as u64);
+                    area = rect;
+                }
+                Command.DropShadow(rect, s, corners) => {
+                    h = mixCorners(mixColor(mixRect(h, rect), s.color), corners);
+                    h = mixF(mixF(mixF(mixF(h, s.offsetX), s.offsetY), s.blur), s.spread);
+                    // drawShadow's layer: the offset box widened by 3 sigma, 2 and the spread.
+                    let pad = (s.blur * 0.5 * 3.0).ceil() + 3.0 + s.spread.max(0.0);
+                    area = grown(Rect { x: rect.x + s.offsetX, y: rect.y + s.offsetY, w: rect.w, h: rect.h }, pad);
+                }
+                Command.GradientFill(rect, g, corners) => {
+                    h = mixCorners(mixColor(mixColor(mixRect(h, rect), g.from), g.to), corners);
+                    h = mixF(mix(
+                        mix(mix(mix(h, bit(g.vertical)), gradientKind(g.kind)), bit(g.useAngle)),
+                        gradientSpread(g.spread),
+                    ), g.angle);
+                    h = mix(h, g.stopCount as u64);
+                    for (k in 0..g.stopCount.min(4)) {
+                        h = mixF(mixColor(h, g.stops[k].color), g.stops[k].position);
+                    }
+                    area = rect;
+                }
+                Command.RingStroke(rect, ring, corners) => {
+                    h = mixF(
+                        mixF(mixCorners(mixColor(mixRect(h, rect), ring.color), corners), ring.width),
+                        ring.offset,
+                    );
+                    area = grown(rect, ring.offset.max(0.0) + ring.width.max(0.0) + 1.0);
+                }
+                Command.IconDraw(rect, icon) => {
+                    h = mixF(mix(mixColor(mixRect(h, rect), icon.color), icon.id as u64), icon.stroke);
+                    area = rect;
+                }
+                Command.ClipStart(rect, corners, horizontal, vertical) => {
+                    h = mix(mix(mixCorners(mixRect(h, rect), corners), bit(horizontal)), bit(vertical));
+                    bracket = true;
+                    area = rect;
+                }
+                Command.ClipEnd => { bracket = true; }
+                Command.TransformStart(rect, t) => {
+                    h = mixF(mixF(
+                        mixF(mixF(mixF(mixF(mixRect(h, rect), t.scale), t.rotation), t.skewX), t.skewY),
+                        t.pivot.x,
+                    ), t.pivot.y);
+                    bracket = true;
+                    if (depth + 1 < this.transforms.length) {
+                        depth += 1;
+                        this.transforms[depth] = m.after(transformMatrix(t));
+                    }
+                }
+                Command.TransformEnd => {
+                    bracket = true;
+                    if (depth > 0) {
+                        depth = if (depth > 0) depth - 1 else 0;
+                    }
+                }
+                Command.BlendStart(mode) => {
+                    h = mix(h, blendKey(mode));
+                    bracket = true;
+                }
+                Command.BlendEnd => { bracket = true; }
+                Command.OpacityStart(rect, alpha) => {
+                    h = mixF(mixRect(h, rect), alpha);
+                    bracket = true;
+                    area = rect;
+                }
+                Command.OpacityEnd(alpha) => {
+                    h = mixF(h, alpha);
+                    bracket = true;
+                }
+                Command.FilterStart(rect, mode, amount) => {
+                    h = mixF(mix(mixRect(h, rect), filterKey(mode)), amount);
+                    bracket = true;
+                }
+                Command.FilterEnd(mode, amount) => {
+                    h = mixF(mix(h, filterKey(mode)), amount);
+                    bracket = true;
+                }
+            }
+            this.hashes[i] = h;
+            this.brackets[i] = bracket;
+            this.kinds[i] = kindOf(command);
+            let painted = m.bounds(area);
+            this.areas[i] = painted;
+        }
+    }
+
+    /// Adds `r` to this frame's boxes: merged into one it touches (and those into each other), or kept apart, or,
+    /// when there are already four, merged into the one whose box grows least.
+    fn addPiece(borrow mut this, r: Rect) {
+        if (empty(r)) {
+            return;
+        }
+        var box = r;
+        var k: usize = 0;
+        while (k < this.pieceCount) {
+            if (overlaps(grown(this.pieces[k], 8.0), box)) {
+                // Merge and start over: the bigger box may now touch another.
+                box = joined(this.pieces[k], true, box);
+                this.pieces[k] = this.pieces[this.pieceCount - 1];
+                this.pieceCount -= 1;
+                k = 0;
+            } else {
+                k += 1;
+            }
+        }
+        if (this.pieceCount < 4) {
+            this.pieces[this.pieceCount] = box;
+            this.pieceCount += 1;
+            return;
+        }
+        var best: usize = 0;
+        var bestGrowth: f32 = 0.0;
+        for (j in 0usize..4) {
+            let u = joined(this.pieces[j], true, box);
+            let growth = u.w * u.h - this.pieces[j].w * this.pieces[j].h;
+            if (j == 0 || growth < bestGrowth) {
+                best = j;
+                bestGrowth = growth;
+            }
+        }
+        this.pieces[best] = joined(this.pieces[best], true, box);
+    }
+
+    /// The commands from the bracket at `i` to its other end, both included (the same in both frames, whose kinds
+    /// match): a start runs forward to its end, an end back to its start.
+    fn bracketSpan(borrow this, i: usize, n: usize) -> Span {
+        if (isBracketStart(this.kinds[i])) {
+            var depth: usize = 0;
+            for (k in i..n) {
+                if (isBracketStart(this.kinds[k])) {
+                    depth += 1;
+                } else if (isBracketEnd(this.kinds[k])) {
+                    depth = if (depth > 0) depth - 1 else 0;
+                    if (depth == 0) {
+                        return Span { first: i, last: k };
+                    }
+                }
+            }
+            return Span { first: i, last: n - 1 };
+        }
+        var depth: usize = 0;
+        var k = i + 1;
+        while (k > 0) {
+            k -= 1;
+            if (isBracketEnd(this.kinds[k])) {
+                depth += 1;
+            } else if (isBracketStart(this.kinds[k])) {
+                depth = if (depth > 0) depth - 1 else 0;
+                if (depth == 0) {
+                    return Span { first: k, last: i };
+                }
+            }
+        }
+        return Span { first: 0, last: i };
+    }
+}
+
+/// A range of command indices, both ends included.
+struct Span {
+    first: usize;
+    last: usize;
+}
+
+/// ClipStart, TransformStart, BlendStart, OpacityStart, FilterStart (kindOf's numbers).
+fn isBracketStart(kind: u64) -> bool => kind == 6 || kind == 8 || kind == 14 || kind == 16 || kind == 18;
+
+fn isBracketEnd(kind: u64) -> bool => kind == 7 || kind == 9 || kind == 15 || kind == 17 || kind == 19;
+
+fn mix(h: u64, v: u64) -> u64 => (h ^ v).wrappingMul(0x100000001b3);
+
+fn mixF(h: u64, f: f32) -> u64 => mix(h, f.bits() as u64);
+
+fn mixRect(h: u64, r: Rect) -> u64 => mixF(mixF(mixF(mixF(h, r.x), r.y), r.w), r.h);
+
+fn mixColor(h: u64, c: Color) -> u64 => mix(h, colorKey(c));
+
+fn mixCorners(h: u64, c: Corners) -> u64 => mixF(
+    mixF(mixF(mixF(h, c.topLeft), c.topRight), c.bottomRight),
+    c.bottomLeft,
+);
+
+fn colorKey(c: Color) -> u64 => (c.r as u64) | (c.g as u64) << 8 | (c.b as u64) << 16 | (c.a as u64) << 24 | 1 << 32;
+
+fn bit(b: bool) -> u64 => if (b) 1 else 0;
+
+fn kindOf(c: Command) -> u64 => match (c) {
+    Command.Fill(_, _, _) => 1,
+    Command.Stroke(_, _, _, _) => 2,
+    Command.Text(_, _) => 3,
+    Command.Picture(_, _, _, _) => 4,
+    Command.CustomDraw(_, _, _, _) => 5,
+    Command.ClipStart(_, _, _, _) => 6,
+    Command.ClipEnd => 7,
+    Command.TransformStart(_, _) => 8,
+    Command.TransformEnd => 9,
+    Command.DropShadow(_, _, _) => 10,
+    Command.GradientFill(_, _, _) => 11,
+    Command.RingStroke(_, _, _) => 12,
+    Command.IconDraw(_, _) => 13,
+    Command.BlendStart(_) => 14,
+    Command.BlendEnd => 15,
+    Command.OpacityStart(_, _) => 16,
+    Command.OpacityEnd(_) => 17,
+    Command.FilterStart(_, _, _) => 18,
+    Command.FilterEnd(_, _) => 19,
+};
+
+fn gradientKind(k: GradientKind) -> u64 => match (k) {
+    GradientKind.Linear => 1,
+    GradientKind.Radial => 2,
+};
+
+fn gradientSpread(s: GradientSpread) -> u64 => match (s) {
+    GradientSpread.Pad => 1,
+    GradientSpread.Reflect => 2,
+    GradientSpread.Repeat => 3,
+};
+
+fn filterKey(f: FilterMode) -> u64 => match (f) {
+    FilterMode.None => 1,
+    FilterMode.Blur => 2,
+    FilterMode.Grayscale => 3,
+    FilterMode.Brightness => 4,
+};
+
+fn blendKey(b: BlendMode) -> u64 => match (b) {
+    BlendMode.None => 1,
+    BlendMode.Multiply => 2,
+    BlendMode.Add => 3,
+    BlendMode.Subtract => 4,
+    BlendMode.Screen => 5,
+    BlendMode.Overlay => 6,
+    BlendMode.Darken => 7,
+    BlendMode.Lighten => 8,
+    BlendMode.ColorDodge => 9,
+    BlendMode.ColorBurn => 10,
+    BlendMode.HardLight => 11,
+    BlendMode.SoftLight => 12,
+    BlendMode.Difference => 13,
+    BlendMode.Exclusion => 14,
+    BlendMode.Hue => 15,
+    BlendMode.Saturation => 16,
+    BlendMode.Color => 17,
+    BlendMode.Luminosity => 18,
+};
+
+fn grown(r: Rect, by: f32) -> Rect => Rect { x: r.x - by, y: r.y - by, w: r.w + 2.0 * by, h: r.h + 2.0 * by };
+
+/// `a` joined with `b`; `a` counts only when `has`. Empty boxes add nothing.
+fn joined(a: Rect, has: bool, b: Rect) -> Rect {
+    if (empty(b)) {
+        return a;
+    }
+    if (!has || empty(a)) {
+        return b;
+    }
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    return Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+fn empty(r: Rect) -> bool => r.w <= 0.0 || r.h <= 0.0;

@@ -1,6 +1,6 @@
 # ClayWind → CeeSafe: Port Plan
 
-**Source:** `~/dev/ClayWind` (C11, ~12k lines). **Target:** a CeeSafe package under `~/dev/CeeSafeApps/claywind`.
+**Source:** `~/dev/ClayWind` (C11, ~12k lines). **Target:** a CeeSafe package under `~/dev/CeeSafeApps/Clay/claywind`.
 
 **The rule: 100% CeeSafe.**
 - Every line we write is `.cee`.
@@ -55,7 +55,7 @@ code builds hosted and freestanding (CosmoOS), which is what ClayWind was built 
 ## 3. Package layout
 
 ```
-CeeSafeApps/claywind/                 kind = "library"
+CeeSafeApps/Clay/claywind/                 kind = "library"
   src/
     math.cee        sin/cos/atan2/exp/pow/lerp/clamp (no-trig workaround)
     color.cee       Color (f32 RGBA), WITH_ALPHA→withAlpha, THEME, full Tailwind palette consts
@@ -99,12 +99,12 @@ CeeSafeApps/claywind/                 kind = "library"
       bmp.cee, ppm.cee   loaders/writers (no deps)
       png.cee       inflate + PNG decode/encode (pure CeeSafe; phase 6)
   tests/            ports of layout_test, platform_test, raster golden tests
-CeeSafeApps/claywind-hosts/
+CeeSafeApps/Clay/claywind-hosts/
   headless/   renders N frames to BMP/PPM (CI + screenshots; replaces CLAYWIND_SCREENSHOT)
   terminal/   interactive host in a truecolor terminal (see §5)
   browser/    CeeSafe HTTP/WebSocket server + embedded canvas page (see §5)
   cosmoos/    freestanding: @export entry points over a GOP framebuffer + HID input
-CeeSafeApps/claywind-demo/   port of main.c (dashboard, controls, effects tabs)
+CeeSafeApps/Clay/claywind-demo/   port of main.c (dashboard, controls, effects tabs)
 ```
 
 ## 4. API redesign (C macros → CeeSafe)
@@ -673,4 +673,88 @@ scoped values behind `borrow dyn`, and arrays of views. The packages now need ce
 (ADR 0066), so they are sliced where they are named: the `let x = TABLE;` lines are gone. Verified the same way: all
 packages check, 72 tests pass, the 14 scenes hash identically, the page is byte-identical, and `test_client.py`
 passes. The packages now need ceesafec 0.12.0 or later.
+
+## 18. The desktop host: native windows (2026-11-04)
+
+**What it is.** `claywind-hosts/desktop` runs the demo in a native window on macOS, Windows and Linux, still 100%
+CeeSafe. It became possible once CeeSafe ADR 0069 added `Window` to lib/std (AppKit, Win32 and X11 in the C
+runtime). It is the host the owner asked for as "a native app demo".
+
+- **`DesktopPlatform`** (`src/platform.cee`) folds `WindowEvent`s into ClayWind's `Platform`:
+  - pointer, buttons and wheel, with one notch giving 2.5 units, as in the browser page;
+  - the named keys and F1–F12;
+  - modifiers, taken from each key event, since a modifier alone sends nothing;
+  - typed text through `nextChar`;
+  - focus loss, which releases everything held.
+- **The loop** (`src/main.cee`) drains events, lays out and renders a frame, presents it, then calls `waitFrame`.
+  - **Resizing.** The window resizes freely: the layout follows it, and the frame follows through the new
+    `Raster.resize`, up to 1920 × 1200.
+  - **Fonts.** It looks for Arial on macOS and Windows, then Linux's Microsoft core fonts or DejaVu, or takes
+    `CLAYWIND_FONT_DIR`.
+- **`Raster.resize(width, height)`** (`claywind/src/raster_core.cee`) is new. It changes the frame's size within the
+  capacity `create` was given. No buffer is reallocated, since each was sized for the capacity.
+- **Retina** (§19): frames are drawn at the display's pixel ratio.
+
+**Verified:**
+- **macOS** (Apple silicon): the dashboard renders at about 50 frames per second.
+- **Windows 11 ARM64** (Parallels VM; MSVC from the emitted C): a real mouse click opens Controls, and `WM_CLOSE`
+  ends the program.
+- **Ubuntu 22.04 on Xvfb** (gcc): with DejaVu fonts, a click opens Controls, and `WM_DELETE_WINDOW` ends the program
+  with status 0.
+- **The owner** ran it on the Mac and on the Windows VM: "Worked perfectly on both mac and windows vm".
+- **ClayWind:** all packages check, and the 72 tests pass.
+
+## 19. Retina pixel ratio and incremental rendering (2026-11-04)
+
+**Pixel ratio.** `Raster.setPixelRatio(ratio)` makes every frame start from a `scale(ratio)` transform.
+- **Layout** stays in points.
+- **Drawing:** paths, text, clips, images, gradients, shadows and blur all go through the transform, so they come out
+  in device pixels.
+- **The rectangle-clip fast path** now also applies at the ratio's scale.
+- **Frame size:** a host sets it to points × ratio with `Raster.resize`.
+- **The desktop host** draws at `window.scale()` (2 on a Retina display). Past 2880 × 1800 pixels it uses a lower
+  ratio.
+- **The headless host** has `CLAYWIND_PIXEL_RATIO=N`.
+- **Verified:**
+  - at ratio 1, the 14 demo scenes are byte-identical to before;
+  - at ratio 2, box-downsampled to 1×, they match the 1× frames to within anti-aliasing: at most 0.010% of pixels
+    off by more than 40, in two Effects scenes.
+
+**Incremental rendering** (`claywind/src/damage.cee`).
+- **`Damage` compares frames.** It hashes each frame's commands and keeps the area each one paints. A frame then
+  needs one of three things:
+  - nothing, when every hash matches;
+  - a redraw of up to four boxes, covering the old and new areas of each changed command, or of everything inside a
+    changed bracket;
+  - a full redraw, when the structure, size, ratio or clear color changed.
+- **`Damage.render`** draws the boxes with the new `Raster.beginRegion`, which clears only a box and keeps the
+  previous frame's pixels elsewhere.
+- **Raster changes:**
+  - **Fills and masks** stay inside the region.
+  - **Blur** (shadows and blur filters) is computed over the region widened by its reach (`blurReach`), so the
+    pixels inside are exact.
+  - **Edges cut by a box.** `accumulateLine` now splits an edge that crosses a box's side within a row, where it used
+    to clamp it. Clamping bent the edge, which miscomputed a boundary pixel's coverage. That case also occurs in full
+    frames at clip and frame edges: 3 pixels of `dashboard-click` changed by at most 5, now exact.
+- **The desktop host** renders through `Damage`, and presents only when something changed. The headless host has
+  `CLAYWIND_INCREMENTAL=1` (every frame incremental) and `CLAYWIND_DAMAGE_LOG=1` (each frame's redrawn box and, for
+  a full redraw, why).
+
+**Verified:**
+- **Exactness.** Each of the 14 scenes, drawn incrementally frame after frame, ends byte-identical to its full
+  redraw, at ratio 1 and at ratio 2.
+- **Cost per frame at ratio 2** (headless, Apple silicon):
+  - full redraw: 64 ms;
+  - incremental: 2.1 ms on the dashboard, 1.6 ms on Controls and 4.1 ms on Effects.
+- **The desktop app on a Retina display:**
+  - rendering at 2× alone: 13 FPS at 97% CPU;
+  - with incremental rendering: 38 FPS at 47%;
+  - with the sRGB window colour space as well: 31% CPU.
+- **Where the rest goes.** The remaining cost is presenting: every frame copies the whole frame for the window,
+  because the rotating badge changes every frame.
+
+**Pending in CeeSafe (uncommitted in ~/dev/CeeSafe):**
+- **An sRGB window on macOS** (`setColorSpace:`). Core Animation then stops converting every frame's colours on the
+  CPU, which was about 500 profile samples a frame. That was the 47% to 31% drop. It is for a 0.13.1.
+- **A later improvement:** a `present` that takes the changed boxes, to avoid copying the whole frame.
 

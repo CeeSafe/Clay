@@ -46,6 +46,25 @@ fn contentBounds(r: borrow Raster, layer: Layer) -> LayerBounds? {
 /// `sigma2`), over `content` grown by the passes' reach: beyond that the layer is zero before and after, and a region
 /// edge of zeros extends as the layer edge would, so the pixels are the same as blurring the whole layer. Returns the
 /// region it blurred.
+/// How far gaussianBlur's passes reach for `sigma2` (both box passes and their margin), in pixels: a pixel of the
+/// result depends only on the layer within this distance.
+fn blurReach(sigma2: f32) -> i32 {
+    if (sigma2 <= 0.0) {
+        return 0;
+    }
+    var wl = truncate<i32>((12.0 * sigma2 / 3.0 + 1.0).sqrt());
+    if (wl % 2 == 0) {
+        wl -= 1;
+    }
+    let wu = wl + 2;
+    let wlf = round<f32>(wl);
+    let mi = (12.0 * sigma2 - 3.0 * wlf * wlf - 12.0 * wlf - 9.0) / (-4.0 * wlf - 4.0);
+    let m = truncate<i32>((mi + 0.5).max(-1000.0).min(1000.0));
+    let k0 = ((if (0 < m) wl else wu) - 1) / 2;
+    let k1 = ((if (1 < m) wl else wu) - 1) / 2;
+    return imax(k0, 0) + imax(k1, 0) + 2;
+}
+
 fn gaussianBlur(r: borrow mut Raster, layer: Layer, sigma2: f32, content: LayerBounds) -> LayerBounds {
     if (sigma2 <= 0.0) {
         return content;
