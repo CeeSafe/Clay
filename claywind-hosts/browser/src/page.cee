@@ -11,7 +11,7 @@
 // message "cursor NAME" sets the CSS cursor.
 
 /// The page, one line per entry (a string literal ends at its line).
-const PAGE: [StringView; 30] = [
+static PAGE: [StringView; 30] = [
     "<!doctype html>",
     "<html lang=\"en\"><head><meta charset=\"utf-8\"><title>ClayWind</title>",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",

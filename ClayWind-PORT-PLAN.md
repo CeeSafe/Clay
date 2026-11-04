@@ -669,3 +669,8 @@ scoped values behind `borrow dyn`, and arrays of views. The packages now need ce
 - The 14 demo_compare scenes, rendered by the headless host, hash identically before and after.
 - The browser host serves a byte-identical page, and `test_client.py` passes.
 
+**ceesafec 0.12.0 (2026-11-04).** The demo's item tables and the browser page are now `static [StringView; N]`
+(ADR 0066), so they are sliced where they are named: the `let x = TABLE;` lines are gone. Verified the same way: all
+packages check, 72 tests pass, the 14 scenes hash identically, the page is byte-identical, and `test_client.py`
+passes. The packages now need ceesafec 0.12.0 or later.
+

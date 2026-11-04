@@ -121,3 +121,16 @@ to before. The browser page is byte-identical, and `test_client.py` passes.
 - **A `const` table must be bound to a local to slice it or take `.length`** (N0247, N0216). This is documented
   (§10, "bound to a local to be sliced"), but it adds a line at every call that passes a table as a slice. A
   `static` table would avoid it, which makes the first finding the one worth fixing.
+
+## H. Fixed in ~/dev/CeeSafe (2026-11-04)
+
+- **Static tables of views (ADR 0066).** `static T: [StringView; N]` is accepted, so a table can be sliced where it
+  is named. `static mut` tables stay rejected.
+- **A soundness hole found while testing it (ADR 0067).** 0.11.0 compiled `unsafe { LAST = s.view(); }` into a
+  `static mut LAST: StringView`, which dangles once `s` is gone. A write to a static now may carry no loan (N0272).
+- **`static` in signatures (ADR 0068).** Writing `static` on a parameter is N0273. A result that names only `static`
+  is enforced: the function may return only static data, and callers may keep the result past its arguments or store
+  it in a static.
+- **Released as ceesafec 0.12.0** (CeeSafe 8ba88b6, 046d24f, 7bed6e9, c23764e). ClayWind's tables are `static`
+  now, and the `let x = TABLE;` lines are gone.
+

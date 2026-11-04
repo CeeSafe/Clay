@@ -17,14 +17,14 @@ public const NAV_COUNT: usize = 6;
 const NAV_CONTROLS: usize = 1;
 const NAV_EFFECTS: usize = 2;
 
-const NAV_ITEMS: [StringView; 6] = ["Dashboard", "Controls", "Effects", "Projects", "Activity", "Settings"];
-const PRIO_ITEMS: [StringView; 3] = ["Low", "Medium", "High"];
-const FILE_ITEMS: [StringView; 6] = ["README.md", "main.c", "clay.h", "renderer.h", "controls.h", "PARITY.md"];
-const THEME_ITEMS: [StringView; 3] = ["System", "Light", "Dark"];
-const CTX_ITEMS: [StringView; 4] = ["Cut", "Copy", "Paste", "Delete"];
-const CONTROLS_TABS: [StringView; 3] = ["Inputs", "Selection", "Lists"];
-const SIZE_ITEMS: [StringView; 4] = ["Small", "Medium", "Large", "X-Large"];
-const TAG_ITEMS: [StringView; 10] = [
+static NAV_ITEMS: [StringView; 6] = ["Dashboard", "Controls", "Effects", "Projects", "Activity", "Settings"];
+static PRIO_ITEMS: [StringView; 3] = ["Low", "Medium", "High"];
+static FILE_ITEMS: [StringView; 6] = ["README.md", "main.c", "clay.h", "renderer.h", "controls.h", "PARITY.md"];
+static THEME_ITEMS: [StringView; 3] = ["System", "Light", "Dark"];
+static CTX_ITEMS: [StringView; 4] = ["Cut", "Copy", "Paste", "Delete"];
+static CONTROLS_TABS: [StringView; 3] = ["Inputs", "Selection", "Lists"];
+static SIZE_ITEMS: [StringView; 4] = ["Small", "Medium", "Large", "X-Large"];
+static TAG_ITEMS: [StringView; 10] = [
     "layout",
     "tailwind",
     "clay",
@@ -36,7 +36,7 @@ const TAG_ITEMS: [StringView; 10] = [
     "margins",
     "variants",
 ];
-const BLEND_NAMES: [StringView; 16] = [
+static BLEND_NAMES: [StringView; 16] = [
     "multiply",
     "screen",
     "overlay",
@@ -54,7 +54,7 @@ const BLEND_NAMES: [StringView; 16] = [
     "luminosity",
     "plus-lighter",
 ];
-const GRADIENT_DIRS: [StringView; 8] = ["t", "tr", "r", "br", "b", "bl", "l", "tl"];
+static GRADIENT_DIRS: [StringView; 8] = ["t", "tr", "r", "br", "b", "bl", "l", "tl"];
 
 /// The app state (main.c's statics), all caller-owned state for the controls.
 public struct DemoApp {
@@ -177,8 +177,7 @@ public fn demoFrame<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, 
     // Tooltip over the counter button, and a right-click context menu; both float on top, so they come last.
     Controls.tooltip(mut ui, "clickBtn", "Increments the click counter");
     Controls.tooltip(mut ui, "ci-save", "Counts saves (shown in Live state)");
-    let ctxItems = CTX_ITEMS;
-    match (Controls.contextMenu(mut ui, "ctx", ctxItems[..], mut app.ctxOpen, app.ctxX, app.ctxY)) {
+    match (Controls.contextMenu(mut ui, "ctx", CTX_ITEMS[..], mut app.ctxOpen, app.ctxX, app.ctxY)) {
         Some(act) => { app.clicks += (truncate<i32>(act)) + 1; }
         null => {}
     }
@@ -413,13 +412,12 @@ fn dashboard(ui: borrow mut Ui, app: borrow DemoApp) {
 
     // A wrapping tag row (flex-wrap).
     ui.open(Style.row().id("tags").w(Size.grow()).wrap().gapX(space(2.0)).gapY(space(2.0)));
-    let tags = TAG_ITEMS;
-    for (t in 0..tags.length) {
+    for (t in 0..TAG_ITEMS.length) {
         ui.open(Style.box().idHash(numberedId("tag-", truncate<i64>(t))).px(space(3.0)).py(space(1.0))
             .bg(ui.theme(SLATE_800, SLATE_200)).rounded(Radius.Md).cursor(Cursor.Pointer).hover(
             Style.of().bg(BLUE_600),
         ));
-        ui.label(tags[t], Text.of().color(inkCol(ui)));
+        ui.label(TAG_ITEMS[t], Text.of().color(inkCol(ui)));
         ui.close();
     }
     ui.close();
@@ -516,8 +514,7 @@ fn selectionSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
     ui.close();
     ui.open(Style.column().gap(space(2.0)));
     caption(mut ui, "Theme (radio) · Light/Dark switch the app");
-    let themeItems = THEME_ITEMS;
-    if (Controls.radio(mut ui, "ci-theme", themeItems[..], mut app.radioSel) && app.radioSel != 0) {
+    if (Controls.radio(mut ui, "ci-theme", THEME_ITEMS[..], mut app.radioSel) && app.radioSel != 0) {
         ui.setDarkMode(app.radioSel == 2);
     }
     ui.close();
@@ -525,13 +522,11 @@ fn selectionSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
     ui.open(Style.row().gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
     ui.open(Style.column().w(Size.fixed(180.0)).gap(space(1.0)));
     caption(mut ui, "Priority");
-    let prioItems = PRIO_ITEMS;
-    Controls.dropdown(mut ui, "ci-prio", prioItems[..], mut app.prioSel, mut app.prioOpen);
+    Controls.dropdown(mut ui, "ci-prio", PRIO_ITEMS[..], mut app.prioSel, mut app.prioOpen);
     ui.close();
     ui.open(Style.column().w(Size.fixed(180.0)).gap(space(1.0)));
     caption(mut ui, "Size");
-    let sizeItems = SIZE_ITEMS;
-    Controls.dropdown(mut ui, "ci-size", sizeItems[..], mut app.sizeSel, mut app.sizeOpen);
+    Controls.dropdown(mut ui, "ci-size", SIZE_ITEMS[..], mut app.sizeSel, mut app.sizeOpen);
     ui.close();
     ui.close();
 }
@@ -540,12 +535,11 @@ fn listsSection(ui: borrow mut Ui, app: borrow mut DemoApp) {
     ui.open(Style.row().w(Size.grow()).gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
     ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
     caption(mut ui, "Open (single select)");
-    let fileItems = FILE_ITEMS;
-    Controls.listbox(mut ui, "ci-files", fileItems[..], mut app.fileSel, Size.fixed(150.0));
+    Controls.listbox(mut ui, "ci-files", FILE_ITEMS[..], mut app.fileSel, Size.fixed(150.0));
     ui.close();
     ui.open(Style.column().w(Size.grow()).gap(space(1.0)));
     caption(mut ui, "Stage (multi select)");
-    Controls.listboxMulti(mut ui, "ci-stage", fileItems[..], mut app.filesChecked[..], Size.fixed(150.0));
+    Controls.listboxMulti(mut ui, "ci-stage", FILE_ITEMS[..], mut app.filesChecked[..], Size.fixed(150.0));
     ui.close();
     ui.close();
     caption(mut ui, "Right-click anywhere for a context menu (it bumps the Dashboard's click counter).");
@@ -623,8 +617,7 @@ fn controlsPage<M: TextMetrics>(ui: borrow mut Ui, app: borrow mut DemoApp, metr
     ui.label("Controls", Text.of().font(TEXT_XL).color(inkCol(ui)).bold());
     ui.label("· controls.h · Tab cycles focus", Text.of().color(muteCol(ui)).wrap(TextWrap.None));
     ui.close();
-    let controlsTabs = CONTROLS_TABS;
-    Controls.tabs(mut ui, "ci-tabs", controlsTabs[..], mut app.controlsTab);
+    Controls.tabs(mut ui, "ci-tabs", CONTROLS_TABS[..], mut app.controlsTab);
     ui.open(Style.row().w(Size.grow()).gap(space(5.0)).alignXY(AxisAlign.Start, AxisAlign.Start));
     ui.open(
         Style.column().id("ci-panel").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
@@ -775,9 +768,8 @@ fn blendSection(ui: borrow mut Ui) {
         Style.column().id("blendCard").w(Size.grow()).bg(panelBg(ui)).p(space(5.0)).gap(space(4.0)).rounded(Radius.Lg),
     );
     ui.open(Style.row().w(Size.grow()).gap(space(3.0)).wrap());
-    let blendNames = BLEND_NAMES;
-    for (i in 0..blendNames.length) {
-        let name = blendNames[i];
+    for (i in 0..BLEND_NAMES.length) {
+        let name = BLEND_NAMES[i];
         ui.open(
             Style.column().idHash(namedId("bm-", name)).gap(space(1.0)).alignXY(AxisAlign.Center, AxisAlign.Center),
         );
