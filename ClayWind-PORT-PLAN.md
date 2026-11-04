@@ -753,8 +753,12 @@ runtime). It is the host the owner asked for as "a native app demo".
 - **Where the rest goes.** The remaining cost is presenting: every frame copies the whole frame for the window,
   because the rotating badge changes every frame.
 
-**Pending in CeeSafe (uncommitted in ~/dev/CeeSafe):**
-- **An sRGB window on macOS** (`setColorSpace:`). Core Animation then stops converting every frame's colours on the
-  CPU, which was about 500 profile samples a frame. That was the 47% to 31% drop. It is for a 0.13.1.
-- **A later improvement:** a `present` that takes the changed boxes, to avoid copying the whole frame.
-
+**Done in CeeSafe since** (both shipped in ceesafec 0.14.0):
+- **An sRGB window on macOS** (ADR 0069 §8): Core Animation no longer converts every frame's colours on the CPU.
+  That took idle CPU from 47% to 31%.
+- **`Window.presentChanged`** (ADR 0070): the window takes only the boxes that changed. `Damage.redrawnCount()` and
+  `Damage.redrawn(k)` give them in pixels, and the desktop host passes them on. On macOS the frame lives in two
+  IOSurfaces, so no frame is copied whole.
+- **Result:** the desktop app idles at 16–24% CPU on a Retina display, at 55 FPS, against 13 FPS at 97% with 2×
+  rendering alone.
+- **The packages now need ceesafec 0.14.0 or later.**

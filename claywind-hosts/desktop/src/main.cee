@@ -10,7 +10,7 @@
 // The window resizes freely and the layout follows it. Frames are drawn at the display's pixel ratio (2 on a Retina
 // display, Raster.setPixelRatio), up to MAX_PIXELS_WIDTH × MAX_PIXELS_HEIGHT pixels: a window too large for that at
 // its ratio is drawn at a lower one, which the window scales up. Each frame redraws only what changed (Damage), and
-// nothing is presented when nothing did.
+// the window is given only those boxes (Window.presentChanged, ceesafec 0.14.0); nothing, when nothing changed.
 
 import claywind;
 import claywind_demo;
@@ -206,7 +206,19 @@ fn main() -> i32 {
         if (damage.render(mut raster, ui, Color.hex(pageBg(ui)))) {
             let width = truncate<u32>(raster.frameWidth());
             let height = truncate<u32>(raster.frameHeight());
-            match (window.present(raster.pixels(), width, height)) {
+            // Only the boxes Damage redrew changed: the window shows just those (Window.presentChanged).
+            var boxes = [WindowBox { x: 0, y: 0, width: 0, height: 0 }; 4];
+            let count = damage.redrawnCount();
+            for (k in 0..count) {
+                let r = damage.redrawn(k);
+                boxes[k] = WindowBox {
+                    x: saturatingTruncate<u32>(r.x),
+                    y: saturatingTruncate<u32>(r.y),
+                    width: saturatingTruncate<u32>(r.w),
+                    height: saturatingTruncate<u32>(r.h),
+                };
+            }
+            match (window.presentChanged(raster.pixels(), width, height, boxes[0..count])) {
                 Ok() => {}
                 Err(_) => {
                     Console.writeErrorLine("desktop: the window refused a frame");

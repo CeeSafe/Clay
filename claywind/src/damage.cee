@@ -46,6 +46,9 @@ public struct Damage<region r> {
     /// clock) stay two small redraws rather than the box around both.
     pieces: [Rect; 4];
     pieceCount: usize;
+    /// The pixel boxes the last `render` redrew: a whole frame is one box.
+    drawn: [Rect; 4];
+    drawnCount: usize;
     /// Why the last `update` was `Everything` (`fullReason`), and the command that made it so.
     reason: u32;
     reasonCommand: usize;
@@ -74,6 +77,8 @@ public struct Damage<region r> {
             last: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             pieces: [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 4],
             pieceCount: 0,
+            drawn: [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 4],
+            drawnCount: 0,
             reason: 0,
             reasonCommand: 0,
             width: 0,
@@ -103,22 +108,29 @@ public struct Damage<region r> {
         match (this.update(ui, clear)) {
             DamageResult.Nothing => {
                 this.last = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+                this.drawnCount = 0;
                 return false;
             }
             DamageResult.Everything => {
                 this.last = Rect { x: 0.0, y: 0.0, w: round<f32>(w), h: round<f32>(h) };
+                this.drawn[0] = this.last;
+                this.drawnCount = 1;
                 raster.begin(clear);
             }
             DamageResult.Region(_) => {
                 // One pass per box: each redraws only its pixels, and leaves the others' alone.
                 this.last = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+                this.drawnCount = 0;
                 for (k in 0..this.pieceCount) {
                     let r = this.pieces[k];
                     let x0 = Math.clamp((r.x * ratio).floor() - 1.0, 0.0, round<f32>(w));
                     let y0 = Math.clamp((r.y * ratio).floor() - 1.0, 0.0, round<f32>(h));
                     let x1 = Math.clamp(((r.x + r.w) * ratio).ceil() + 1.0, 0.0, round<f32>(w));
                     let y1 = Math.clamp(((r.y + r.h) * ratio).ceil() + 1.0, 0.0, round<f32>(h));
-                    this.last = joined(this.last, k > 0, Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+                    let box = Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+                    this.last = joined(this.last, k > 0, box);
+                    this.drawn[this.drawnCount] = box;
+                    this.drawnCount += 1;
                     raster.beginRegion(
                         clear,
                         saturatingTruncate<usize>(x0),
@@ -136,6 +148,12 @@ public struct Damage<region r> {
         raster.finish();
         return true;
     }
+
+    /// How many pixel boxes the last `render` redrew (0 when nothing changed, 1 for a whole frame, up to 4).
+    public fn redrawnCount(borrow this) -> usize => this.drawnCount;
+
+    /// Pixel box `k` of the last `render`: what a window needs to show again (`Window.presentChanged`).
+    public fn redrawn(borrow this, k: usize) -> Rect => this.drawn[k];
 
     /// Why the last frame was redrawn whole: 0 it was not, 1 the first frame (or after `invalidate`, a resize or a
     /// new ratio), 2 the number of commands changed, 3 the clear color changed, 4 a bracket changed
